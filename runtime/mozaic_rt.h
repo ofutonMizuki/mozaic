@@ -57,7 +57,101 @@ template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r))
 template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
 
-// ---- device buffers + data-parallel launch (M0: CPU path; Metal/UMA backend later) ----
+// ---- device buffers + data-parallel launch ----
+// Two backends, selected at compile time:
+//   default        : CPU path. Buffer is std::vector-backed; launch is a serial loop.
+//   -DMZ_METAL     : Apple Silicon GPU. Buffer is MTLBuffer(shared)-backed — the CPU
+//                    pointer (buf.contents) and the GPU address are the SAME memory (UMA,
+//                    zero-copy). launch dispatches a precompiled MSL kernel and (for now)
+//                    waits synchronously. Compile the generated unit as Objective-C++.
+#ifdef MZ_METAL
+} // namespace mz  (reopen after importing Metal)
+#import <Metal/Metal.h>
+#import <Foundation/Foundation.h>
+#include <cstring>
+namespace mz {
+
+inline id<MTLDevice> metal_device() {
+  static id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+  if (!d) panic("no Metal device (Apple Silicon GPU required)");
+  return d;
+}
+inline id<MTLCommandQueue> metal_queue() {
+  static id<MTLCommandQueue> q = [metal_device() newCommandQueue];
+  return q;
+}
+
+// MTLBuffer(shared)-backed: contents() is host-visible AND the GPU's memory (UMA).
+template <class T> struct Buffer {
+  id<MTLBuffer> buf;
+  uint32_t len;
+  Buffer(uint32_t n) : len(n) {
+    buf = [metal_device() newBufferWithLength:(NSUInteger)n * sizeof(T)
+                                      options:MTLResourceStorageModeShared];
+    std::memset(buf.contents, 0, (size_t)n * sizeof(T));   // match CPU value-init
+  }
+  T& operator[](uint32_t i) { return ((T*)buf.contents)[i]; }
+  const T& operator[](uint32_t i) const { return ((const T*)buf.contents)[i]; }
+};
+
+// Device value. The backend is fixed at compile time (--gpu), so this is currently a marker;
+// runtime Device.gpu/cpu selection is a later milestone.
+struct Device { };
+
+// A launched-but-not-yet-joined kernel. Holds the in-flight command buffer; await() is the
+// sync point (the borrow returns here). On UMA this is a fence only — no copy-back.
+struct Job {
+  id<MTLCommandBuffer> cb;
+  void await() { if (cb) [cb waitUntilCompleted]; }
+};
+
+// One pipeline per kernel, compiled from MSL source on first use (cached at the call site).
+struct MetalKernel {
+  id<MTLComputePipelineState> pso;
+  MetalKernel(const char* name, const char* src) {
+    NSError* err = nil;
+    id<MTLLibrary> lib = [metal_device() newLibraryWithSource:[NSString stringWithUTF8String:src]
+                                                      options:nil error:&err];
+    if (!lib) { std::cerr << "mozaic: MSL compile failed: " << err.localizedDescription.UTF8String << "\n"; std::abort(); }
+    id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+    if (!fn) { std::cerr << "mozaic: kernel '" << name << "' not found in MSL\n"; std::abort(); }
+    pso = [metal_device() newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) { std::cerr << "mozaic: pipeline failed: " << err.localizedDescription.UTF8String << "\n"; std::abort(); }
+  }
+};
+
+// One dispatch: bind args (in MSL buffer-index order), then run() synchronously.
+struct MetalDispatch {
+  id<MTLCommandBuffer> cb;
+  id<MTLComputeCommandEncoder> enc;
+  id<MTLComputePipelineState> pso;
+  uint32_t grid;
+  MetalDispatch(MetalKernel& k, uint32_t g) : pso(k.pso), grid(g) {
+    cb = [metal_queue() commandBuffer];
+    enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+  }
+  template <class T> void buffer(int idx, Buffer<T>& b) { [enc setBuffer:b.buf offset:0 atIndex:idx]; }
+  template <class T> void value(int idx, T v)           { [enc setBytes:&v length:sizeof(T) atIndex:idx]; }
+  template <class T> void length(int idx, Buffer<T>& b) { uint32_t l = b.len; [enc setBytes:&l length:sizeof(l) atIndex:idx]; }
+  void encode() {
+    if (grid == 0) return;
+    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+    if (tg > grid) tg = grid;
+    [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+  }
+  void run() {                 // synchronous: free launch(...) waits inline
+    encode(); [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+  }
+  Job commit() {               // async: dev.launch(...) returns the Job; caller awaits
+    encode(); [enc endEncoding]; [cb commit];
+    return Job{ cb };
+  }
+};
+
+#else  // ---- CPU path ----
+
 template <class T> struct Buffer {
   std::vector<T> data;
   uint32_t len;
@@ -66,6 +160,12 @@ template <class T> struct Buffer {
   const T& operator[](uint32_t i) const { return data[i]; }
 };
 template <class F> void launch(uint32_t grid, F fn) { for (uint32_t i = 0; i < grid; i++) fn(i); }
+
+// CPU dev.launch runs the loop eagerly, so the Job is already complete; await() is a no-op.
+struct Device { };
+struct Job { void await() {} };
+
+#endif
 
 // UTF-8 bytes -> UTF-32
 inline std::u32string decodeUtf8(const std::string& bytes) {

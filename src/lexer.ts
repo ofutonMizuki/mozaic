@@ -1,7 +1,7 @@
 // Tokenizer.
 export type Tok = { t: string; v: string; pos: number };
 
-const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
+const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let", "mut"]);
 
 export function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -56,7 +56,7 @@ export function lex(src: string): Tok[] {
         two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
       toks.push({ t: two, v: two, pos: i }); i += 2; continue;
     }
-    if ("(){}[];:,.=+-*/%<>".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
+    if ("(){}[];:,.=+-*/%<>&".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
   toks.push({ t: "eof", v: "", pos: n });

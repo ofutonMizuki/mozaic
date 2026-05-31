@@ -16,6 +16,21 @@ let pass = 0, fail = 0;
 for (const f of cases) {
   const name = f.replace(/\.mzc$/, "");
   const moz = join(casesDir, f);
+  const errFile = join(casesDir, name + ".err");
+  // Negative case: a <name>.err file means the compiler must REJECT the program,
+  // and its diagnostics must contain the file's text (the borrow=sync checks live here).
+  if (existsSync(errFile)) {
+    const want = readFileSync(errFile, "utf8").trim();
+    try {
+      execFileSync("node", ["--disable-warning=ExperimentalWarning", compiler, "build", moz], { stdio: "pipe" });
+      console.log(`FAIL ${name} (expected compile error, but it built)`); fail++;
+    } catch (e) {
+      const out = String((e as { stderr?: Buffer }).stderr ?? "") + String((e as Error).message ?? "");
+      if (out.includes(want)) { console.log(`PASS ${name} (rejected: ${want})`); pass++; }
+      else { console.log(`FAIL ${name}\n  expected error containing ${JSON.stringify(want)}\n  got ${JSON.stringify(out.split("\n")[0])}`); fail++; }
+    }
+    continue;
+  }
   const input = existsSync(join(casesDir, name + ".in")) ? readFileSync(join(casesDir, name + ".in"), "utf8") : "";
   const expected = existsSync(join(casesDir, name + ".out")) ? readFileSync(join(casesDir, name + ".out"), "utf8") : "";
   try {

@@ -1,0 +1,32 @@
+// Async data-parallel launch with the keystone: borrow = device sync.
+// dev.launch borrows &buf (shared) and &mut out (exclusive) until job.await().
+// Builds/runs identically on CPU (default) and GPU (--gpu): 10 11 12 13.
+kernel addk(input: Buffer<u32>, output: Buffer<u32>, k: u32) {
+  let i: u32 = grid.x;
+  if (i < output.len) {
+    output[i] = input[i] + k;
+  }
+}
+
+function main() {
+  let n: u32 = 4;
+  let buf: Buffer<u32> = Buffer.shared(n);
+  let out: Buffer<u32> = Buffer.shared(n);
+
+  let i: u32 = 0;
+  while (i < n) {
+    buf[i] = i;
+    i = i + 1;
+  }
+
+  let dev: Device = Device.gpu;
+  let job: Job = dev.launch(addk, n, &buf, &mut out, 10);
+  // touching `out` here would be a compile error — it is borrowed by the in-flight job.
+  job.await();   // sync point: borrows return (UMA = fence only, no copy-back)
+
+  let j: u32 = 0;
+  while (j < n) {
+    stdout.println(out[j]);   // 10, 11, 12, 13
+    j = j + 1;
+  }
+}

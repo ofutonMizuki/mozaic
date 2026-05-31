@@ -30,6 +30,7 @@ export type Expr =
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }
   | { kind: "Call"; callee: Expr; args: Expr[]; ty?: string }
   | { kind: "StructLit"; name: string; fields: { name: string; value: Expr }[]; ty?: string }
+  | { kind: "Borrow"; mut: boolean; expr: Expr; ty?: string }
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
 
 export type Sig = { params: Param[]; retTy: string | null };
@@ -62,6 +63,8 @@ export function cppType(t: string): string {
     case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
     case "str": return "mz::String";
+    case "Device": return "mz::Device";
+    case "Job": return "mz::Job";
     default: {
       const be = bufferElem(t);
       if (be !== null) return `mz::Buffer<${cppType(be)}>`;
@@ -69,7 +72,7 @@ export function cppType(t: string): string {
     }
   }
 }
-export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
+export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str", "Device", "Job"]);
 export const ARITH_OPS = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "+|", "-|", "*|"];
 export const ARITH_FN: Record<string, string> = {
   "+": "add", "-": "sub", "*": "mul", "/": "divi", "%": "modi",

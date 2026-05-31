@@ -200,12 +200,21 @@ export class Parser {
     return left;
   }
   parseMul(): Expr {
-    let left = this.parsePostfix();
+    let left = this.parseUnary();
     while (this.at("*") || this.at("/") || this.at("%") || this.at("*%") || this.at("*|")) {
       const op = this.next().t;
-      left = { kind: "Binary", op, left, right: this.parsePostfix() };
+      left = { kind: "Binary", op, left, right: this.parseUnary() };
     }
     return left;
+  }
+  parseUnary(): Expr {
+    if (this.at("&")) {
+      this.next();
+      let mut = false;
+      if (this.at("mut")) { this.next(); mut = true; }
+      return { kind: "Borrow", mut, expr: this.parseUnary() };
+    }
+    return this.parsePostfix();
   }
   parsePostfix(): Expr {
     let e = this.parsePrimary();

@@ -4,6 +4,10 @@ import {
   BUILTIN_TYPES, ARITH_OPS, isInt, isFloat, unifyInt, unifyFloat, bufferElem, isStdinLines, isBufferNew,
 } from "./ast.ts";
 
+// borrow = device sync: a buffer borrowed by an in-flight Job (between dev.launch and
+// job.await) cannot be touched by the host. & = shared (CPU reads still OK), &mut = exclusive.
+type Borrow = { mut: boolean; job: string };
+
 class Checker {
   errs: string[] = [];
   scopes: Map<string, string>[] = [];
@@ -13,6 +17,29 @@ class Checker {
   enums = new Map<string, Map<string, string[]>>();
   variants = new Map<string, VarInfo>();
   curRet = "unit";
+  borrows = new Map<string, Borrow>();   // buffer name -> in-flight borrow (per function)
+  suppressBufRead: string | null = null;  // the lvalue buffer of the current Assign (write, not read)
+  accessBuf(name: string, write: boolean) {
+    const b = this.borrows.get(name);
+    if (!b) return;
+    if (write) this.err(`'${name}' is borrowed by in-flight job '${b.job}'; await it before writing (borrow = device sync)`);
+    else if (b.mut) this.err(`'${name}' is exclusively borrowed (&mut) by in-flight job '${b.job}'; await it before reading (borrow = device sync)`);
+    // a shared (&) borrow leaves the host free to read concurrently
+  }
+  registerBorrows(call: Extract<Expr, { kind: "Call" }>, job: string) {
+    const kn = call.args[0];
+    if (kn.kind !== "Ident") return;
+    const kparams = this.kernels.get(kn.name);
+    if (!kparams) return;
+    call.args.slice(2).forEach((a, k) => {
+      const p = kparams[k];
+      if (!p || bufferElem(p.ty) === null) return;
+      if (a.kind !== "Borrow" || a.expr.kind !== "Ident") return;
+      const name = a.expr.name;
+      if (this.borrows.has(name)) this.err(`'${name}' is already borrowed in-flight; await before launching again`);
+      else this.borrows.set(name, { mut: a.mut, job });
+    });
+  }
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
   define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, t); }
@@ -65,8 +92,10 @@ class Checker {
     for (const it of p.items) if (it.kind === "FnDecl" || it.kind === "KernelDecl") {
       this.push();
       this.curRet = (it.kind === "FnDecl" ? it.retTy : null) ?? "unit";
+      this.borrows = new Map();
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
+      for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await the job before it goes out of scope`);
       this.pop();
     }
   }
@@ -88,10 +117,19 @@ class Checker {
         }
         s.declTy = declTy;
         this.define(s.name, declTy);
+        // `let job = dev.launch(...)` borrows its buffer args until job.await()
+        if (declTy === "Job" && s.value.kind === "Call" &&
+            s.value.callee.kind === "Member" && s.value.callee.prop === "launch")
+          this.registerBorrows(s.value, s.name);
         break;
       }
       case "Assign": {
+        if (s.target.kind === "Index" && s.target.obj.kind === "Ident") {
+          this.accessBuf(s.target.obj.name, true);     // writing through the buffer
+          this.suppressBufRead = s.target.obj.name;     // ...so don't also flag it as a read
+        }
         const tt = this.checkExpr(s.target);
+        this.suppressBufRead = null;
         const vt = this.checkExpr(s.value);
         if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
         break;
@@ -142,7 +180,15 @@ class Checker {
         break;
       }
       case "Break": case "Continue": break;
-      case "ExprStmt": { this.checkExpr(s.expr); break; }
+      case "ExprStmt": {
+        this.checkExpr(s.expr);
+        const e = s.expr;   // job.await() returns the borrows held by that job
+        if (e.kind === "Call" && e.callee.kind === "Member" && e.callee.prop === "await" && e.callee.obj.kind === "Ident") {
+          const job = e.callee.obj.name;
+          for (const [name, b] of [...this.borrows]) if (b.job === job) this.borrows.delete(name);
+        }
+        break;
+      }
     }
   }
   assignable(vt: string, tt: string): boolean {
@@ -165,8 +211,12 @@ class Checker {
       }
       case "Member": {
         if (e.obj.kind === "Ident" && e.obj.name === "grid" && (e.prop === "x" || e.prop === "y" || e.prop === "z")) { e.ty = "u32"; return e.ty; }
+        if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) { e.ty = "Device"; return e.ty; }
         const ot = this.checkExpr(e.obj);
-        if (bufferElem(ot) !== null && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        if (bufferElem(ot) !== null && e.prop === "len") {
+          if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
+          e.ty = "u32"; return e.ty;
+        }
         const fm = this.structs.get(ot);
         if (fm) {
           const ft = fm.get(e.prop);
@@ -179,6 +229,7 @@ class Checker {
         const ot = this.checkExpr(e.obj);
         const be = bufferElem(ot);
         if (be === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
+        if (e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
         const it = this.checkExpr(e.index);
         if (!isInt(it)) this.err(`buffer index must be an integer (got ${it})`);
         e.ty = be; return be;
@@ -222,6 +273,36 @@ class Checker {
           else this.err("Buffer.shared takes one argument");
           e.ty = "buffernew"; return e.ty;
         }
+        // dev.launch(kernel, grid, &buf, &mut out, ...scalars) -> Job  (async; borrows held until await)
+        if (e.callee.kind === "Member" && e.callee.prop === "launch") {
+          if (this.checkExpr(e.callee.obj) !== "Device") this.err("'.launch' can only be called on a Device");
+          if (e.args.length < 2) this.err("launch needs (kernel, grid, ...args)");
+          else {
+            const kn = e.args[0];
+            if (kn.kind !== "Ident" || !this.kernels.has(kn.name)) this.err("launch: first argument must be a kernel name");
+            else {
+              const kparams = this.kernels.get(kn.name)!;
+              if (!isInt(this.checkExpr(e.args[1]))) this.err("launch: grid size must be an integer");
+              const passed = e.args.slice(2);
+              if (passed.length !== kparams.length) this.err(`launch '${kn.name}': expected ${kparams.length} kernel arg(s), got ${passed.length}`);
+              for (let k = 0; k < passed.length; k++) {
+                const a = passed[k], p = kparams[k];
+                const at = this.checkExpr(a);
+                if (!p) continue;
+                if (bufferElem(p.ty) !== null) {
+                  if (a.kind !== "Borrow" || a.expr.kind !== "Ident") this.err(`launch arg ${k + 1}: buffer must be borrowed (&${p.name} or &mut ${p.name})`);
+                } else if (a.kind === "Borrow") this.err(`launch arg ${k + 1}: scalar '${p.name}' must not be borrowed`);
+                if (!this.assignable(at, p.ty)) this.err(`launch arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
+              }
+            }
+          }
+          e.ty = "Job"; return e.ty;
+        }
+        if (e.callee.kind === "Member" && e.callee.prop === "await") {
+          if (this.checkExpr(e.callee.obj) !== "Job") this.err("'.await' can only be called on a Job");
+          if (e.args.length) this.err("await takes no arguments");
+          e.ty = "unit"; return e.ty;
+        }
         if (e.callee.kind === "Ident") {
           const sig = this.fns.get(e.callee.name);
           if (sig) {
@@ -255,6 +336,11 @@ class Checker {
           }
         }
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;
+      }
+      case "Borrow": {
+        const it = this.checkExpr(e.expr);
+        if (bufferElem(it) === null) this.err(`'&' borrow is only for Buffer arguments to dev.launch (got ${it})`);
+        e.ty = it; return e.ty;
       }
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);

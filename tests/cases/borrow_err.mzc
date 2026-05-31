@@ -1,0 +1,20 @@
+// Negative example: the borrow=sync keystone in action.
+// `out` is &mut-borrowed by the in-flight job; reading it before job.await()
+// is a COMPILE error (no data race can reach the GPU). Expected: compiler rejects this.
+kernel addk(input: Buffer<u32>, output: Buffer<u32>, k: u32) {
+  let i: u32 = grid.x;
+  if (i < output.len) {
+    output[i] = input[i] + k;
+  }
+}
+
+function main() {
+  let n: u32 = 4;
+  let buf: Buffer<u32> = Buffer.shared(n);
+  let out: Buffer<u32> = Buffer.shared(n);
+
+  let dev: Device = Device.gpu;
+  let job: Job = dev.launch(addk, n, &buf, &mut out, 10);
+  stdout.println(out[0]);   // error: 'out' is exclusively borrowed by in-flight job 'job'
+  job.await();
+}
