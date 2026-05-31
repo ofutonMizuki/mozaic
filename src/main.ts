@@ -8,17 +8,21 @@ import { dirname, join, basename } from "node:path";
 
 // ---------- AST (types erased at runtime) ----------
 type Program = { kind: "Program"; items: Item[] };
-type Item = FnDecl | StructDecl;
+type Item = FnDecl | StructDecl | EnumDecl;
 type Param = { name: string; ty: string };
 type Field = { name: string; ty: string };
+type Variant = { name: string; payload: string[] };
 type StructDecl = { kind: "StructDecl"; name: string; fields: Field[] };
+type EnumDecl = { kind: "EnumDecl"; name: string; variants: Variant[] };
 type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[] };
+type Arm = { variant: string; bindings: string[]; body: Stmt[] };
 type Stmt =
   | { kind: "Let"; name: string; annot: string | null; value: Expr; declTy?: string }
   | { kind: "Assign"; name: string; value: Expr }
   | { kind: "While"; cond: Expr; body: Stmt[] }
   | { kind: "ForOf"; binder: string; iter: Expr; body: Stmt[] }
   | { kind: "If"; cond: Expr; then: Stmt[]; els: Stmt[] | null }
+  | { kind: "Match"; scrut: Expr; arms: Arm[] }
   | { kind: "Return"; value: Expr | null }
   | { kind: "Break" }
   | { kind: "Continue" }
@@ -59,14 +63,14 @@ function cppType(t: string): string {
     case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
     case "str": return "mz::String";
-    default: return t;   // user struct types map to their own name
+    default: return t;   // user struct/enum types map to their own name
   }
 }
 const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
 
 // ---------- Lexer ----------
 type Tok = { t: string; v: string; pos: number };
-const KEYWORDS = new Set(["function", "struct", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
+const KEYWORDS = new Set(["function", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
 
 function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -124,7 +128,7 @@ function lex(src: string): Tok[] {
       continue;
     }
     const two = src.slice(i, i + 2);
-    if (two === "==" || two === "!=" || two === "<=" || two === ">=") { toks.push({ t: two, v: two, pos: i }); i += 2; continue; }
+    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>") { toks.push({ t: two, v: two, pos: i }); i += 2; continue; }
     if ("(){};:,.=+-*/%<>".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
@@ -136,6 +140,7 @@ function lex(src: string): Tok[] {
 class Parser {
   toks: Tok[];
   i: number;
+  noStruct = false;   // when true, `Ident {` is NOT a struct literal (used for match scrutinee)
   constructor(toks: Tok[]) { this.toks = toks; this.i = 0; }
   peek(): Tok { return this.toks[this.i]; }
   at(t: string): boolean { return this.toks[this.i].t === t; }
@@ -148,7 +153,11 @@ class Parser {
   }
   parseProgram(): Program {
     const items: Item[] = [];
-    while (!this.at("eof")) items.push(this.at("struct") ? this.parseStruct() : this.parseFn());
+    while (!this.at("eof")) {
+      if (this.at("struct")) items.push(this.parseStruct());
+      else if (this.at("enum")) items.push(this.parseEnum());
+      else items.push(this.parseFn());
+    }
     return { kind: "Program", items };
   }
   parseStruct(): StructDecl {
@@ -165,6 +174,25 @@ class Parser {
     }
     this.eat("}");
     return { kind: "StructDecl", name, fields };
+  }
+  parseEnum(): EnumDecl {
+    this.eat("enum");
+    const name = this.eat("id").v;
+    this.eat("{");
+    const variants: Variant[] = [];
+    while (!this.at("}")) {
+      const vn = this.eat("id").v;
+      const payload: string[] = [];
+      if (this.at("(")) {
+        this.next();
+        if (!this.at(")")) { payload.push(this.eat("id").v); while (this.at(",")) { this.next(); payload.push(this.eat("id").v); } }
+        this.eat(")");
+      }
+      variants.push({ name: vn, payload });
+      if (this.at(",")) this.next(); else break;
+    }
+    this.eat("}");
+    return { kind: "EnumDecl", name, variants };
   }
   parseFn(): FnDecl {
     this.eat("function");
@@ -197,6 +225,7 @@ class Parser {
     if (t === "for") return this.parseFor();
     if (t === "while") return this.parseWhile();
     if (t === "if") return this.parseIf();
+    if (t === "match") return this.parseMatch();
     if (t === "let" || t === "const") return this.parseLet();
     if (t === "return") {
       this.next();
@@ -219,7 +248,7 @@ class Parser {
     return { kind: "ExprStmt", expr: e };
   }
   parseLet(): Stmt {
-    this.next(); // let | const
+    this.next();
     const name = this.eat("id").v;
     let annot: string | null = null;
     if (this.at(":")) { this.next(); annot = this.eat("id").v; }
@@ -251,6 +280,27 @@ class Parser {
     let els: Stmt[] | null = null;
     if (this.at("else")) { this.next(); els = this.parseBlock(); }
     return { kind: "If", cond, then, els };
+  }
+  parseMatch(): Stmt {
+    this.eat("match");
+    this.noStruct = true;
+    const scrut = this.parseExpr();
+    this.noStruct = false;
+    this.eat("{");
+    const arms: Arm[] = [];
+    while (!this.at("}")) {
+      const variant = this.eat("id").v;
+      const bindings: string[] = [];
+      if (this.at("(")) {
+        this.next();
+        if (!this.at(")")) { bindings.push(this.eat("id").v); while (this.at(",")) { this.next(); bindings.push(this.eat("id").v); } }
+        this.eat(")");
+      }
+      this.eat("=>");
+      arms.push({ variant, bindings, body: this.parseBlock() });
+    }
+    this.eat("}");
+    return { kind: "Match", scrut, arms };
   }
   parseExpr(): Expr { return this.parseComparison(); }
   parseComparison(): Expr {
@@ -301,7 +351,7 @@ class Parser {
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
     if (tk.t === "id") {
       this.next();
-      if (this.at("{")) return this.parseStructLit(tk.v);
+      if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);
       return { kind: "Ident", name: tk.v };
     }
     if (tk.t === "(") { this.next(); const e = this.parseExpr(); this.eat(")"); return e; }
@@ -328,12 +378,15 @@ function isStdinLines(e: Expr): boolean {
 }
 
 type Sig = { params: Param[]; retTy: string | null };
+type VarInfo = { enumName: string; index: number; payload: string[] };
 
 class Checker {
   errs: string[] = [];
   scopes: Map<string, string>[] = [];
   fns = new Map<string, Sig>();
-  structs = new Map<string, Map<string, string>>();   // name -> (field -> type)
+  structs = new Map<string, Map<string, string>>();
+  enums = new Map<string, Map<string, string[]>>();       // enum -> (variant -> payload types)
+  variants = new Map<string, VarInfo>();                  // variant -> info
   curRet = "unit";
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
@@ -343,7 +396,7 @@ class Checker {
     return null;
   }
   err(m: string) { this.errs.push(m); }
-  typeKnown(t: string): boolean { return BUILTIN_TYPES.has(t) || this.structs.has(t); }
+  typeKnown(t: string): boolean { return BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t); }
 
   checkProgram(p: Program) {
     for (const it of p.items) if (it.kind === "StructDecl") {
@@ -352,8 +405,20 @@ class Checker {
       for (const f of it.fields) fm.set(f.name, f.ty);
       this.structs.set(it.name, fm);
     }
+    for (const it of p.items) if (it.kind === "EnumDecl") {
+      if (this.enums.has(it.name)) this.err(`duplicate enum '${it.name}'`);
+      const vm = new Map<string, string[]>();
+      it.variants.forEach((v, idx) => {
+        if (this.variants.has(v.name)) this.err(`duplicate variant name '${v.name}'`);
+        vm.set(v.name, v.payload);
+        this.variants.set(v.name, { enumName: it.name, index: idx, payload: v.payload });
+      });
+      this.enums.set(it.name, vm);
+    }
     for (const it of p.items) if (it.kind === "StructDecl")
       for (const f of it.fields) if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
+    for (const it of p.items) if (it.kind === "EnumDecl")
+      for (const v of it.variants) for (const pt of v.payload) if (!this.typeKnown(pt)) this.err(`unknown type '${pt}' in variant '${v.name}'`);
     for (const it of p.items) if (it.kind === "FnDecl") {
       if (this.fns.has(it.name)) this.err(`duplicate function '${it.name}'`);
       this.fns.set(it.name, { params: it.params, retTy: it.retTy });
@@ -408,6 +473,26 @@ class Checker {
         if (s.els) this.checkBlock(s.els);
         break;
       }
+      case "Match": {
+        const st = this.checkExpr(s.scrut);
+        const variants = this.enums.get(st);
+        if (!variants) { this.err(`match on non-enum type ${st}`); for (const arm of s.arms) this.checkBlock(arm.body); break; }
+        const covered = new Set<string>();
+        let hasWild = false;
+        for (const arm of s.arms) {
+          if (arm.variant === "_") { hasWild = true; this.checkBlock(arm.body); continue; }
+          const payload = variants.get(arm.variant);
+          if (!payload) { this.err(`'${arm.variant}' is not a variant of ${st}`); this.checkBlock(arm.body); continue; }
+          if (arm.bindings.length !== payload.length) this.err(`pattern '${arm.variant}' expects ${payload.length} binding(s), got ${arm.bindings.length}`);
+          covered.add(arm.variant);
+          this.push();
+          arm.bindings.forEach((b, i) => this.define(b, payload[i] ?? "i32"));
+          for (const st2 of arm.body) this.checkStmt(st2);
+          this.pop();
+        }
+        if (!hasWild) for (const vn of variants.keys()) if (!covered.has(vn)) this.err(`non-exhaustive match: missing variant '${vn}'`);
+        break;
+      }
       case "ForOf": {
         if (!isStdinLines(s.iter)) this.err("M0: only `stdin.lines()` is iterable");
         this.push();
@@ -438,8 +523,10 @@ class Checker {
       case "Str": e.ty = "str"; return e.ty;
       case "Ident": {
         const t = this.lookup(e.name);
-        if (!t) { this.err(`undefined variable '${e.name}'`); e.ty = "i32"; return e.ty; }
-        e.ty = t; return t;
+        if (t) { e.ty = t; return t; }
+        const v = this.variants.get(e.name);
+        if (v && v.payload.length === 0) { e.ty = v.enumName; return e.ty; }
+        this.err(`undefined variable '${e.name}'`); e.ty = "i32"; return e.ty;
       }
       case "Member": {
         const ot = this.checkExpr(e.obj);
@@ -477,6 +564,16 @@ class Checker {
             }
             e.ty = sig.retTy ?? "unit";
             return e.ty;
+          }
+          const v = this.variants.get(e.callee.name);
+          if (v) {
+            if (e.args.length !== v.payload.length) this.err(`variant '${e.callee.name}' expects ${v.payload.length} payload(s), got ${e.args.length}`);
+            for (let k = 0; k < e.args.length; k++) {
+              const at = this.checkExpr(e.args[k]);
+              const pt = v.payload[k];
+              if (pt && !this.assignable(at, pt)) this.err(`payload ${k + 1} of '${e.callee.name}': cannot pass ${at} as ${pt}`);
+            }
+            e.ty = v.enumName; return e.ty;
           }
         }
         if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
@@ -527,6 +624,8 @@ function check(prog: Program): string[] {
 
 // ---------- Emit C++ ----------
 let STRUCT_FIELDS = new Map<string, string[]>();
+let VARIANTS = new Map<string, VarInfo>();
+let matchCounter = 0;
 
 function cstr(s: string): string {
   let out = '"';
@@ -546,7 +645,11 @@ function emitExpr(e: Expr): string {
     case "Num": return e.value;
     case "Float": return e.value;
     case "Str": return cstr(e.value);
-    case "Ident": return e.name;
+    case "Ident": {
+      const v = VARIANTS.get(e.name);
+      if (v && v.payload.length === 0) return `${v.enumName}{ .tag = ${v.index} }`;
+      return e.name;
+    }
     case "Member": return `${emitExpr(e.obj)}.${e.prop}`;
     case "StructLit": {
       const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
@@ -561,6 +664,14 @@ function emitExpr(e: Expr): string {
       return `(${l} ${e.op} ${r})`;
     }
     case "Call": {
+      if (e.callee.kind === "Ident") {
+        const name = e.callee.name;
+        const v = VARIANTS.get(name);
+        if (v) {
+          const parts = [`.tag = ${v.index}`, ...e.args.map((a, i) => `.${name}_${i} = ${emitExpr(a)}`)];
+          return `${v.enumName}{ ${parts.join(", ")} }`;
+        }
+      }
       if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
         const recv = e.callee.obj.name, m = e.callee.prop;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
@@ -576,6 +687,23 @@ function emitExpr(e: Expr): string {
       return `${emitExpr(e.callee)}(${e.args.map(emitExpr).join(", ")})`;
     }
   }
+}
+
+function emitMatch(s: Extract<Stmt, { kind: "Match" }>, ind: string, ctx: string): string {
+  const tmp = `_m${matchCounter++}`;
+  let out = `${ind}{ auto ${tmp} = ${emitExpr(s.scrut)};\n${ind}  switch (${tmp}.tag) {\n`;
+  for (const arm of s.arms) {
+    const body = arm.body.map((st) => emitStmt(st, ind + "    ", ctx)).join("\n");
+    if (arm.variant === "_") {
+      out += `${ind}  default: {\n${body}\n${ind}  break; }\n`;
+    } else {
+      const v = VARIANTS.get(arm.variant)!;
+      const binds = arm.bindings.map((b, i) => `${ind}    ${cppType(v.payload[i])} ${b} = ${tmp}.${arm.variant}_${i};`).join("\n");
+      out += `${ind}  case ${v.index}: {\n${binds ? binds + "\n" : ""}${body}\n${ind}  break; }\n`;
+    }
+  }
+  out += `${ind}  }\n${ind}}`;
+  return out;
 }
 
 function emitStmt(s: Stmt, ind: string, ctx: string): string {
@@ -596,6 +724,7 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
       if (s.els) out += ` else {\n${s.els.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n")}\n${ind}}`;
       return out;
     }
+    case "Match": return emitMatch(s, ind, ctx);
     case "Return":
       if (ctx === "main") return `${ind}return 0;`;
       return s.value ? `${ind}return ${emitExpr(s.value)};` : `${ind}return;`;
@@ -613,15 +742,26 @@ function emitFn(fn: FnDecl): string {
   return `${ret} ${fn.name}(${params}) {\n${body}\n}`;
 }
 
-function emit(prog: Program): string {
-  const structs = prog.items.filter((it): it is StructDecl => it.kind === "StructDecl");
-  const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
-  STRUCT_FIELDS = new Map();
-  for (const s of structs) STRUCT_FIELDS.set(s.name, s.fields.map((f) => f.name));
+function emitTypeDecl(it: StructDecl | EnumDecl): string {
+  if (it.kind === "StructDecl") return `struct ${it.name} { ${it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ")} };`;
+  const fields: string[] = ["int tag;"];
+  for (const v of it.variants) v.payload.forEach((pt, i) => fields.push(`${cppType(pt)} ${v.name}_${i};`));
+  return `struct ${it.name} { ${fields.join(" ")} };`;
+}
 
-  const structDecls = structs
-    .map((s) => `struct ${s.name} { ${s.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ")} };`)
-    .join("\n");
+function emit(prog: Program): string {
+  const types = prog.items.filter((it): it is StructDecl | EnumDecl => it.kind === "StructDecl" || it.kind === "EnumDecl");
+  const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
+
+  STRUCT_FIELDS = new Map();
+  VARIANTS = new Map();
+  matchCounter = 0;
+  for (const it of types) {
+    if (it.kind === "StructDecl") STRUCT_FIELDS.set(it.name, it.fields.map((f) => f.name));
+    else it.variants.forEach((v, idx) => VARIANTS.set(v.name, { enumName: it.name, index: idx, payload: v.payload }));
+  }
+
+  const typeDecls = types.map(emitTypeDecl).join("\n");
   const protos = fns
     .filter((f) => f.name !== "main")
     .map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => cppType(p.ty)).join(", ")});`)
@@ -630,7 +770,7 @@ function emit(prog: Program): string {
   return `// generated by mozaic (M0)
 #include "mozaic_rt.h"
 
-${structDecls ? structDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
+${typeDecls ? typeDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
 `;
 }
 
@@ -665,7 +805,7 @@ function main(): void {
   const binPath = join(buildDir, base);
   writeFileSync(cppPath, cpp);
   try {
-    execFileSync("g++", ["-std=c++17", "-O2", "-I", runtimeDir, "-o", binPath, cppPath], { stdio: "inherit" });
+    execFileSync("g++", ["-std=c++20", "-O2", "-I", runtimeDir, "-o", binPath, cppPath], { stdio: "inherit" });
   } catch {
     return fail("C++ compile failed");
   }

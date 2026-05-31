@@ -1,0 +1,9 @@
+// Intentionally rejected: non-exhaustive match (variant B not covered).
+enum E { A, B }
+
+function main() {
+  let e: E = A;
+  match e {
+    A => { stdout.println(1); }
+  }
+}
