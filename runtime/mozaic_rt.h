@@ -57,6 +57,16 @@ template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r))
 template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
 
+// ---- device buffers + data-parallel launch (M0: CPU path; Metal/UMA backend later) ----
+template <class T> struct Buffer {
+  std::vector<T> data;
+  uint32_t len;
+  Buffer(uint32_t n) : data(n, T()), len(n) {}
+  T& operator[](uint32_t i) { return data[i]; }
+  const T& operator[](uint32_t i) const { return data[i]; }
+};
+template <class F> void launch(uint32_t grid, F fn) { for (uint32_t i = 0; i < grid; i++) fn(i); }
+
 // UTF-8 bytes -> UTF-32
 inline std::u32string decodeUtf8(const std::string& bytes) {
   std::u32string out;

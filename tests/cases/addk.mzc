@@ -1,0 +1,23 @@
+kernel addk(input: Buffer<u32>, output: Buffer<u32>, k: u32) {
+  let i: u32 = grid.x;
+  if (i < output.len) {
+    output[i] = input[i] + k;
+  }
+}
+
+function main() {
+  let n: u32 = 4;
+  let buf: Buffer<u32> = Buffer.shared(n);
+  let out: Buffer<u32> = Buffer.shared(n);
+  let i: u32 = 0;
+  while (i < n) {
+    buf[i] = i;
+    i = i + 1;
+  }
+  launch(addk, n, buf, out, 10);
+  let j: u32 = 0;
+  while (j < n) {
+    stdout.println(out[j]);
+    j = j + 1;
+  }
+}

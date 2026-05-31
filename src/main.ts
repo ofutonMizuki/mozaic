@@ -8,17 +8,18 @@ import { dirname, join, basename } from "node:path";
 
 // ---------- AST (types erased at runtime) ----------
 type Program = { kind: "Program"; items: Item[] };
-type Item = FnDecl | StructDecl | EnumDecl;
+type Item = FnDecl | StructDecl | EnumDecl | KernelDecl;
 type Param = { name: string; ty: string };
 type Field = { name: string; ty: string };
 type Variant = { name: string; payload: string[] };
 type StructDecl = { kind: "StructDecl"; name: string; fields: Field[] };
 type EnumDecl = { kind: "EnumDecl"; name: string; variants: Variant[] };
 type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[] };
+type KernelDecl = { kind: "KernelDecl"; name: string; params: Param[]; body: Stmt[] };
 type Arm = { variant: string; bindings: string[]; body: Stmt[] };
 type Stmt =
   | { kind: "Let"; name: string; annot: string | null; value: Expr; declTy?: string }
-  | { kind: "Assign"; name: string; value: Expr }
+  | { kind: "Assign"; target: Expr; value: Expr }
   | { kind: "While"; cond: Expr; body: Stmt[] }
   | { kind: "ForOf"; binder: string; iter: Expr; body: Stmt[] }
   | { kind: "If"; cond: Expr; then: Stmt[]; els: Stmt[] | null }
@@ -33,6 +34,7 @@ type Expr =
   | { kind: "Str"; value: string; ty?: string }
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
+  | { kind: "Index"; obj: Expr; index: Expr; ty?: string }
   | { kind: "Call"; callee: Expr; args: Expr[]; ty?: string }
   | { kind: "StructLit"; name: string; fields: { name: string; value: Expr }[]; ty?: string }
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
@@ -43,6 +45,7 @@ const FLOATS = ["f32", "f64"];
 function isInt(t: string): boolean { return t === "intlit" || INTS.includes(t); }
 function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
+function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 function unifyInt(a: string, b: string): string | null {
   if (!isInt(a) || !isInt(b)) return null;
   if (a === "intlit") return b;
@@ -63,13 +66,15 @@ function cppType(t: string): string {
     case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
     case "str": return "mz::String";
-    default: return t;   // user struct/enum types map to their own name
+    default: {
+      const be = bufferElem(t);
+      if (be !== null) return `mz::Buffer<${cppType(be)}>`;
+      return t;   // user struct/enum types map to their own name
+    }
   }
 }
 const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
 const ARITH_OPS = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "+|", "-|", "*|"];
-// integer arithmetic op -> runtime helper. default +/-/* trap(debug)/wrap(release);
-// +%/-%/*% always wrap; +|/-|/*| saturate; / and % trap on /0 and MIN/-1.
 const ARITH_FN: Record<string, string> = {
   "+": "add", "-": "sub", "*": "mul", "/": "divi", "%": "modi",
   "+%": "wadd", "-%": "wsub", "*%": "wmul",
@@ -78,7 +83,7 @@ const ARITH_FN: Record<string, string> = {
 
 // ---------- Lexer ----------
 type Tok = { t: string; v: string; pos: number };
-const KEYWORDS = new Set(["function", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
+const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
 
 function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -114,15 +119,8 @@ function lex(src: string): Tok[] {
       let j = i;
       while (j < n && /[0-9_]/.test(src[j])) j++;
       let flt = false;
-      if (src[j] === "." && /[0-9]/.test(src[j + 1])) {
-        flt = true; j++;
-        while (j < n && /[0-9_]/.test(src[j])) j++;
-      }
-      if (src[j] === "e" || src[j] === "E") {
-        flt = true; j++;
-        if (src[j] === "+" || src[j] === "-") j++;
-        while (j < n && /[0-9]/.test(src[j])) j++;
-      }
+      if (src[j] === "." && /[0-9]/.test(src[j + 1])) { flt = true; j++; while (j < n && /[0-9_]/.test(src[j])) j++; }
+      if (src[j] === "e" || src[j] === "E") { flt = true; j++; if (src[j] === "+" || src[j] === "-") j++; while (j < n && /[0-9]/.test(src[j])) j++; }
       toks.push({ t: flt ? "fnum" : "num", v: src.slice(i, j).replace(/_/g, ""), pos: i });
       i = j;
       continue;
@@ -140,7 +138,7 @@ function lex(src: string): Tok[] {
         two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
       toks.push({ t: two, v: two, pos: i }); i += 2; continue;
     }
-    if ("(){};:,.=+-*/%<>".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
+    if ("(){}[];:,.=+-*/%<>".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
   toks.push({ t: "eof", v: "", pos: n });
@@ -151,7 +149,7 @@ function lex(src: string): Tok[] {
 class Parser {
   toks: Tok[];
   i: number;
-  noStruct = false;   // when true, `Ident {` is NOT a struct literal (used for match scrutinee)
+  noStruct = false;
   constructor(toks: Tok[]) { this.toks = toks; this.i = 0; }
   peek(): Tok { return this.toks[this.i]; }
   at(t: string): boolean { return this.toks[this.i].t === t; }
@@ -162,11 +160,17 @@ class Parser {
     this.i++;
     return tk;
   }
+  parseType(): string {
+    const name = this.eat("id").v;
+    if (this.at("<")) { this.next(); const inner = this.parseType(); this.eat(">"); return `${name}<${inner}>`; }
+    return name;
+  }
   parseProgram(): Program {
     const items: Item[] = [];
     while (!this.at("eof")) {
       if (this.at("struct")) items.push(this.parseStruct());
       else if (this.at("enum")) items.push(this.parseEnum());
+      else if (this.at("kernel")) items.push(this.parseKernel());
       else items.push(this.parseFn());
     }
     return { kind: "Program", items };
@@ -179,7 +183,7 @@ class Parser {
     while (!this.at("}")) {
       const fname = this.eat("id").v;
       this.eat(":");
-      const ty = this.eat("id").v;
+      const ty = this.parseType();
       this.eat(";");
       fields.push({ name: fname, ty });
     }
@@ -196,7 +200,7 @@ class Parser {
       const payload: string[] = [];
       if (this.at("(")) {
         this.next();
-        if (!this.at(")")) { payload.push(this.eat("id").v); while (this.at(",")) { this.next(); payload.push(this.eat("id").v); } }
+        if (!this.at(")")) { payload.push(this.parseType()); while (this.at(",")) { this.next(); payload.push(this.parseType()); } }
         this.eat(")");
       }
       variants.push({ name: vn, payload });
@@ -205,24 +209,31 @@ class Parser {
     this.eat("}");
     return { kind: "EnumDecl", name, variants };
   }
-  parseFn(): FnDecl {
-    this.eat("function");
-    const name = this.eat("id").v;
-    this.eat("(");
-    const params: Param[] = [];
-    if (!this.at(")")) {
-      params.push(this.parseParam());
-      while (this.at(",")) { this.next(); params.push(this.parseParam()); }
-    }
-    this.eat(")");
-    let retTy: string | null = null;
-    if (this.at(":")) { this.next(); retTy = this.eat("id").v; }
-    return { kind: "FnDecl", name, params, retTy, body: this.parseBlock() };
-  }
   parseParam(): Param {
     const name = this.eat("id").v;
     this.eat(":");
-    return { name, ty: this.eat("id").v };
+    return { name, ty: this.parseType() };
+  }
+  parseParams(): Param[] {
+    const params: Param[] = [];
+    this.eat("(");
+    if (!this.at(")")) { params.push(this.parseParam()); while (this.at(",")) { this.next(); params.push(this.parseParam()); } }
+    this.eat(")");
+    return params;
+  }
+  parseFn(): FnDecl {
+    this.eat("function");
+    const name = this.eat("id").v;
+    const params = this.parseParams();
+    let retTy: string | null = null;
+    if (this.at(":")) { this.next(); retTy = this.parseType(); }
+    return { kind: "FnDecl", name, params, retTy, body: this.parseBlock() };
+  }
+  parseKernel(): KernelDecl {
+    this.eat("kernel");
+    const name = this.eat("id").v;
+    const params = this.parseParams();
+    return { kind: "KernelDecl", name, params, body: this.parseBlock() };
   }
   parseBlock(): Stmt[] {
     this.eat("{");
@@ -252,8 +263,8 @@ class Parser {
       this.next();
       const value = this.parseExpr();
       this.eat(";");
-      if (e.kind !== "Ident") throw new Error("parse error: invalid assignment target");
-      return { kind: "Assign", name: e.name, value };
+      if (e.kind !== "Ident" && e.kind !== "Index") throw new Error("parse error: invalid assignment target");
+      return { kind: "Assign", target: e, value };
     }
     this.eat(";");
     return { kind: "ExprStmt", expr: e };
@@ -262,7 +273,7 @@ class Parser {
     this.next();
     const name = this.eat("id").v;
     let annot: string | null = null;
-    if (this.at(":")) { this.next(); annot = this.eat("id").v; }
+    if (this.at(":")) { this.next(); annot = this.parseType(); }
     this.eat("=");
     const value = this.parseExpr();
     this.eat(";");
@@ -342,6 +353,7 @@ class Parser {
     let e = this.parsePrimary();
     for (;;) {
       if (this.at(".")) { this.next(); e = { kind: "Member", obj: e, prop: this.eat("id").v }; }
+      else if (this.at("[")) { this.next(); const index = this.parseExpr(); this.eat("]"); e = { kind: "Index", obj: e, index }; }
       else if (this.at("(")) {
         this.next();
         const args: Expr[] = [];
@@ -387,6 +399,10 @@ function isStdinLines(e: Expr): boolean {
   return e.kind === "Call" && e.callee.kind === "Member" &&
     e.callee.obj.kind === "Ident" && e.callee.obj.name === "stdin" && e.callee.prop === "lines";
 }
+function isBufferNew(e: Expr): boolean {
+  return e.kind === "Call" && e.callee.kind === "Member" &&
+    e.callee.obj.kind === "Ident" && e.callee.obj.name === "Buffer" && e.callee.prop === "shared";
+}
 
 type Sig = { params: Param[]; retTy: string | null };
 type VarInfo = { enumName: string; index: number; payload: string[] };
@@ -395,9 +411,10 @@ class Checker {
   errs: string[] = [];
   scopes: Map<string, string>[] = [];
   fns = new Map<string, Sig>();
+  kernels = new Map<string, Param[]>();
   structs = new Map<string, Map<string, string>>();
-  enums = new Map<string, Map<string, string[]>>();       // enum -> (variant -> payload types)
-  variants = new Map<string, VarInfo>();                  // variant -> info
+  enums = new Map<string, Map<string, string[]>>();
+  variants = new Map<string, VarInfo>();
   curRet = "unit";
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
@@ -407,7 +424,11 @@ class Checker {
     return null;
   }
   err(m: string) { this.errs.push(m); }
-  typeKnown(t: string): boolean { return BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t); }
+  typeKnown(t: string): boolean {
+    if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
+    const be = bufferElem(t);
+    return be !== null && this.typeKnown(be);
+  }
 
   checkProgram(p: Program) {
     for (const it of p.items) if (it.kind === "StructDecl") {
@@ -430,6 +451,11 @@ class Checker {
       for (const f of it.fields) if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
     for (const it of p.items) if (it.kind === "EnumDecl")
       for (const v of it.variants) for (const pt of v.payload) if (!this.typeKnown(pt)) this.err(`unknown type '${pt}' in variant '${v.name}'`);
+    for (const it of p.items) if (it.kind === "KernelDecl") {
+      if (this.kernels.has(it.name)) this.err(`duplicate kernel '${it.name}'`);
+      this.kernels.set(it.name, it.params);
+      for (const pa of it.params) if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
+    }
     for (const it of p.items) if (it.kind === "FnDecl") {
       if (this.fns.has(it.name)) this.err(`duplicate function '${it.name}'`);
       this.fns.set(it.name, { params: it.params, retTy: it.retTy });
@@ -439,9 +465,9 @@ class Checker {
     if (!this.fns.has("main")) this.err("no `main` function");
     const main = this.fns.get("main");
     if (main && (main.params.length > 0 || main.retTy)) this.err("`main` must take no parameters and declare no return type");
-    for (const it of p.items) if (it.kind === "FnDecl") {
+    for (const it of p.items) if (it.kind === "FnDecl" || it.kind === "KernelDecl") {
       this.push();
-      this.curRet = it.retTy ?? "unit";
+      this.curRet = (it.kind === "FnDecl" ? it.retTy : null) ?? "unit";
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
       this.pop();
@@ -459,18 +485,18 @@ class Checker {
           else if (!this.assignable(vt, s.annot)) { this.err(`type mismatch: cannot init '${s.name}: ${s.annot}' with ${vt}`); declTy = s.annot; }
           else declTy = s.annot;
         } else {
-          declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
-          if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; }
+          if (vt === "buffernew") { this.err(`'${s.name}': Buffer.shared needs a type annotation (e.g. : Buffer<f32>)`); declTy = "i32"; }
+          else { declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
+            if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
         this.define(s.name, declTy);
         break;
       }
       case "Assign": {
-        const tt = this.lookup(s.name);
-        if (!tt) { this.err(`assign to undefined variable '${s.name}'`); this.checkExpr(s.value); break; }
+        const tt = this.checkExpr(s.target);
         const vt = this.checkExpr(s.value);
-        if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to '${s.name}: ${tt}'`);
+        if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
         break;
       }
       case "While": {
@@ -523,6 +549,7 @@ class Checker {
     }
   }
   assignable(vt: string, tt: string): boolean {
+    if (vt === "buffernew" && bufferElem(tt) !== null) return true;
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
     return vt === tt;
@@ -540,7 +567,9 @@ class Checker {
         this.err(`undefined variable '${e.name}'`); e.ty = "i32"; return e.ty;
       }
       case "Member": {
+        if (e.obj.kind === "Ident" && e.obj.name === "grid" && (e.prop === "x" || e.prop === "y" || e.prop === "z")) { e.ty = "u32"; return e.ty; }
         const ot = this.checkExpr(e.obj);
+        if (bufferElem(ot) !== null && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const fm = this.structs.get(ot);
         if (fm) {
           const ft = fm.get(e.prop);
@@ -548,6 +577,14 @@ class Checker {
           this.err(`no field '${e.prop}' on ${ot}`); e.ty = "i32"; return e.ty;
         }
         e.ty = "unknown"; return e.ty;
+      }
+      case "Index": {
+        const ot = this.checkExpr(e.obj);
+        const be = bufferElem(ot);
+        if (be === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
+        const it = this.checkExpr(e.index);
+        if (!isInt(it)) this.err(`buffer index must be an integer (got ${it})`);
+        e.ty = be; return be;
       }
       case "StructLit": {
         const fm = this.structs.get(e.name);
@@ -564,6 +601,32 @@ class Checker {
         e.ty = e.name; return e.ty;
       }
       case "Call": {
+        // launch(kernel, grid, ...args)
+        if (e.callee.kind === "Ident" && e.callee.name === "launch") {
+          if (e.args.length < 2) this.err("launch needs (kernel, grid, ...args)");
+          else {
+            const kn = e.args[0];
+            if (kn.kind !== "Ident" || !this.kernels.has(kn.name)) this.err("launch: first argument must be a kernel name");
+            else {
+              const kparams = this.kernels.get(kn.name)!;
+              if (!isInt(this.checkExpr(e.args[1]))) this.err("launch: grid size must be an integer");
+              const passed = e.args.slice(2);
+              if (passed.length !== kparams.length) this.err(`launch '${kn.name}': expected ${kparams.length} kernel arg(s), got ${passed.length}`);
+              for (let k = 0; k < passed.length; k++) {
+                const at = this.checkExpr(passed[k]);
+                const pt = kparams[k]?.ty;
+                if (pt && !this.assignable(at, pt)) this.err(`launch arg ${k + 1}: cannot pass ${at} as ${pt}`);
+              }
+            }
+          }
+          e.ty = "unit"; return e.ty;
+        }
+        // Buffer.shared(n)
+        if (isBufferNew(e)) {
+          if (e.args.length === 1) { if (!isInt(this.checkExpr(e.args[0]))) this.err("Buffer.shared(n): n must be an integer"); }
+          else this.err("Buffer.shared takes one argument");
+          e.ty = "buffernew"; return e.ty;
+        }
         if (e.callee.kind === "Ident") {
           const sig = this.fns.get(e.callee.name);
           if (sig) {
@@ -601,7 +664,7 @@ class Checker {
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
         if (ARITH_OPS.includes(e.op)) {
-          const intOnly = e.op.length === 2 || e.op === "%";   // %, +%, -%, *%, +|, -|, *|
+          const intOnly = e.op.length === 2 || e.op === "%";
           if ((isFloat(lt) || isFloat(rt)) && !intOnly) {
             const u = unifyFloat(lt, rt);
             if (u === null) { this.err(`'${e.op}' requires matching numeric types (got ${lt}, ${rt})`); e.ty = "f64"; }
@@ -662,7 +725,10 @@ function emitExpr(e: Expr): string {
       if (v && v.payload.length === 0) return `${v.enumName}{ .tag = ${v.index} }`;
       return e.name;
     }
-    case "Member": return `${emitExpr(e.obj)}.${e.prop}`;
+    case "Member":
+      if (e.obj.kind === "Ident" && e.obj.name === "grid") return `grid_${e.prop}`;
+      return `${emitExpr(e.obj)}.${e.prop}`;
+    case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
     case "StructLit": {
       const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
       const byName = new Map(e.fields.map((f) => [f.name, f.value]));
@@ -674,10 +740,16 @@ function emitExpr(e: Expr): string {
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
       if (e.op === "!=") return e.left.ty === "str" ? `(!mz::eq(${l}, ${r}))` : `(${l} != ${r})`;
       const fn = ARITH_FN[e.op];
-      if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;  // overflow-aware integer arithmetic
-      return `(${l} ${e.op} ${r})`;                                                    // float arithmetic + comparisons
+      if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;
+      return `(${l} ${e.op} ${r})`;
     }
     case "Call": {
+      if (e.callee.kind === "Ident" && e.callee.name === "launch") {
+        const kn = (e.args[0] as Extract<Expr, { kind: "Ident" }>).name;
+        const grid = emitExpr(e.args[1]);
+        const kargs = e.args.slice(2).map(emitExpr);
+        return `mz::launch(${grid}, [&](uint32_t grid_x){ ${kn}(grid_x${kargs.length ? ", " + kargs.join(", ") : ""}); })`;
+      }
       if (e.callee.kind === "Ident") {
         const name = e.callee.name;
         const v = VARIANTS.get(name);
@@ -722,8 +794,13 @@ function emitMatch(s: Extract<Stmt, { kind: "Match" }>, ind: string, ctx: string
 
 function emitStmt(s: Stmt, ind: string, ctx: string): string {
   switch (s.kind) {
-    case "Let": return `${ind}${cppType(s.declTy!)} ${s.name} = ${emitExpr(s.value)};`;
-    case "Assign": return `${ind}${s.name} = ${emitExpr(s.value)};`;
+    case "Let":
+      if (isBufferNew(s.value)) {
+        const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
+        return `${ind}${cppType(s.declTy!)} ${s.name} = ${cppType(s.declTy!)}(${arg});`;
+      }
+      return `${ind}${cppType(s.declTy!)} ${s.name} = ${emitExpr(s.value)};`;
+    case "Assign": return `${ind}${emitExpr(s.target)} = ${emitExpr(s.value)};`;
     case "While": {
       const body = s.body.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n");
       return `${ind}while (${emitExpr(s.cond)}) {\n${body}\n${ind}}`;
@@ -748,14 +825,20 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
   }
 }
 
+function emitParam(p: Param): string {
+  return bufferElem(p.ty) !== null ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
+}
 function emitFn(fn: FnDecl): string {
   const body = fn.body.map((s) => emitStmt(s, "  ", fn.name === "main" ? "main" : (fn.retTy ? "value" : "void"))).join("\n");
   if (fn.name === "main") return `int main() {\n${body}\n  return 0;\n}`;
   const ret = fn.retTy ? cppType(fn.retTy) : "void";
-  const params = fn.params.map((p) => `${cppType(p.ty)} ${p.name}`).join(", ");
-  return `${ret} ${fn.name}(${params}) {\n${body}\n}`;
+  return `${ret} ${fn.name}(${fn.params.map(emitParam).join(", ")}) {\n${body}\n}`;
 }
-
+function emitKernel(k: KernelDecl): string {
+  const body = k.body.map((s) => emitStmt(s, "  ", "void")).join("\n");
+  const params = k.params.map(emitParam);
+  return `void ${k.name}(uint32_t grid_x${params.length ? ", " + params.join(", ") : ""}) {\n${body}\n}`;
+}
 function emitTypeDecl(it: StructDecl | EnumDecl): string {
   if (it.kind === "StructDecl") return `struct ${it.name} { ${it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ")} };`;
   const fields: string[] = ["int tag;"];
@@ -765,6 +848,7 @@ function emitTypeDecl(it: StructDecl | EnumDecl): string {
 
 function emit(prog: Program): string {
   const types = prog.items.filter((it): it is StructDecl | EnumDecl => it.kind === "StructDecl" || it.kind === "EnumDecl");
+  const kernels = prog.items.filter((it): it is KernelDecl => it.kind === "KernelDecl");
   const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
 
   STRUCT_FIELDS = new Map();
@@ -776,11 +860,10 @@ function emit(prog: Program): string {
   }
 
   const typeDecls = types.map(emitTypeDecl).join("\n");
-  const protos = fns
-    .filter((f) => f.name !== "main")
-    .map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => cppType(p.ty)).join(", ")});`)
-    .join("\n");
-  const defs = fns.map(emitFn).join("\n\n");
+  const kernelProtos = kernels.map((k) => `void ${k.name}(uint32_t${k.params.map((p) => ", " + (bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty))).join("")});`).join("\n");
+  const fnProtos = fns.filter((f) => f.name !== "main").map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty)).join(", ")});`).join("\n");
+  const protos = [kernelProtos, fnProtos].filter((s) => s).join("\n");
+  const defs = [...kernels.map(emitKernel), ...fns.map(emitFn)].join("\n\n");
   return `// generated by mozaic (M0)
 #include "mozaic_rt.h"
 
@@ -821,7 +904,7 @@ function main(): void {
   const binPath = join(buildDir, base);
   writeFileSync(cppPath, cpp);
   const flags = ["-std=c++20", "-O2", "-I", runtimeDir];
-  if (release) flags.push("-DMZ_RELEASE");      // release: integer overflow wraps; debug (default): traps
+  if (release) flags.push("-DMZ_RELEASE");
   flags.push("-o", binPath, cppPath);
   try {
     execFileSync("g++", flags, { stdio: "inherit" });
