@@ -1,0 +1,12 @@
+// structs: fields, construction, field access, pass-by-value
+struct Point { x: i32; y: i32; }
+
+function manhattan(p: Point): i32 {
+  return p.x + p.y;
+}
+
+function main() {
+  let p: Point = Point { x: 3, y: 4 };
+  stdout.println(manhattan(p));   // 7
+  stdout.println(p.x);            // 3
+}

@@ -7,8 +7,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, basename } from "node:path";
 
 // ---------- AST (types erased at runtime) ----------
-type Program = { kind: "Program"; items: FnDecl[] };
+type Program = { kind: "Program"; items: Item[] };
+type Item = FnDecl | StructDecl;
 type Param = { name: string; ty: string };
+type Field = { name: string; ty: string };
+type StructDecl = { kind: "StructDecl"; name: string; fields: Field[] };
 type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[] };
 type Stmt =
   | { kind: "Let"; name: string; annot: string | null; value: Expr; declTy?: string }
@@ -27,6 +30,7 @@ type Expr =
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Call"; callee: Expr; args: Expr[]; ty?: string }
+  | { kind: "StructLit"; name: string; fields: { name: string; value: Expr }[]; ty?: string }
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
 
 // ---------- Types ----------
@@ -51,18 +55,18 @@ function cppType(t: string): string {
   switch (t) {
     case "i8": return "int8_t"; case "i16": return "int16_t"; case "i32": return "int32_t"; case "i64": return "int64_t";
     case "u8": return "uint8_t"; case "u16": return "uint16_t"; case "u32": return "uint32_t"; case "u64": return "uint64_t";
-    case "intlit": return "int32_t";       // default int literal type
-    case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";  // default float literal type
+    case "intlit": return "int32_t";
+    case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
     case "str": return "mz::String";
-    default: return "auto";
+    default: return t;   // user struct types map to their own name
   }
 }
-const KNOWN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
+const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
 
 // ---------- Lexer ----------
 type Tok = { t: string; v: string; pos: number };
-const KEYWORDS = new Set(["function", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
+const KEYWORDS = new Set(["function", "struct", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let"]);
 
 function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -143,9 +147,24 @@ class Parser {
     return tk;
   }
   parseProgram(): Program {
-    const items: FnDecl[] = [];
-    while (!this.at("eof")) items.push(this.parseFn());
+    const items: Item[] = [];
+    while (!this.at("eof")) items.push(this.at("struct") ? this.parseStruct() : this.parseFn());
     return { kind: "Program", items };
+  }
+  parseStruct(): StructDecl {
+    this.eat("struct");
+    const name = this.eat("id").v;
+    this.eat("{");
+    const fields: Field[] = [];
+    while (!this.at("}")) {
+      const fname = this.eat("id").v;
+      this.eat(":");
+      const ty = this.eat("id").v;
+      this.eat(";");
+      fields.push({ name: fname, ty });
+    }
+    this.eat("}");
+    return { kind: "StructDecl", name, fields };
   }
   parseFn(): FnDecl {
     this.eat("function");
@@ -280,9 +299,25 @@ class Parser {
     if (tk.t === "num") { this.next(); return { kind: "Num", value: tk.v }; }
     if (tk.t === "fnum") { this.next(); return { kind: "Float", value: tk.v }; }
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
-    if (tk.t === "id") { this.next(); return { kind: "Ident", name: tk.v }; }
+    if (tk.t === "id") {
+      this.next();
+      if (this.at("{")) return this.parseStructLit(tk.v);
+      return { kind: "Ident", name: tk.v };
+    }
     if (tk.t === "(") { this.next(); const e = this.parseExpr(); this.eat(")"); return e; }
     throw new Error(`parse error: unexpected '${tk.t}' ('${tk.v}') at ${tk.pos}`);
+  }
+  parseStructLit(name: string): Expr {
+    this.eat("{");
+    const fields: { name: string; value: Expr }[] = [];
+    while (!this.at("}")) {
+      const fname = this.eat("id").v;
+      this.eat(":");
+      fields.push({ name: fname, value: this.parseExpr() });
+      if (this.at(",")) this.next(); else break;
+    }
+    this.eat("}");
+    return { kind: "StructLit", name, fields };
   }
 }
 
@@ -298,6 +333,7 @@ class Checker {
   errs: string[] = [];
   scopes: Map<string, string>[] = [];
   fns = new Map<string, Sig>();
+  structs = new Map<string, Map<string, string>>();   // name -> (field -> type)
   curRet = "unit";
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
@@ -307,22 +343,31 @@ class Checker {
     return null;
   }
   err(m: string) { this.errs.push(m); }
+  typeKnown(t: string): boolean { return BUILTIN_TYPES.has(t) || this.structs.has(t); }
 
   checkProgram(p: Program) {
-    for (const f of p.items) {
-      if (this.fns.has(f.name)) this.err(`duplicate function '${f.name}'`);
-      this.fns.set(f.name, { params: f.params, retTy: f.retTy });
-      for (const pa of f.params) if (!KNOWN_TYPES.has(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}'`);
-      if (f.retTy && !KNOWN_TYPES.has(f.retTy)) this.err(`unknown return type '${f.retTy}' for '${f.name}'`);
+    for (const it of p.items) if (it.kind === "StructDecl") {
+      if (this.structs.has(it.name)) this.err(`duplicate struct '${it.name}'`);
+      const fm = new Map<string, string>();
+      for (const f of it.fields) fm.set(f.name, f.ty);
+      this.structs.set(it.name, fm);
+    }
+    for (const it of p.items) if (it.kind === "StructDecl")
+      for (const f of it.fields) if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
+    for (const it of p.items) if (it.kind === "FnDecl") {
+      if (this.fns.has(it.name)) this.err(`duplicate function '${it.name}'`);
+      this.fns.set(it.name, { params: it.params, retTy: it.retTy });
+      for (const pa of it.params) if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}'`);
+      if (it.retTy && !this.typeKnown(it.retTy)) this.err(`unknown return type '${it.retTy}' for '${it.name}'`);
     }
     if (!this.fns.has("main")) this.err("no `main` function");
     const main = this.fns.get("main");
     if (main && (main.params.length > 0 || main.retTy)) this.err("`main` must take no parameters and declare no return type");
-    for (const f of p.items) {
+    for (const it of p.items) if (it.kind === "FnDecl") {
       this.push();
-      this.curRet = f.retTy ?? "unit";
-      for (const pa of f.params) this.define(pa.name, pa.ty);
-      for (const s of f.body) this.checkStmt(s);
+      this.curRet = it.retTy ?? "unit";
+      for (const pa of it.params) this.define(pa.name, pa.ty);
+      for (const s of it.body) this.checkStmt(s);
       this.pop();
     }
   }
@@ -334,7 +379,7 @@ class Checker {
         const vt = this.checkExpr(s.value);
         let declTy: string;
         if (s.annot) {
-          if (!KNOWN_TYPES.has(s.annot)) { this.err(`unknown type '${s.annot}'`); declTy = "i32"; }
+          if (!this.typeKnown(s.annot)) { this.err(`unknown type '${s.annot}'`); declTy = "i32"; }
           else if (!this.assignable(vt, s.annot)) { this.err(`type mismatch: cannot init '${s.name}: ${s.annot}' with ${vt}`); declTy = s.annot; }
           else declTy = s.annot;
         } else {
@@ -396,7 +441,30 @@ class Checker {
         if (!t) { this.err(`undefined variable '${e.name}'`); e.ty = "i32"; return e.ty; }
         e.ty = t; return t;
       }
-      case "Member": e.ty = "unknown"; return e.ty;
+      case "Member": {
+        const ot = this.checkExpr(e.obj);
+        const fm = this.structs.get(ot);
+        if (fm) {
+          const ft = fm.get(e.prop);
+          if (ft) { e.ty = ft; return ft; }
+          this.err(`no field '${e.prop}' on ${ot}`); e.ty = "i32"; return e.ty;
+        }
+        e.ty = "unknown"; return e.ty;
+      }
+      case "StructLit": {
+        const fm = this.structs.get(e.name);
+        if (!fm) { this.err(`unknown struct '${e.name}'`); e.ty = "i32"; return e.ty; }
+        const seen = new Set<string>();
+        for (const fld of e.fields) {
+          const ft = fm.get(fld.name);
+          const vt = this.checkExpr(fld.value);
+          if (!ft) { this.err(`no field '${fld.name}' on ${e.name}`); continue; }
+          seen.add(fld.name);
+          if (!this.assignable(vt, ft)) this.err(`field '${e.name}.${fld.name}': cannot assign ${vt} to ${ft}`);
+        }
+        for (const fname of fm.keys()) if (!seen.has(fname)) this.err(`missing field '${fname}' in ${e.name} literal`);
+        e.ty = e.name; return e.ty;
+      }
       case "Call": {
         if (e.callee.kind === "Ident") {
           const sig = this.fns.get(e.callee.name);
@@ -458,6 +526,8 @@ function check(prog: Program): string[] {
 }
 
 // ---------- Emit C++ ----------
+let STRUCT_FIELDS = new Map<string, string[]>();
+
 function cstr(s: string): string {
   let out = '"';
   for (const ch of s) {
@@ -478,6 +548,12 @@ function emitExpr(e: Expr): string {
     case "Str": return cstr(e.value);
     case "Ident": return e.name;
     case "Member": return `${emitExpr(e.obj)}.${e.prop}`;
+    case "StructLit": {
+      const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
+      const byName = new Map(e.fields.map((f) => [f.name, f.value]));
+      const vals = order.map((fn) => { const v = byName.get(fn); return v ? emitExpr(v) : "{}"; });
+      return `${e.name}{ ${vals.join(", ")} }`;
+    }
     case "Binary": {
       const l = emitExpr(e.left), r = emitExpr(e.right);
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
@@ -502,7 +578,6 @@ function emitExpr(e: Expr): string {
   }
 }
 
-// ctx: "main" | "void" | "value" — controls how `return` is emitted.
 function emitStmt(s: Stmt, ind: string, ctx: string): string {
   switch (s.kind) {
     case "Let": return `${ind}${cppType(s.declTy!)} ${s.name} = ${emitExpr(s.value)};`;
@@ -539,15 +614,23 @@ function emitFn(fn: FnDecl): string {
 }
 
 function emit(prog: Program): string {
-  const protos = prog.items
+  const structs = prog.items.filter((it): it is StructDecl => it.kind === "StructDecl");
+  const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
+  STRUCT_FIELDS = new Map();
+  for (const s of structs) STRUCT_FIELDS.set(s.name, s.fields.map((f) => f.name));
+
+  const structDecls = structs
+    .map((s) => `struct ${s.name} { ${s.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ")} };`)
+    .join("\n");
+  const protos = fns
     .filter((f) => f.name !== "main")
     .map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => cppType(p.ty)).join(", ")});`)
     .join("\n");
-  const defs = prog.items.map(emitFn).join("\n\n");
+  const defs = fns.map(emitFn).join("\n\n");
   return `// generated by mozaic (M0)
 #include "mozaic_rt.h"
 
-${protos ? protos + "\n\n" : ""}${defs}
+${structDecls ? structDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
 `;
 }
 
