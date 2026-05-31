@@ -256,7 +256,8 @@ class Checker {
             if (kn.kind !== "Ident" || !this.kernels.has(kn.name)) this.err("launch: first argument must be a kernel name");
             else {
               const kparams = this.kernels.get(kn.name)!;
-              if (!isInt(this.checkExpr(e.args[1]))) this.err("launch: grid size must be an integer");
+              const gt = this.checkExpr(e.args[1]);
+              if (gt !== "Grid" && !isInt(gt)) this.err("launch: grid must be an integer or grid2(...)/grid3(...)");
               const passed = e.args.slice(2);
               if (passed.length !== kparams.length) this.err(`launch '${kn.name}': expected ${kparams.length} kernel arg(s), got ${passed.length}`);
               for (let k = 0; k < passed.length; k++) {
@@ -273,6 +274,13 @@ class Checker {
           else this.err("Buffer.shared takes one argument");
           e.ty = "buffernew"; return e.ty;
         }
+        // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
+        if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
+          const want = e.callee.name === "grid2" ? 2 : 3;
+          if (e.args.length !== want) this.err(`${e.callee.name} takes ${want} integer dimensions`);
+          for (const a of e.args) if (!isInt(this.checkExpr(a))) this.err(`${e.callee.name}: dimensions must be integers`);
+          e.ty = "Grid"; return e.ty;
+        }
         // dev.launch(kernel, grid, &buf, &mut out, ...scalars) -> Job  (async; borrows held until await)
         if (e.callee.kind === "Member" && e.callee.prop === "launch") {
           if (this.checkExpr(e.callee.obj) !== "Device") this.err("'.launch' can only be called on a Device");
@@ -282,7 +290,8 @@ class Checker {
             if (kn.kind !== "Ident" || !this.kernels.has(kn.name)) this.err("launch: first argument must be a kernel name");
             else {
               const kparams = this.kernels.get(kn.name)!;
-              if (!isInt(this.checkExpr(e.args[1]))) this.err("launch: grid size must be an integer");
+              const gt = this.checkExpr(e.args[1]);
+              if (gt !== "Grid" && !isInt(gt)) this.err("launch: grid must be an integer or grid2(...)/grid3(...)");
               const passed = e.args.slice(2);
               if (passed.length !== kparams.length) this.err(`launch '${kn.name}': expected ${kparams.length} kernel arg(s), got ${passed.length}`);
               for (let k = 0; k < passed.length; k++) {

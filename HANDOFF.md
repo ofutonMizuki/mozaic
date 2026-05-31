@@ -13,7 +13,7 @@
 ## 次フェーズ候補(未着手)
 - **ランタイム Device 選択**:現状 `Device.gpu`/`Device.cpu` は値だが、実行バックエンドは `--gpu` フラグ(コンパイル時)が支配。SPEC §6 の `Device.gpu.first() ?? Device.cpu` 相当の実行時ディスパッチは未実装。
 - **MSL 数値の精緻化**:飽和演算 `+|`/`-|`/`*|` は今ネイティブ(=ラップ)に潰している。`f64` は Metal 非対応で `float` にマップ。カーネル内 overflow セマンティクスの確定。
-- **2D/3D グリッド・ワークグループ共有**:`grid.{y,z}` は配線済み(`_tpig`)だが dispatch は 1D 固定。`local.{x,y,z}`/`barrier()`/`shared [T;N]` は未実装。
+- **2D/3D グリッド**:**実装済み**(`grid2(w,h)`/`grid3(w,h,d)`、CPU=入れ子ループ / GPU=`dispatchThreads` を多次元化。例 [examples/matadd.mzc](examples/matadd.mzc))。残り:ワークグループ機能 `local.{x,y,z}`/`barrier()`/`shared [T;N]` は未実装。
 - **タスク並列**(SPEC §5):`scope { spawn … }` / `Task.join()`。借用追跡の枠組みは流用可能。
 - 言語内 `T?`/`Result`・`as`/`as?`・総称型・完全な借用チェッカ(SPEC §8 TBD)。
 

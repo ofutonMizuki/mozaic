@@ -64,6 +64,10 @@ template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r))
 //                    pointer (buf.contents) and the GPU address are the SAME memory (UMA,
 //                    zero-copy). launch dispatches a precompiled MSL kernel and (for now)
 //                    waits synchronously. Compile the generated unit as Objective-C++.
+
+// A 1/2/3-D launch grid. grid.{x,y,z} in a kernel index into this (1 for unused dims).
+struct Grid { uint32_t x, y, z; };
+
 #ifdef MZ_METAL
 } // namespace mz  (reopen after importing Metal)
 #import <Metal/Metal.h>
@@ -125,8 +129,8 @@ struct MetalDispatch {
   id<MTLCommandBuffer> cb;
   id<MTLComputeCommandEncoder> enc;
   id<MTLComputePipelineState> pso;
-  uint32_t grid;
-  MetalDispatch(MetalKernel& k, uint32_t g) : pso(k.pso), grid(g) {
+  Grid grid;
+  MetalDispatch(MetalKernel& k, Grid g) : pso(k.pso), grid(g) {
     cb = [metal_queue() commandBuffer];
     enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
@@ -135,11 +139,14 @@ struct MetalDispatch {
   template <class T> void value(int idx, T v)           { [enc setBytes:&v length:sizeof(T) atIndex:idx]; }
   template <class T> void length(int idx, Buffer<T>& b) { uint32_t l = b.len; [enc setBytes:&l length:sizeof(l) atIndex:idx]; }
   void encode() {
-    if (grid == 0) return;
-    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-    if (tg > grid) tg = grid;
-    [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) return;
+    // Pick a threadgroup whose volume stays within the device limit (greedy x,y,z).
+    NSUInteger maxT = pso.maxTotalThreadsPerThreadgroup;
+    NSUInteger tx = grid.x < maxT ? grid.x : maxT;
+    NSUInteger ty = grid.y < (maxT / tx) ? grid.y : (maxT / tx ? maxT / tx : 1);
+    NSUInteger tz = grid.z < (maxT / (tx * ty)) ? grid.z : (maxT / (tx * ty) ? maxT / (tx * ty) : 1);
+    [enc dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
+       threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
   }
   void run() {                 // synchronous: free launch(...) waits inline
     encode(); [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -159,7 +166,11 @@ template <class T> struct Buffer {
   T& operator[](uint32_t i) { return data[i]; }
   const T& operator[](uint32_t i) const { return data[i]; }
 };
-template <class F> void launch(uint32_t grid, F fn) { for (uint32_t i = 0; i < grid; i++) fn(i); }
+template <class F> void launch(Grid g, F fn) {
+  for (uint32_t z = 0; z < g.z; z++)
+    for (uint32_t y = 0; y < g.y; y++)
+      for (uint32_t x = 0; x < g.x; x++) fn(x, y, z);
+}
 
 // CPU dev.launch runs the loop eagerly, so the Job is already complete; await() is a no-op.
 struct Device { };

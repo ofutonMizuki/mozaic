@@ -65,6 +65,7 @@ export function cppType(t: string): string {
     case "str": return "mz::String";
     case "Device": return "mz::Device";
     case "Job": return "mz::Job";
+    case "Grid": return "mz::Grid";
     default: {
       const be = bufferElem(t);
       if (be !== null) return `mz::Buffer<${cppType(be)}>`;
@@ -72,7 +73,7 @@ export function cppType(t: string): string {
     }
   }
 }
-export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str", "Device", "Job"]);
+export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str", "Device", "Job", "Grid"]);
 export const ARITH_OPS = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "+|", "-|", "*|"];
 export const ARITH_FN: Record<string, string> = {
   "+": "add", "-": "sub", "*": "mul", "/": "divi", "%": "modi",

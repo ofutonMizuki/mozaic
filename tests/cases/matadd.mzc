@@ -1,0 +1,37 @@
+// 2-D data-parallel kernel: element-wise add of two W×H matrices (row-major).
+// Each GPU thread owns a cell (grid.x, grid.y). Launched with grid2(w, h).
+// Same source runs on CPU (nested loop) and GPU (--gpu, 2-D dispatch): 0 11 22 33 44 55.
+kernel matadd(a: Buffer<u32>, b: Buffer<u32>, out: Buffer<u32>, w: u32) {
+  let x: u32 = grid.x;
+  let y: u32 = grid.y;
+  let idx: u32 = y * w + x;
+  if (idx < out.len) {
+    out[idx] = a[idx] + b[idx];
+  }
+}
+
+function main() {
+  let w: u32 = 3;
+  let h: u32 = 2;
+  let n: u32 = w * h;
+  let a: Buffer<u32> = Buffer.shared(n);
+  let b: Buffer<u32> = Buffer.shared(n);
+  let out: Buffer<u32> = Buffer.shared(n);
+
+  let i: u32 = 0;
+  while (i < n) {
+    a[i] = i;
+    b[i] = i * 10;
+    i = i + 1;
+  }
+
+  let dev: Device = Device.gpu;
+  let job: Job = dev.launch(matadd, grid2(w, h), &a, &b, &mut out, w);
+  job.await();
+
+  let j: u32 = 0;
+  while (j < n) {
+    stdout.println(out[j]);   // 0, 11, 22, 33, 44, 55
+    j = j + 1;
+  }
+}

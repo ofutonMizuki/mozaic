@@ -19,14 +19,20 @@ function kernelLenIndex(params: Param[]): Map<string, number> {
   for (const p of params) if (bufferElem(p.ty) !== null) m.set(p.name, next++);
   return m;
 }
+// The launch grid lowers to an mz::Grid{x,y,z}. A bare integer is 1-D (y=z=1);
+// grid2()/grid3() already emit an mz::Grid, so pass them through.
+function gridExpr(g: Expr): string {
+  if (g.ty === "Grid") return emitExpr(g);
+  return `mz::Grid{ (uint32_t)(${emitExpr(g)}), 1, 1 }`;
+}
 // Host-side Metal binding for one launch: pipeline + buffer/scalar/length sets, in MSL index
 // order. Shared by free launch (sync .run()) and dev.launch (async .commit() -> Job).
-function metalBindLines(kn: string, grid: string, kargs: Expr[]): string[] {
+function metalBindLines(kn: string, grid: Expr, kargs: Expr[]): string[] {
   const params = KERNELS.get(kn)!;
   const lenIdx = kernelLenIndex(params);
   const lines = [
     `static mz::MetalKernel _mk("${kn}", _msl_${kn});`,
-    `mz::MetalDispatch _d(_mk, (uint32_t)(${grid}));`,
+    `mz::MetalDispatch _d(_mk, ${gridExpr(grid)});`,
   ];
   params.forEach((p, i) => {
     if (bufferElem(p.ty) !== null) lines.push(`_d.buffer(${i}, ${emitExpr(kargs[i])});`);
@@ -85,20 +91,25 @@ function emitExpr(e: Expr): string {
       // free launch(kernel, grid, args...) — synchronous sugar (dispatch + wait inline)
       if (e.callee.kind === "Ident" && e.callee.name === "launch") {
         const kn = (e.args[0] as Extract<Expr, { kind: "Ident" }>).name;
-        const grid = emitExpr(e.args[1]);
+        const grid = e.args[1];
         const kargs = e.args.slice(2);
         if (TARGET === "metal") return `([&]{ ${[...metalBindLines(kn, grid, kargs), "_d.run();"].join(" ")} }())`;
         const ka = kargs.map(emitExpr);
-        return `mz::launch(${grid}, [&](uint32_t grid_x){ ${kn}(grid_x${ka.length ? ", " + ka.join(", ") : ""}); })`;
+        return `mz::launch(${gridExpr(grid)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${ka.length ? ", " + ka.join(", ") : ""}); })`;
       }
       // dev.launch(kernel, grid, &buf, &mut out, ...) — async; returns a Job to await later
       if (e.callee.kind === "Member" && e.callee.prop === "launch") {
         const kn = (e.args[0] as Extract<Expr, { kind: "Ident" }>).name;
-        const grid = emitExpr(e.args[1]);
+        const grid = e.args[1];
         const kargs = e.args.slice(2);
         if (TARGET === "metal") return `([&]{ ${[...metalBindLines(kn, grid, kargs), "return _d.commit();"].join(" ")} }())`;
         const ka = kargs.map(emitExpr);
-        return `([&]{ mz::launch((uint32_t)(${grid}), [&](uint32_t grid_x){ ${kn}(grid_x${ka.length ? ", " + ka.join(", ") : ""}); }); return mz::Job{}; }())`;
+        return `([&]{ mz::launch(${gridExpr(grid)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${ka.length ? ", " + ka.join(", ") : ""}); }); return mz::Job{}; }())`;
+      }
+      // grid2(w,h) / grid3(w,h,d) -> mz::Grid{...}
+      if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
+        const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
+        return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
       }
       if (e.callee.kind === "Ident") {
         const name = e.callee.name;
@@ -187,7 +198,7 @@ function emitFn(fn: FnDecl): string {
 function emitKernel(k: KernelDecl): string {
   const body = k.body.map((s) => emitStmt(s, "  ", "void")).join("\n");
   const params = k.params.map(emitParam);
-  return `void ${k.name}(uint32_t grid_x${params.length ? ", " + params.join(", ") : ""}) {\n${body}\n}`;
+  return `void ${k.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z${params.length ? ", " + params.join(", ") : ""}) {\n${body}\n}`;
 }
 
 // ---- MSL (Metal Shading Language) backend for kernels ----
@@ -300,7 +311,7 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const mslDecls = target === "metal"
     ? kernels.map((k) => `static const char* _msl_${k.name} = R"MSL(\n${emitMslKernel(k)}\n)MSL";`).join("\n\n")
     : "";
-  const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t${k.params.map((p) => ", " + (bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty))).join("")});`).join("\n");
+  const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + (bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty))).join("")});`).join("\n");
   const fnProtos = fns.filter((f) => f.name !== "main").map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty)).join(", ")});`).join("\n");
   const protos = [kernelProtos, fnProtos].filter((s) => s).join("\n");
   const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.map(emitFn)].join("\n\n");
