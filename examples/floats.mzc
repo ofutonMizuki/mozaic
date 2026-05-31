@@ -1,0 +1,9 @@
+// f32 / f64 arithmetic
+function main() {
+  let x: f64 = 1.5;
+  let y: f64 = 2.25;
+  stdout.println(x + y);   // 3.75
+  stdout.println(x * y);   // 3.375
+  let z: f32 = 0.25;
+  stdout.println(z + z);   // 0.5
+}

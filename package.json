@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "emit:echo": "node --disable-warning=ExperimentalWarning src/main.ts emit examples/echo.moz",
-    "build:echo": "node --disable-warning=ExperimentalWarning src/main.ts build examples/echo.moz",
-    "run:echo": "node --disable-warning=ExperimentalWarning src/main.ts run examples/echo.moz"
+    "emit:echo": "node --disable-warning=ExperimentalWarning src/main.ts emit examples/echo.mzc",
+    "build:echo": "node --disable-warning=ExperimentalWarning src/main.ts build examples/echo.mzc",
+    "run:echo": "node --disable-warning=ExperimentalWarning src/main.ts run examples/echo.mzc",
+    "test": "node --disable-warning=ExperimentalWarning tests/run.ts"
   }
 }

@@ -67,8 +67,12 @@ inline std::vector<String> stdin_lines() {
   return lines;
 }
 
-inline void println(const String& s)   { std::cout << encodeUtf8(s) << "\n"; }
-inline void println(const char* s)      { std::cout << s << "\n"; }
+inline void println(const String& s)        { std::cout << encodeUtf8(s) << "\n"; }
+inline void println(const char* s)           { std::cout << s << "\n"; }
+inline void println(long long v)             { std::cout << v << "\n"; }
+inline void println(unsigned long long v)    { std::cout << v << "\n"; }
+inline void println(double v)                { std::cout << v << "\n"; }
+inline void println(bool v)                  { std::cout << (v ? "true" : "false") << "\n"; }
 
 inline bool eq(const String& a, const char* b) { return a == decodeUtf8(std::string(b)); }
 inline bool eq(const String& a, const String& b) { return a == b; }

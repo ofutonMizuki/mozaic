@@ -14,7 +14,7 @@
 
 - コメント:`// 行` と `/* ブロック */`(ネスト可)。
 - 識別子:`[A-Za-z_][A-Za-z0-9_]*`。
-- キーワード(暫定):`fn const let struct enum kernel scope spawn match if else for while of return break continue defer as comptime self true false none some import`
+- キーワード(暫定):`function const let struct enum kernel scope spawn match if else for while of return break continue defer as comptime self true false none some import`
 - リテラル:
   - 整数:`42`, `0xFF`, `0b1010`, `1_000`。接尾辞で型固定:`42u8`, `100i64`。
   - 浮動:`1.5`, `1e9`, `3.0f32`。
@@ -38,7 +38,7 @@
 | バッファ | `Buffer<T>`(デバイス常駐) |
 | 参照 | `&T`(共有) / `&mut T`(排他) |
 | オプショナル | `T?`(`null` 無し) |
-| 関数 | `fn(A, B): R` |
+| 関数 | `function(A, B): R` |
 
 戻り型を省略した関数は値を返さない(ユニット)。
 
@@ -63,11 +63,11 @@
 > 代償:1 文字 4 バイト固定(ASCII 主体で UTF-8 比 4 倍のメモリ)。見返りに固定幅の単純さ・O(1) 添字・復号不要を得る。
 
 ```typescript
-fn greet(name: str): String {
+function greet(name: str): String {
   return `hello, ${name}!`;          // String を確保して返す
 }
 
-fn countDigits(s: str): u32 {
+function countDigits(s: str): u32 {
   let n: u32 = 0;
   for (let c of s.chars()) {
     if (c >= '0' && c <= '9') { n = n + 1; }   // char 同士の比較
@@ -80,7 +80,7 @@ fn countDigits(s: str): u32 {
 
 ```typescript
 // 関数
-fn add(a: i32, b: i32): i32 { return a + b; }
+function add(a: i32, b: i32): i32 { return a + b; }
 
 // 束縛: const=不変 / let=可変(再代入可)。&mut 借用は let 束縛にのみ可。
 const PI: f32 = 3.1415927;
@@ -90,8 +90,8 @@ let count: i32 = 0;
 struct Vec2 {
   x: f32;
   y: f32;
-  fn len2(&self): f32 { return self.x * self.x + self.y * self.y; }
-  fn scale(&mut self, k: f32) { self.x = self.x * k; self.y = self.y * k; }
+  function len2(&self): f32 { return self.x * self.x + self.y * self.y; }
+  function scale(&mut self, k: f32) { self.x = self.x * k; self.y = self.y * k; }
 }
 
 // 直和 + 網羅 match
@@ -100,7 +100,7 @@ enum Shape {
   Rect { w: f32, h: f32 },
   Empty,
 }
-fn area(s: &Shape): f32 {
+function area(s: &Shape): f32 {
   match s {
     Circle(r)     => return 3.1415927f32 * r * r,
     Rect { w, h } => return w * h,
@@ -165,12 +165,12 @@ let s: i16? = a as? i16;      // 範囲外なら none
 ```typescript
 enum MathError { DivByZero, Overflow }
 
-fn checkedDiv(a: i32, b: i32): Result<i32, MathError> {
+function checkedDiv(a: i32, b: i32): Result<i32, MathError> {
   if (b == 0) return Err(DivByZero);
   return Ok(a / b);
 }
 
-fn ratioSum(xs: &[]i32, d: i32): Result<i32, MathError> {
+function ratioSum(xs: &[]i32, d: i32): Result<i32, MathError> {
   let total: i32 = 0;
   for (let x of xs) {
     total = total + checkedDiv(x, d)?;   // Err なら即この関数から Err を返す
@@ -184,7 +184,7 @@ fn ratioSum(xs: &[]i32, d: i32): Result<i32, MathError> {
 - 対して `?` の早期 return は*通常の return* なので `defer` は走る。
 - `.unwrap()` / `.expect()` が `Err` / `none` に当たると `abort`。
 
-`fn main()` は値なし、または `Result<(), E>` を返せる(後者なら本体で `?` を使える)。
+`function main()` は値なし、または `Result<(), E>` を返せる(後者なら本体で `?` を使える)。
 
 ## 5. 所有権と借用 (Ownership & Borrowing)
 
@@ -253,13 +253,13 @@ job.await();          // 借用返却。UMA=フェンスのみ / discrete=コピ
 Program    = { Item } ;
 Item       = FnDecl | StructDecl | EnumDecl | KernelDecl | ConstDecl ;
 
-FnDecl     = "fn" Ident "(" [ Params ] ")" [ ":" Type ] Block ;
+FnDecl     = "function" Ident "(" [ Params ] ")" [ ":" Type ] Block ;
 Params     = Param { "," Param } ;
 Param      = Ident ":" Type ;
 
 StructDecl = "struct" Ident "{" { Field } { Method } "}" ;
 Field      = Ident ":" Type ";" ;
-Method     = "fn" Ident "(" [ Recv [ "," Params ] ] ")" [ ":" Type ] Block ;
+Method     = "function" Ident "(" [ Recv [ "," Params ] ] ")" [ ":" Type ] Block ;
 Recv       = "self" | "&self" | "&mut self" ;
 
 EnumDecl   = "enum" Ident "{" { Variant "," } "}" ;

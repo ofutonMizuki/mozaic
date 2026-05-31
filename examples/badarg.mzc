@@ -1,0 +1,7 @@
+// Intentionally rejected: passing i64 where i32 is expected (no implicit conversion).
+function id(x: i32): i32 { return x; }
+
+function main() {
+  let y: i64 = 1;
+  stdout.println(id(y));
+}

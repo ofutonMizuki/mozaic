@@ -1,0 +1,13 @@
+// first 10 Fibonacci numbers
+function main() {
+  let a: i64 = 0;
+  let b: i64 = 1;
+  let n: i64 = 0;
+  while (n < 10) {
+    stdout.println(a);
+    let t: i64 = a + b;
+    a = b;
+    b = t;
+    n = n + 1;
+  }
+}

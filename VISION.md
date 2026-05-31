@@ -117,7 +117,7 @@ use(output[0]);                                   // OK
 struct Bitset128 {       // 128 ビットの集合
   lo: u64;
   hi: u64;
-  fn test(&self, i: u32): bool {
+  function test(&self, i: u32): bool {
     return i < 64 ? ((self.lo >> i) & 1) != 0
                   : ((self.hi >> (i - 64)) & 1) != 0;
   }

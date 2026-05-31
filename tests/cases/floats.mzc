@@ -1,0 +1,8 @@
+function main() {
+  let x: f64 = 1.5;
+  let y: f64 = 2.25;
+  stdout.println(x + y);
+  stdout.println(x * y);
+  let z: f32 = 0.25;
+  stdout.println(z + z);
+}

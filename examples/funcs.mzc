@@ -1,0 +1,14 @@
+// user-defined functions: parameters, return values, recursion
+function add(a: i32, b: i32): i32 {
+  return a + b;
+}
+
+function fact(n: i64): i64 {
+  if (n <= 1) { return 1; }
+  return n * fact(n - 1);
+}
+
+function main() {
+  stdout.println(add(2, 3));
+  stdout.println(fact(10));
+}

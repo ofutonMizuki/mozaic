@@ -1,0 +1,6 @@
+// Intentionally rejected: mixing f64 and i32 (no implicit numeric conversion).
+function main() {
+  let a: f64 = 1.5;
+  let b: i32 = 1;
+  stdout.println(a + b);
+}

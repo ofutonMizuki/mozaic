@@ -1,0 +1,6 @@
+function main() {
+  for (const line of stdin.lines()) {
+    if (line == "quit") { return; }
+    stdout.println(line);
+  }
+}
