@@ -1,0 +1,11 @@
+{
+  "name": "mozaic",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "emit:echo": "node --disable-warning=ExperimentalWarning src/main.ts emit examples/echo.moz",
+    "build:echo": "node --disable-warning=ExperimentalWarning src/main.ts build examples/echo.moz",
+    "run:echo": "node --disable-warning=ExperimentalWarning src/main.ts run examples/echo.moz"
+  }
+}

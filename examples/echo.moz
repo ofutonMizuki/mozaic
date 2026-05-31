@@ -1,0 +1,7 @@
+// mozaic M0 sample: echo each input line, exit on "quit".
+fn main() {
+  for (const line of stdin.lines()) {
+    if (line == "quit") { return; }
+    stdout.println(line);
+  }
+}
