@@ -1,7 +1,24 @@
-# HANDOFF — Mac 実機へ引き継ぎ(GPU/Metal バックエンド)
+# HANDOFF — GPU/Metal バックエンド(**M1 完了** / 次フェーズへ)
 
-最終更新: 2026-05-31。この開発機は **WSL Linux で Metal が無い**ため、ここから **Apple Silicon Mac** へ移行する。
-次の主目的は mozaic の**目玉である GPU/Metal バックエンド** ── UMA ゼロコピー + 「借用=同期」の実装。
+最終更新: 2026-06-01(Apple Silicon M4 実機)。**G0〜G4 は実装・検証済み**。目玉だった
+**GPU/Metal バックエンド(UMA ゼロコピー + 借用=同期)が動作**。以下は到達点と、次に着手する候補。
+
+## TL;DR(2026-06-01 時点で動くもの)
+- `node src/main.ts run examples/addk_async.mzc --gpu` → Apple Silicon GPU(Metal)で `10 11 12 13`。CPU と完全一致。
+- ブランチ `gpu-metal-backend`(main 未マージ)。ゴールデン **11/11**(`node tests/run.ts`、`addk_async` 正例 + `borrow_err` 負例を含む)。
+- **採用した実装方針**:metal-cpp は使わず **Objective‑C++ + システム Metal.framework**(`clang++ -x objective-c++ -fobjc-arc -framework Metal -framework Foundation -DMZ_METAL`)。外部 DL 不要で Xcode のみで完結。MSL は `newLibraryWithSource` で実行時コンパイル。
+- **借用=同期(キーストーン)達成**:`dev.launch(k, grid, &in, &mut out, …) -> Job` / `job.await()`。`await` 前に借用中バッファへ CPU が触ると **コンパイルエラー**([src/check.ts](src/check.ts) の `borrows` 追跡)。`&`=共有(CPU 並走読み可)/ `&mut`=排他。
+- **UMA ゼロコピー実証**:生成 `.mm` に host↔device の `memcpy` ゼロ。`buf.contents` 直接読み書き = GPU と同一メモリ。
+
+## 次フェーズ候補(未着手)
+- **ランタイム Device 選択**:現状 `Device.gpu`/`Device.cpu` は値だが、実行バックエンドは `--gpu` フラグ(コンパイル時)が支配。SPEC §6 の `Device.gpu.first() ?? Device.cpu` 相当の実行時ディスパッチは未実装。
+- **MSL 数値の精緻化**:飽和演算 `+|`/`-|`/`*|` は今ネイティブ(=ラップ)に潰している。`f64` は Metal 非対応で `float` にマップ。カーネル内 overflow セマンティクスの確定。
+- **2D/3D グリッド・ワークグループ共有**:`grid.{y,z}` は配線済み(`_tpig`)だが dispatch は 1D 固定。`local.{x,y,z}`/`barrier()`/`shared [T;N]` は未実装。
+- **タスク並列**(SPEC §5):`scope { spawn … }` / `Task.join()`。借用追跡の枠組みは流用可能。
+- 言語内 `T?`/`Result`・`as`/`as?`・総称型・完全な借用チェッカ(SPEC §8 TBD)。
+
+---
+以下は **移行時(2026-05-31)の元メモ**。経緯の参考に残す。
 
 ## 0. まず読む
 - [VISION.md](VISION.md) — 思想とキーストーン(借用=デバイス同期、Apple Silicon UMA)
