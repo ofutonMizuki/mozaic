@@ -5,11 +5,57 @@
 #include <vector>
 #include <iostream>
 #include <cstdint>
+#include <limits>
+#include <cstdlib>
 
 namespace mz {
 
 using String = std::u32string;   // owned UTF-32 (M0: str/String share this)
 using str    = std::u32string;
+
+// ---- integer arithmetic (overflow-aware) ----
+// Default add/sub/mul: trap on overflow in debug, wrap in release (-DMZ_RELEASE).
+[[noreturn]] inline void panic(const char* msg) { std::cerr << "mozaic: " << msg << "\n"; std::abort(); }
+
+template <class T> T add(T a, T b) { T r; bool o = __builtin_add_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+  if (o) panic("integer overflow in '+'");
+#else
+  (void)o;
+#endif
+  return r; }
+template <class T> T sub(T a, T b) { T r; bool o = __builtin_sub_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+  if (o) panic("integer overflow in '-'");
+#else
+  (void)o;
+#endif
+  return r; }
+template <class T> T mul(T a, T b) { T r; bool o = __builtin_mul_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+  if (o) panic("integer overflow in '*'");
+#else
+  (void)o;
+#endif
+  return r; }
+template <class T> T divi(T a, T b) {
+  if (b == 0) panic("division by zero");
+  if (std::numeric_limits<T>::is_signed && b == (T)(-1) && a == std::numeric_limits<T>::min()) panic("integer overflow in '/'");
+  return a / b;
+}
+template <class T> T modi(T a, T b) {
+  if (b == 0) panic("remainder by zero");
+  if (std::numeric_limits<T>::is_signed && b == (T)(-1) && a == std::numeric_limits<T>::min()) return 0;
+  return a % b;
+}
+// wrapping (two's complement)
+template <class T> T wadd(T a, T b) { T r; __builtin_add_overflow(a, b, &r); return r; }
+template <class T> T wsub(T a, T b) { T r; __builtin_sub_overflow(a, b, &r); return r; }
+template <class T> T wmul(T a, T b) { T r; __builtin_mul_overflow(a, b, &r); return r; }
+// saturating (clamp to type min/max)
+template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r)) return b >= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
+template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
+template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
 
 // UTF-8 bytes -> UTF-32
 inline std::u32string decodeUtf8(const std::string& bytes) {

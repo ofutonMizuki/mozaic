@@ -1,0 +1,9 @@
+// explicit overflow behavior: +% wraps, +| saturates
+function main() {
+  let a: u8 = 255;
+  stdout.println(a +% 1);     // wrap     -> 0
+  stdout.println(a +| 1);     // saturate -> 255
+  let s: i8 = 100;
+  stdout.println(s +| 100);   // saturate -> 127
+  stdout.println(s +% 100);   // wrap     -> -56
+}

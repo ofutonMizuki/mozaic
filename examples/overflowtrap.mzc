@@ -1,0 +1,6 @@
+// Default '+' traps on overflow in a debug build (aborts);
+// wraps in a release build (build with --release).
+function main() {
+  let x: i32 = 2147483647;   // i32 max
+  stdout.println(x + 1);
+}

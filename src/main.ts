@@ -67,6 +67,14 @@ function cppType(t: string): string {
   }
 }
 const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str"]);
+const ARITH_OPS = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "+|", "-|", "*|"];
+// integer arithmetic op -> runtime helper. default +/-/* trap(debug)/wrap(release);
+// +%/-%/*% always wrap; +|/-|/*| saturate; / and % trap on /0 and MIN/-1.
+const ARITH_FN: Record<string, string> = {
+  "+": "add", "-": "sub", "*": "mul", "/": "divi", "%": "modi",
+  "+%": "wadd", "-%": "wsub", "*%": "wmul",
+  "+|": "sadd", "-|": "ssub", "*|": "smul",
+};
 
 // ---------- Lexer ----------
 type Tok = { t: string; v: string; pos: number };
@@ -128,7 +136,10 @@ function lex(src: string): Tok[] {
       continue;
     }
     const two = src.slice(i, i + 2);
-    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>") { toks.push({ t: two, v: two, pos: i }); i += 2; continue; }
+    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>" ||
+        two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
+      toks.push({ t: two, v: two, pos: i }); i += 2; continue;
+    }
     if ("(){};:,.=+-*/%<>".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
@@ -313,7 +324,7 @@ class Parser {
   }
   parseAdditive(): Expr {
     let left = this.parseMul();
-    while (this.at("+") || this.at("-")) {
+    while (this.at("+") || this.at("-") || this.at("+%") || this.at("-%") || this.at("+|") || this.at("-|")) {
       const op = this.next().t;
       left = { kind: "Binary", op, left, right: this.parseMul() };
     }
@@ -321,7 +332,7 @@ class Parser {
   }
   parseMul(): Expr {
     let left = this.parsePostfix();
-    while (this.at("*") || this.at("/") || this.at("%")) {
+    while (this.at("*") || this.at("/") || this.at("%") || this.at("*%") || this.at("*|")) {
       const op = this.next().t;
       left = { kind: "Binary", op, left, right: this.parsePostfix() };
     }
@@ -589,13 +600,14 @@ class Checker {
       }
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
-        if (["+", "-", "*", "/", "%"].includes(e.op)) {
-          if (isFloat(lt) || isFloat(rt)) {
+        if (ARITH_OPS.includes(e.op)) {
+          const intOnly = e.op.length === 2 || e.op === "%";   // %, +%, -%, *%, +|, -|, *|
+          if ((isFloat(lt) || isFloat(rt)) && !intOnly) {
             const u = unifyFloat(lt, rt);
             if (u === null) { this.err(`'${e.op}' requires matching numeric types (got ${lt}, ${rt})`); e.ty = "f64"; }
-            else if (e.op === "%") { this.err("'%' is not defined for floats"); e.ty = u; }
             else e.ty = u;
           } else {
+            if (isFloat(lt) || isFloat(rt)) this.err(`'${e.op}' is integer-only (got ${lt}, ${rt})`);
             const u = unifyInt(lt, rt);
             if (u === null) { this.err(`'${e.op}' requires matching integer types (got ${lt}, ${rt})`); e.ty = "i32"; }
             else e.ty = u;
@@ -661,7 +673,9 @@ function emitExpr(e: Expr): string {
       const l = emitExpr(e.left), r = emitExpr(e.right);
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
       if (e.op === "!=") return e.left.ty === "str" ? `(!mz::eq(${l}, ${r}))` : `(${l} != ${r})`;
-      return `(${l} ${e.op} ${r})`;
+      const fn = ARITH_FN[e.op];
+      if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;  // overflow-aware integer arithmetic
+      return `(${l} ${e.op} ${r})`;                                                    // float arithmetic + comparisons
     }
     case "Call": {
       if (e.callee.kind === "Ident") {
@@ -778,9 +792,11 @@ ${typeDecls ? typeDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
 function fail(msg: string): never { console.error(msg); process.exit(1); }
 
 function main(): void {
-  const [cmd, file] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const release = args.includes("--release");
+  const [cmd, file] = args.filter((a) => a !== "--release");
   if (!cmd || !file || !["emit", "build", "run"].includes(cmd)) {
-    console.error("usage: mozaic <emit|build|run> <file.mzc>");
+    console.error("usage: mozaic <emit|build|run> <file.mzc> [--release]");
     process.exit(2);
   }
   const src = readFileSync(file, "utf8");
@@ -804,8 +820,11 @@ function main(): void {
   const cppPath = join(buildDir, base + ".cpp");
   const binPath = join(buildDir, base);
   writeFileSync(cppPath, cpp);
+  const flags = ["-std=c++20", "-O2", "-I", runtimeDir];
+  if (release) flags.push("-DMZ_RELEASE");      // release: integer overflow wraps; debug (default): traps
+  flags.push("-o", binPath, cppPath);
   try {
-    execFileSync("g++", ["-std=c++20", "-O2", "-I", runtimeDir, "-o", binPath, cppPath], { stdio: "inherit" });
+    execFileSync("g++", flags, { stdio: "inherit" });
   } catch {
     return fail("C++ compile failed");
   }

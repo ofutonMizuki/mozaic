@@ -1,0 +1,8 @@
+function main() {
+  let a: u8 = 255;
+  stdout.println(a +% 1);
+  stdout.println(a +| 1);
+  let s: i8 = 100;
+  stdout.println(s +| 100);
+  stdout.println(s +% 100);
+}
