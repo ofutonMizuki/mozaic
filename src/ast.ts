@@ -38,6 +38,7 @@ export type Expr =
   | { kind: "Ok"; expr: Expr; ty?: string }         // Ok(x)  : Result<T, E>
   | { kind: "Err"; expr: Expr; ty?: string }        // Err(e) : Result<T, E>
   | { kind: "Array"; elems: Expr[]; ty?: string }   // [a, b, c] : [T; N]
+  | { kind: "Template"; strings: string[]; exprs: Expr[]; ty?: string }   // `a${e}b` : str (strings.length == exprs.length + 1)
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }

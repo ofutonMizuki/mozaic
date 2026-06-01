@@ -1,0 +1,5 @@
+struct P { x: i32; }
+function main() {
+  let p = P { x: 1 };
+  stdout.println(`val=${p}`);   // structs aren't formattable
+}

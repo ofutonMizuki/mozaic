@@ -33,6 +33,29 @@ export function lex(src: string): Tok[] {
       toks.push({ t: "str", v: s, pos: i });
       continue;
     }
+    if (c === "`") {   // template string `lit ${expr} lit` -> a single tmpl token (parser splits + reparses ${})
+      i++;
+      let raw = "";
+      let brace = 0;   // 0 = literal region; >0 = inside ${ ... } (balanced braces)
+      while (i < n) {
+        const d = src[i];
+        if (brace === 0 && d === "`") { i++; break; }                       // end of template
+        if (brace === 0 && d === "$" && src[i + 1] === "{") { brace = 1; raw += "${"; i += 2; continue; }
+        if (brace > 0) {
+          if (d === '"') {   // skip a string literal so its braces/backticks don't confuse balancing
+            raw += d; i++;
+            while (i < n && src[i] !== '"') { if (src[i] === "\\") { raw += src[i] + (src[i + 1] ?? ""); i += 2; continue; } raw += src[i]; i++; }
+            raw += src[i] ?? ""; i++; continue;
+          }
+          if (d === "{") brace++;
+          else if (d === "}") brace--;
+          raw += d; i++; continue;
+        }
+        raw += d; i++;   // literal char (escapes kept raw; the parser unescapes)
+      }
+      toks.push({ t: "tmpl", v: raw, pos: i });
+      continue;
+    }
     if (c === "'") {   // char literal -> codepoint (UTF-32). 'a' / '\n' / 'あ'
       i++;
       let cp: number;

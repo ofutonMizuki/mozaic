@@ -81,6 +81,16 @@ function cstr(s: string): string {
   return out + '"_mz';   // _mz UDL -> mz::String prvalue (avoids const char32_t* -> bool surprises)
 }
 
+// One interpolation/format argument -> mz::format(...). Casts like println so the right overload binds.
+function formatArg(e: Expr): string {
+  const at = e.ty ?? "unit";
+  const x = emitExpr(e);
+  if (at === "char") return `mz::format((char32_t)(${x}))`;
+  if (isInt(at)) return `mz::format((${isUnsigned(at) ? "unsigned long long" : "long long"})(${x}))`;
+  if (isFloat(at)) return `mz::format((double)(${x}))`;
+  return `mz::format(${x})`;   // str / bool
+}
+
 function emitExpr(e: Expr): string {
   switch (e.kind) {
     case "Num": return e.value;
@@ -97,6 +107,11 @@ function emitExpr(e: Expr): string {
     case "Ok":  return `{ true, ${emitExpr(e.expr)} }`;       // mz::Result aggregate: {ok, val, err=default}
     case "Err": return `{ false, {}, ${emitExpr(e.expr)} }`;  // {ok=false, val=default, err}
     case "Array": return `{ ${e.elems.map(emitExpr).join(", ")} }`;   // braced -> adapts to std::array<T,N>
+    case "Template": {   // `a${e}b` -> (U"a"_mz + format(e) + U"b"_mz) : mz::String
+      const parts = [cstr(e.strings[0])];
+      for (let k = 0; k < e.exprs.length; k++) { parts.push(formatArg(e.exprs[k])); parts.push(cstr(e.strings[k + 1])); }
+      return `(${parts.join(" + ")})`;
+    }
     case "OrElse": return `(${emitExpr(e.opt)}).value_or(${emitExpr(e.alt)})`;
     case "Try":   // GCC/clang statement-expression: unwrap, or early-return the empty/Err carrier
       return resultArgs(e.expr.ty ?? "") !== null
@@ -112,8 +127,11 @@ function emitExpr(e: Expr): string {
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `grid_${e.prop}`;
       if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) return `mz::Device{}`;
-      // std::array has .size(), not a .len field (Buffer/Slice both have a .len member).
-      if (e.prop === "len" && arrayParts(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "") !== null) return `(uint32_t)(${emitExpr(e.obj)}).size()`;
+      // std::array and mz::String use .size(); Buffer/Slice have a .len member.
+      if (e.prop === "len") {
+        const ot = refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "";
+        if (arrayParts(ot) !== null || ot === "str") return `(uint32_t)(${emitExpr(e.obj)}).size()`;
+      }
       return `${emitExpr(e.obj)}.${e.prop}`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
@@ -141,6 +159,7 @@ function emitExpr(e: Expr): string {
       const l = emitExpr(e.left), r = emitExpr(e.right);
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
       if (e.op === "!=") return e.left.ty === "str" ? `(!mz::eq(${l}, ${r}))` : `(${l} != ${r})`;
+      if (e.op === "+" && e.left.ty === "str") return `(${l} + ${r})`;   // String concatenation
       const fn = ARITH_FN[e.op];
       if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;
       return `(${l} ${e.op} ${r})`;
@@ -169,6 +188,7 @@ function emitExpr(e: Expr): string {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
       }
+      if (e.callee.kind === "Ident" && e.callee.name === "format") return formatArg(e.args[0]);
       if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) -> mz::Slice{ ptr, len }
         const elem = sliceElem(e.ty ?? "[]i32")!;
         const arr = emitExpr(e.args[0]);
@@ -359,6 +379,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     case "Some": case "None": case "Try": case "OrElse": throw new Error("kernel: optionals are not allowed");
     case "Ok": case "Err": throw new Error("kernel: Result is not allowed");
     case "Array": throw new Error("kernel: array literals are not allowed");
+    case "Template": throw new Error("kernel: template strings are not allowed");
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

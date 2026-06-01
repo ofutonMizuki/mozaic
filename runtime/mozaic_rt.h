@@ -311,6 +311,14 @@ inline void println(bool v)                  { std::cout << (v ? "true" : "false
 inline bool eq(const String& a, const char* b) { return a == decodeUtf8(std::string(b)); }
 inline bool eq(const String& a, const String& b) { return a == b; }
 
+// format(x) -> String, for template interpolation and explicit format(...).
+inline String format(const String& s)       { return s; }
+inline String format(char32_t c)            { return String(1, c); }
+inline String format(bool b)                { return decodeUtf8(b ? "true" : "false"); }
+inline String format(long long v)           { return decodeUtf8(std::to_string(v)); }
+inline String format(unsigned long long v)  { return decodeUtf8(std::to_string(v)); }
+inline String format(double v)              { return decodeUtf8(std::to_string(v)); }
+
 // abort / assert. panic_msg takes an mz::String (needs encodeUtf8, defined above).
 // assert_ is always checked (a correctness contract, unlike the debug-only overflow traps).
 [[noreturn]] inline void panic_msg(const String& m) { std::cerr << "mozaic: " << encodeUtf8(m) << "\n"; std::abort(); }

@@ -1,0 +1,16 @@
+// Template strings, format(), str concatenation, .len (codepoints), char indexing.
+function greet(name: str, age: i32): str {
+  return `Hello, ${name}! You are ${age}.`;
+}
+function main() {
+  let name: str = "world";
+  stdout.println(greet(name, 42));        // Hello, world! You are 42.
+  stdout.println("ab" + "cd");            // abcd
+  let s: str = "héllo";                   // 5 code points
+  stdout.println(s.len);                  // 5
+  stdout.println(s[1]);                   // é
+  stdout.println(format(true));           // true
+  stdout.println(format(7));              // 7
+  let flag = true;
+  stdout.println(`flag=${flag} ch=${'X'}`);   // flag=true ch=X
+}

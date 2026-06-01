@@ -190,6 +190,8 @@ class Checker {
     if (t === "buffernew" || t === "atomicnew") this.err(`Buffer.shared / Atomic.new cannot be nested in ${where}; bind it to a typed variable first`);
     return t;
   }
+  // Types that have a textual form (for format(x) and template interpolation).
+  formattable(t: string): boolean { return t === "str" || t === "bool" || t === "char" || isInt(t) || isFloat(t); }
   typeKnown(t: string): boolean {
     const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
@@ -512,6 +514,10 @@ class Checker {
         else if (!scalarSrc || !okTarget) this.err(`cannot cast ${st} as ${e.toTy} (only numeric / char / bool scalar conversions)`);
         e.ty = e.toTy; return e.ty;
       }
+      case "Template": {
+        for (const ex of e.exprs) { const t = this.checkExpr(ex); if (!this.formattable(t)) this.err(`cannot interpolate ${t} in a template (only str / bool / char / numbers)`); }
+        e.ty = "str"; return e.ty;
+      }
       case "Array": {
         if (e.elems.length === 0) { this.err("empty array literal needs a type annotation (e.g. : [i32; 0])"); e.ty = "[i32;0]"; return e.ty; }
         let elemTy = this.noConstruct(this.checkExpr(e.elems[0]), "an array literal");
@@ -569,7 +575,7 @@ class Checker {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
         }
-        if ((sliceElem(ot) !== null || arrayParts(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str") && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const fm = this.structs.get(ot);
         if (fm) {
           const ft = fm.get(e.prop);
@@ -582,7 +588,7 @@ class Checker {
         const ot0 = this.checkExpr(e.obj);
         const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
         const ap = arrayParts(ot);
-        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null);
+        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null) ?? (ot === "str" ? "char" : null);
         if (elem === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
         if (bufferElem(ot) !== null && e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
         const it = this.checkExpr(e.index);
@@ -672,6 +678,11 @@ class Checker {
           if (this.checkExpr(e.callee.obj) !== "Job") this.err("'.await' can only be called on a Job");
           if (e.args.length) this.err("await takes no arguments");
           e.ty = "unit"; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "format") {   // format(x) : str
+          if (e.args.length !== 1) this.err("format(x) takes one argument");
+          else if (!this.formattable(this.checkExpr(e.args[0]))) this.err("format: only str / bool / char / numbers");
+          e.ty = "str"; return e.ty;
         }
         if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) : []T — view over a named fixed array
           if (e.args.length !== 1) { this.err("slice(arr) takes one array argument"); e.ty = "[]i32"; return e.ty; }
@@ -792,6 +803,7 @@ class Checker {
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
         if (this.hasAtomic(lt) || this.hasAtomic(rt)) { this.err(`Atomic can only be accessed via load/store/fetchAdd/compareExchange (not used as a value)`); e.ty = "i32"; return e.ty; }
+        if (e.op === "+" && lt === "str" && rt === "str") { e.ty = "str"; return e.ty; }   // string concatenation
         if (ARITH_OPS.includes(e.op)) {
           const intOnly = e.op.length === 2 || e.op === "%";
           if ((isFloat(lt) || isFloat(rt)) && !intOnly) {

@@ -3,6 +3,7 @@ import type {
   Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, Arm, Stmt, Expr,
 } from "./ast.ts";
 import type { Tok } from "./lexer.ts";
+import { lex } from "./lexer.ts";
 
 export class Parser {
   toks: Tok[];
@@ -314,6 +315,7 @@ export class Parser {
     if (tk.t === "fnum") { this.next(); return { kind: "Float", value: tk.v }; }
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
     if (tk.t === "char") { this.next(); return { kind: "Char", value: tk.v }; }
+    if (tk.t === "tmpl") { this.next(); return this.parseTemplate(tk.v); }
     if (tk.t === "true" || tk.t === "false") { this.next(); return { kind: "Bool", value: tk.t === "true" }; }
     if (tk.t === "none") { this.next(); return { kind: "None" }; }
     if (tk.t === "some") { this.next(); this.eat("("); const inner = this.parseExpr(); this.eat(")"); return { kind: "Some", expr: inner }; }
@@ -341,6 +343,41 @@ export class Parser {
     }
     if (tk.t === "(") { this.next(); const e = this.parseExpr(); this.eat(")"); return e; }
     throw new Error(`parse error: unexpected '${tk.t}' ('${tk.v}') at ${tk.pos}`);
+  }
+  // raw = literal text with embedded `${expr}` segments (balanced braces). Split into the
+  // literal `strings` (unescaped) and `exprs` (each reparsed as an expression).
+  parseTemplate(raw: string): Expr {
+    const strings: string[] = [];
+    const exprs: Expr[] = [];
+    let cur = "";
+    let i = 0;
+    while (i < raw.length) {
+      if (raw[i] === "$" && raw[i + 1] === "{") {
+        strings.push(this.unescapeTmpl(cur)); cur = "";
+        let brace = 1, j = i + 2, src = "";
+        while (j < raw.length && brace > 0) {
+          const d = raw[j];
+          if (d === "{") brace++;
+          else if (d === "}") { brace--; if (brace === 0) break; }
+          src += d; j++;
+        }
+        exprs.push(new Parser(lex(src)).parseExpr());
+        i = j + 1;
+      } else { cur += raw[i]; i++; }
+    }
+    strings.push(this.unescapeTmpl(cur));
+    return { kind: "Template", strings, exprs };
+  }
+  unescapeTmpl(s: string): string {
+    let out = "", i = 0;
+    while (i < s.length) {
+      if (s[i] === "\\") {
+        const e = s[i + 1];
+        out += e === "n" ? "\n" : e === "t" ? "\t" : e === "r" ? "\r" : e === "`" ? "`" : e === "$" ? "$" : e === "\\" ? "\\" : e === '"' ? '"' : (e ?? "");
+        i += 2;
+      } else { out += s[i]; i++; }
+    }
+    return out;
   }
   parseStructLit(name: string): Expr {
     this.eat("{");

@@ -1,0 +1,3 @@
+mz::format(name)
+mz::format((long long)(age))
+U"Hello, "_mz
