@@ -1,0 +1,10 @@
+// `?` may only propagate when the error types match.
+function inner(x: i32): Result<i32, str> {
+  if (x > 0) { return Ok(x); }
+  return Err("bad");
+}
+function outer(x: i32): Result<i32, i32> {   // error type i32, not str
+  let v = inner(x)?;                          // str error can't propagate into i32 error
+  return Ok(v);
+}
+function main() { stdout.println(outer(1).unwrap()); }

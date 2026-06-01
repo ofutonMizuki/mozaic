@@ -33,8 +33,10 @@ export type Expr =
   | { kind: "Cast"; expr: Expr; toTy: string; opt: boolean; ty?: string }   // `e as T` / `e as? T`
   | { kind: "Some"; expr: Expr; ty?: string }       // some(x) : T?
   | { kind: "None"; ty?: string }                   // none — fits any T?
-  | { kind: "Try"; expr: Expr; ty?: string }        // postfix e? — propagate none (early return)
+  | { kind: "Try"; expr: Expr; ty?: string }        // postfix e? — propagate none/Err (early return)
   | { kind: "OrElse"; opt: Expr; alt: Expr; ty?: string }   // a ?? b — unwrap or default
+  | { kind: "Ok"; expr: Expr; ty?: string }         // Ok(x)  : Result<T, E>
+  | { kind: "Err"; expr: Expr; ty?: string }        // Err(e) : Result<T, E>
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }
@@ -62,7 +64,20 @@ export function isMutRef(t: string): boolean { return t.startsWith("&mut "); }
 export function refInner(t: string): string | null { return t.startsWith("&mut ") ? t.slice(5) : (t.startsWith("&") ? t.slice(1) : null); }
 export function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 // Optionals are encoded as a trailing `?` (like refs use a leading `&`). `i32?` -> std::optional<int32_t>.
-export function optInner(t: string): string | null { return t.endsWith("?") ? t.slice(0, -1) : null; }
+export function optInner(t: string): string | null { return (!t.startsWith("&") && t.endsWith("?")) ? t.slice(0, -1) : null; }
+// Result<T, E> -> [T, E], splitting on the top-level comma (respecting < > nesting). null if not a Result.
+export function resultArgs(t: string): [string, string] | null {
+  if (!t.startsWith("Result<") || !t.endsWith(">")) return null;
+  const inner = t.slice(7, -1);
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "<") depth++;
+    else if (c === ">") depth--;
+    else if (c === "," && depth === 0) return [inner.slice(0, i).trim(), inner.slice(i + 1).trim()];
+  }
+  return null;
+}
 export function atomicElem(t: string): string | null { return t.startsWith("Atomic<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T in Atomic<T>
 // Does a type transitively contain an Atomic? (Atomic itself / Buffer of atomic / struct with an atomic field.)
@@ -109,6 +124,8 @@ export function cppType(t: string): string {
       if (ae !== null) return `std::atomic<${cppType(ae)}>`;
       const be = bufferElem(t);
       if (be !== null) return `mz::Buffer<${cppType(be)}>`;
+      const ra = resultArgs(t);
+      if (ra !== null) return `mz::Result<${cppType(ra[0])}, ${cppType(ra[1])}>`;
       return t;   // user struct/enum types map to their own name
     }
   }

@@ -95,6 +95,22 @@ std::optional<To> checked_cast(From v) {
   }
 }
 
+// Result<T, E>: an aggregate {ok, val, err}. Ok(x) -> {true, x} (err value-inited);
+// Err(e) -> {false, {}, e}. T and E must be default-constructible (M2 limitation).
+template <class T, class E> struct Result {
+  bool ok;
+  T val{};
+  E err{};
+};
+template <class T, class E> T result_unwrap(const Result<T, E>& r) {
+  if (!r.ok) panic("unwrap() on an Err value");
+  return r.val;
+}
+template <class T, class E> E result_unwrap_err(const Result<T, E>& r) {
+  if (r.ok) panic("unwrapErr() on an Ok value");
+  return r.err;
+}
+
 // ---- device buffers + data-parallel launch ----
 // Two backends, selected at compile time:
 //   default        : CPU path. Buffer is std::vector-backed; launch is a serial loop.

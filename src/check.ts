@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -188,6 +188,7 @@ class Checker {
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
+    const ra = resultArgs(t); if (ra !== null) return this.typeKnown(ra[0]) && this.typeKnown(ra[1]);
     const be = bufferElem(t);
     return be !== null && this.typeKnown(be);
   }
@@ -230,6 +231,7 @@ class Checker {
         if (this.hasAtomic(pa.ty)) this.err(`Atomic is not supported inside a kernel (parameter '${pa.name}')`);
         if (refInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a reference (host-data refs are not allowed in kernels)`);
         if (optInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be optional`);
+        if (resultArgs(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a Result`);
       }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
@@ -295,6 +297,7 @@ class Checker {
           else if (vt === "atomicnew") { this.err(`'${s.name}': Atomic.new needs a type annotation (e.g. : Atomic<u64>)`); declTy = "i32"; }
           else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
           else if (vt === "none") { this.err(`'${s.name}': bare none has no type — annotate it (e.g. : i32?)`); declTy = "i32"; }
+          else if (vt.startsWith("ok<") || vt.startsWith("err<")) { this.err(`'${s.name}': Ok/Err need a Result type annotation (e.g. : Result<i32, str>)`); declTy = "i32"; }
           else { declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
             if (optInner(declTy) === "intlit") declTy = "i32?";          // some(5) -> i32?
             else if (optInner(declTy) === "floatlit") declTy = "f64?";   // some(1.5) -> f64?
@@ -452,6 +455,15 @@ class Checker {
       return vo !== null && this.assignable(vo, to);
     }
     if (vt === "none" || vo !== null) return false;   // an optional value needs an optional target
+    // Result: Ok(x)/Err(e) carry only one half; check against the matching half of the target.
+    const tra = resultArgs(tt);
+    if (tra !== null) {
+      if (vt.startsWith("ok<")) return this.assignable(vt.slice(3, -1), tra[0]);
+      if (vt.startsWith("err<")) return this.assignable(vt.slice(4, -1), tra[1]);
+      const vra = resultArgs(vt);
+      return vra !== null && this.assignable(vra[0], tra[0]) && this.assignable(vra[1], tra[1]);
+    }
+    if (vt.startsWith("ok<") || vt.startsWith("err<")) return false;   // Ok/Err need a Result target
     const tr = refInner(tt), vr = refInner(vt);
     // ref param: &->&, &mut->&mut, and &mut coerces to & (same referent type required).
     if (tr !== null) return vr !== null && tr === vr && (!isMutRef(tt) || isMutRef(vt));
@@ -485,12 +497,22 @@ class Checker {
       }
       case "Some": { e.ty = this.checkExpr(e.expr) + "?"; return e.ty; }
       case "None": { e.ty = "none"; return e.ty; }
+      case "Ok": { e.ty = `ok<${this.checkExpr(e.expr)}>`; return e.ty; }    // partial: T known, E from context
+      case "Err": { e.ty = `err<${this.checkExpr(e.expr)}>`; return e.ty; }  // partial: E known, T from context
       case "Try": {
         const it = this.checkExpr(e.expr);
-        const inner = optInner(it);
-        if (inner === null) { this.err(`postfix '?' requires an optional (got ${it})`); e.ty = it; return e.ty; }
-        if (optInner(this.curRet) === null) this.err("postfix '?' can only be used in a function that returns an optional");
-        e.ty = inner; return e.ty;
+        const oi = optInner(it), ra = resultArgs(it);
+        if (oi !== null) {   // optional carrier
+          if (optInner(this.curRet) === null) this.err("postfix '?' on an optional requires a function returning an optional");
+          e.ty = oi; return e.ty;
+        }
+        if (ra !== null) {   // Result carrier: the propagated Err type must match the enclosing fn's E
+          const cur = resultArgs(this.curRet);
+          if (cur === null) this.err("postfix '?' on a Result requires a function returning a Result");
+          else if (cur[1] !== ra[1]) this.err(`postfix '?': error type ${ra[1]} does not match the function's error type ${cur[1]}`);
+          e.ty = ra[0]; return e.ty;
+        }
+        this.err(`postfix '?' requires an optional or Result (got ${it})`); e.ty = it; return e.ty;
       }
       case "OrElse": {
         const ot = this.checkExpr(e.opt);
@@ -682,6 +704,17 @@ class Checker {
           if (recvTy === "Task" && e.callee.prop === "join") {
             if (e.args.length) this.err("join() takes no arguments");
             e.ty = "unit"; return e.ty;
+          }
+          const rra = resultArgs(recvTy);
+          if (rra !== null) {   // Result<T,E> terminal accessors
+            const m = e.callee.prop;
+            if (e.args.length) this.err(`Result.${m} takes no arguments`);
+            switch (m) {
+              case "isOk": case "isErr": e.ty = "bool"; return e.ty;
+              case "unwrap": e.ty = rra[0]; return e.ty;       // aborts at runtime if Err
+              case "unwrapErr": e.ty = rra[1]; return e.ty;    // aborts at runtime if Ok
+              default: this.err(`unknown Result method '${m}' (use isOk / isErr / unwrap / unwrapErr / ?)`); e.ty = "i32"; return e.ty;
+            }
           }
           const baseTy = refInner(recvTy) ?? recvTy;
           const methods = this.structMethods.get(baseTy);

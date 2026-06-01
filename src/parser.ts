@@ -31,7 +31,13 @@ export class Parser {
       return (mut ? "&mut " : "&") + this.parseType();
     }
     const name = this.eat("id").v;
-    if (this.at("<")) { this.next(); const inner = this.parseType(); this.eat(">"); return `${name}<${inner}>`; }
+    if (this.at("<")) {   // generic args: Buffer<T> (1) / Result<T, E> (2)
+      this.next();
+      const args = [this.parseType()];
+      while (this.at(",")) { this.next(); args.push(this.parseType()); }
+      this.eat(">");
+      return `${name}<${args.join(", ")}>`;
+    }
     return name;
   }
   parseProgram(): Program {
@@ -302,6 +308,13 @@ export class Parser {
     if (tk.t === "true" || tk.t === "false") { this.next(); return { kind: "Bool", value: tk.t === "true" }; }
     if (tk.t === "none") { this.next(); return { kind: "None" }; }
     if (tk.t === "some") { this.next(); this.eat("("); const inner = this.parseExpr(); this.eat(")"); return { kind: "Some", expr: inner }; }
+    // built-in Result constructors: only `Ok(` / `Err(` (a bare Ok/Err stays an ordinary ident)
+    if (tk.t === "id" && (tk.v === "Ok" || tk.v === "Err") && this.toks[this.i + 1]?.t === "(") {
+      this.next(); this.eat("(");
+      const inner = this.parseExpr();
+      this.eat(")");
+      return { kind: tk.v === "Ok" ? "Ok" : "Err", expr: inner };
+    }
     if (tk.t === "id") {
       this.next();
       if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);

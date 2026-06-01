@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -94,9 +94,13 @@ function emitExpr(e: Expr): string {
         : `(${cppType(e.toTy)})(${emitExpr(e.expr)})`;                                          // as  -> explicit cast
     case "Some": return `{ ${emitExpr(e.expr)} }`;   // braced -> adapts to the target std::optional<T>
     case "None": return "{}";                        // empty optional (nullopt) via the target type
+    case "Ok":  return `{ true, ${emitExpr(e.expr)} }`;       // mz::Result aggregate: {ok, val, err=default}
+    case "Err": return `{ false, {}, ${emitExpr(e.expr)} }`;  // {ok=false, val=default, err}
     case "OrElse": return `(${emitExpr(e.opt)}).value_or(${emitExpr(e.alt)})`;
-    case "Try":   // GCC/clang statement-expression: unwrap, or early-return none from the enclosing fn
-      return `({ auto _o = (${emitExpr(e.expr)}); if (!_o.has_value()) return {}; _o.value(); })`;
+    case "Try":   // GCC/clang statement-expression: unwrap, or early-return the empty/Err carrier
+      return resultArgs(e.expr.ty ?? "") !== null
+        ? `({ auto _r = (${emitExpr(e.expr)}); if (!_r.ok) return { false, {}, _r.err }; _r.val; })`
+        : `({ auto _o = (${emitExpr(e.expr)}); if (!_o.has_value()) return {}; _o.value(); })`;
     case "Ident": {
       if (e.name === "self") return "(*this)";   // method receiver -> the C++ instance
       if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
@@ -187,6 +191,14 @@ function emitExpr(e: Expr): string {
           if (isFloat(at)) return `mz::println((double)(${emitExpr(a)}))`;
           return `mz::println(${emitExpr(a)})`;
         }
+      }
+      // Result<T,E> terminal accessors (the checker stamped obj.ty).
+      if (e.callee.kind === "Member" && e.callee.obj.ty && resultArgs(e.callee.obj.ty) !== null) {
+        const recv = emitExpr(e.callee.obj), m = e.callee.prop;
+        if (m === "isOk") return `(${recv}).ok`;
+        if (m === "isErr") return `(!(${recv}).ok)`;
+        if (m === "unwrap") return `mz::result_unwrap(${recv})`;
+        if (m === "unwrapErr") return `mz::result_unwrap_err(${recv})`;
       }
       // atomic methods on an Atomic<T> receiver (the checker stamped obj.ty). Never lower to a plain int.
       if (e.callee.kind === "Member" && e.callee.obj.ty && atomicElem(e.callee.obj.ty) !== null) {
@@ -308,6 +320,7 @@ function emitKernel(k: KernelDecl): string {
 //   - Metal scalar type names; no double (f64 maps to float)
 function mslType(t: string): string {
   if (optInner(t) !== null) throw new Error("kernel: optional types are not allowed");
+  if (resultArgs(t) !== null) throw new Error("kernel: Result types are not allowed");
   switch (t) {
     case "u8": return "uchar"; case "u16": return "ushort"; case "u32": return "uint"; case "u64": return "ulong";
     case "i8": return "char"; case "i16": return "short"; case "i32": return "int"; case "i64": return "long";
@@ -335,6 +348,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
       return `(${mslType(e.toTy)})(${emitMslExpr(e.expr, bufs)})`;
     }
     case "Some": case "None": case "Try": case "OrElse": throw new Error("kernel: optionals are not allowed");
+    case "Ok": case "Err": throw new Error("kernel: Result is not allowed");
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

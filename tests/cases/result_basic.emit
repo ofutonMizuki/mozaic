@@ -1,0 +1,5 @@
+mz::Result<int32_t, mz::String>
+{ true, mz::mul<int32_t>(x, 10) }
+{ false, {}, U"not positive"_mz }
+if (!_r.ok) return { false, {}, _r.err };
+mz::result_unwrap(

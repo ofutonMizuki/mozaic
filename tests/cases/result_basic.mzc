@@ -1,0 +1,18 @@
+// Result<T, E>: Ok/Err, isOk/isErr/unwrap/unwrapErr, postfix ? propagation.
+function parse(x: i32): Result<i32, str> {
+  if (x > 0) { return Ok(x * 10); }
+  return Err("not positive");
+}
+function doubleParse(x: i32): Result<i32, str> {
+  let v = parse(x)?;          // propagate Err on the failing path
+  return Ok(v + 1);
+}
+function main() {
+  let a = parse(5);
+  let b = parse(0);
+  if (a.isOk()) { stdout.println(a.unwrap()); }        // 50
+  if (b.isErr()) { stdout.println(b.unwrapErr()); }    // not positive
+  stdout.println(doubleParse(5).unwrap());             // 51
+  let r = doubleParse(0);
+  if (r.isErr()) { stdout.println(r.unwrapErr()); }    // not positive (propagated)
+}
