@@ -1,3 +1,15 @@
+# HANDOFF
+
+> **最新状況は [ROADMAP.md](ROADMAP.md) 「現在地」を参照**(本ファイル以下は M1/M2 当時の歴史メモ)。
+> 2026-06-02 時点: **M3 完了・M4 大半・M6 着手**(branch `m3-abstraction`, ゴールデン **89/89**)。
+> 追加実装: 総称型 / SIMD `f32x4` / `comptime`+トップレベル `const` / `Task<R>` 結果返し /
+> `Arc`・`Mutex`・`Channel` / `Atomic` `SeqCst` / 可変長 `Vec<T>` / 可変 `String` 構築 /
+> `stdin.readAll` / 論理 `&& || !` / `else if`。mozaic 製字句解析器
+> [tests/cases/lexer_mz.mzc](tests/cases/lexer_mz.mzc) が動作(M7 布石)。
+> 残り: M4d(GPU ワークグループ・実行時 device)、M5(借用完全形)、M6(`import`/モジュール・ファイル I/O)、M7(セルフホスト)。
+
+---
+
 # HANDOFF — GPU/Metal + Atomic/並行 + **M2 言語コア実装中**
 
 最終更新: 2026-06-01(Apple Silicon M4 実機)。**G0〜G4 + Atomic/並行 + M2 言語コアの大半**が実装・検証済み。
