@@ -1,0 +1,10 @@
+// Negative: moving a binding declared outside a loop is unsound (it would re-move each iteration).
+struct Point { x: i32; y: i32; }
+function main() {
+  let p: Point = Point { x: 1, y: 2 };
+  let n: u32 = 0;
+  while (n < 3) {
+    let q: Point = p;      // moves an outer binding inside a loop
+    n = n + 1;
+  }
+}

@@ -1,0 +1,2 @@
+Point q = std::move(p);
+#include <utility>

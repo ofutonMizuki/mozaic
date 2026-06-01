@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -9,13 +9,16 @@ import {
 // job.await) cannot be touched by the host. & = shared (CPU reads still OK), &mut = exclusive.
 // The same machinery backs spawn/scope/join: a task holds its &/&mut args until it joins.
 type Borrow = { mut: boolean; job: string };
+// Per-binding state for ownership/move tracking. `moved` = ownership transferred out (later use is an
+// error); `loopDepth` = the loop nesting at definition (moving an outer binding inside a loop is unsound).
+type VarState = { ty: string; moved: boolean; loopDepth: number };
 
 // Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
 const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
 
 class Checker {
   errs: string[] = [];
-  scopes: Map<string, string>[] = [];
+  scopes: Map<string, VarState>[] = [];
   fns = new Map<string, Sig>();
   kernels = new Map<string, Param[]>();
   structs = new Map<string, Map<string, string>>();
@@ -24,6 +27,8 @@ class Checker {
   curRet = "unit";
   borrows = new Map<string, Borrow>();   // buffer/atomic name -> in-flight borrow (per function)
   suppressBufRead: string | null = null;  // the lvalue buffer of the current Assign (write, not read)
+  suppressMovedCheck: string | null = null;  // the Assign target ident (assigning TO it is not a use)
+  loopDepth = 0;                           // loop nesting depth (for the move-in-loop soundness guard)
   inKernel = false;                        // checking a kernel body? (Atomic is banned there)
   tasks = new Map<string, { joined: boolean }>();  // named spawn Tasks -> joined yet? (per function)
   scopeStack: string[] = [];               // active scope ids (bare spawns join at scope end)
@@ -124,10 +129,21 @@ class Checker {
   }
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
-  define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, t); }
-  lookup(n: string): string | null {
-    for (let i = this.scopes.length - 1; i >= 0; i--) { const t = this.scopes[i].get(n); if (t) return t; }
+  define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, { ty: t, moved: false, loopDepth: this.loopDepth }); }
+  lookup(n: string): string | null { const v = this.lookupVar(n); return v ? v.ty : null; }
+  lookupVar(n: string): VarState | null {
+    for (let i = this.scopes.length - 1; i >= 0; i--) { const v = this.scopes[i].get(n); if (v) return v; }
     return null;
+  }
+  // If `e` reads a non-Copy, non-atomic binding, it MOVES it (later use is an error). Copy values are
+  // never moved; Atomic is handled separately (immovable). Moving an outer binding inside a loop is
+  // unsound (re-move across iterations), so reject it.
+  moveIfBinding(e: Expr) {
+    if (e.kind !== "Ident") return;
+    const src = this.lookupVar(e.name);
+    if (!src || isCopy(src.ty) || this.hasAtomic(src.ty)) return;
+    if (src.loopDepth < this.loopDepth) this.err(`cannot move '${e.name}' inside a loop (it is declared outside the loop)`);
+    else src.moved = true;
   }
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
@@ -243,6 +259,7 @@ class Checker {
           this.tasks.set(s.name, { joined: false });
           this.registerSpawnBorrows(s.value.call, s.name);
         }
+        this.moveIfBinding(s.value);   // `let q = p` (p non-Copy) moves p; later use of p is an error
         break;
       }
       case "Assign": {
@@ -250,16 +267,22 @@ class Checker {
           this.accessBuf(s.target.obj.name, true);     // writing through the buffer
           this.suppressBufRead = s.target.obj.name;     // ...so don't also flag it as a read
         }
+        if (s.target.kind === "Ident") this.suppressMovedCheck = s.target.name;  // assigning TO x is not a use of x
         const tt = this.checkExpr(s.target);
         this.suppressBufRead = null;
+        this.suppressMovedCheck = null;
         if (this.hasAtomic(tt)) { this.err(`cannot assign to an Atomic; use .store(value, order)`); break; }
         const vt = this.checkExpr(s.value);
         if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
+        this.moveIfBinding(s.value);   // RHS binding moves...
+        if (s.target.kind === "Ident") { const tv = this.lookupVar(s.target.name); if (tv) tv.moved = false; }  // ...the assignment revives the target
         break;
       }
       case "While": {
         if (this.checkExpr(s.cond) !== "bool") this.err("`while` condition must be bool");
+        this.loopDepth++;
         this.checkBlock(s.body);
+        this.loopDepth--;
         break;
       }
       case "If": {
@@ -292,7 +315,9 @@ class Checker {
         if (!isStdinLines(s.iter)) this.err("M0: only `stdin.lines()` is iterable");
         this.push();
         this.define(s.binder, "str");
+        this.loopDepth++;
         for (const st of s.body) this.checkStmt(st);
+        this.loopDepth--;
         this.pop();
         break;
       }
@@ -345,8 +370,11 @@ class Checker {
       case "Float": e.ty = "floatlit"; return e.ty;
       case "Str": e.ty = "str"; return e.ty;
       case "Ident": {
-        const t = this.lookup(e.name);
-        if (t) { e.ty = t; return t; }
+        const vs = this.lookupVar(e.name);
+        if (vs) {
+          if (vs.moved && this.suppressMovedCheck !== e.name) this.err(`use of moved value '${e.name}'`);
+          e.ty = vs.ty; return vs.ty;
+        }
         if (ORDERINGS.has(e.name)) { e.ty = "Ordering"; return e.ty; }
         const v = this.variants.get(e.name);
         if (v && v.payload.length === 0) { e.ty = v.enumName; return e.ty; }

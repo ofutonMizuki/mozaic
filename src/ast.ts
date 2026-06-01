@@ -44,6 +44,9 @@ export const FLOATS = ["f32", "f64"];
 export function isInt(t: string): boolean { return t === "intlit" || INTS.includes(t); }
 export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
+// Copy types are duplicated freely on assign/pass; everything else is move-only (single owner).
+// Non-Copy: str/String, Buffer<T>, structs, enums-with-payload, Atomic<...>.
+export function isCopy(t: string): boolean { return isInt(t) || isFloat(t) || t === "bool"; }
 export function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export function atomicElem(t: string): string | null { return t.startsWith("Atomic<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T in Atomic<T>

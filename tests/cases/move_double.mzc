@@ -1,0 +1,9 @@
+// Negative: a value cannot be moved twice.
+struct Point { x: i32; y: i32; }
+function main() {
+  let p: Point = Point { x: 1, y: 2 };
+  let a: Point = p;        // moves p
+  let b: Point = p;        // second move -> use of moved value
+  stdout.println(a.x);
+  stdout.println(b.x);
+}
