@@ -24,6 +24,15 @@ export class Parser {
     return t;
   }
   parseTypeCore(): string {
+    if (this.at("[")) {   // slice []T  or  fixed array [T; N]
+      this.next();
+      if (this.at("]")) { this.next(); return "[]" + this.parseType(); }
+      const elem = this.parseType();
+      this.eat(";");
+      const n = this.eat("num").v;
+      this.eat("]");
+      return `[${elem};${n}]`;
+    }
     if (this.at("&")) {   // reference type: &T (shared) / &mut T (exclusive)
       this.next();
       let mut = false;
@@ -319,6 +328,16 @@ export class Parser {
       this.next();
       if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);
       return { kind: "Ident", name: tk.v };
+    }
+    if (tk.t === "[") {   // array literal [a, b, c]
+      this.next();
+      const elems: Expr[] = [];
+      if (!this.at("]")) {
+        elems.push(this.parseExpr());
+        while (this.at(",")) { this.next(); if (this.at("]")) break; elems.push(this.parseExpr()); }
+      }
+      this.eat("]");
+      return { kind: "Array", elems };
     }
     if (tk.t === "(") { this.next(); const e = this.parseExpr(); this.eat(")"); return e; }
     throw new Error(`parse error: unexpected '${tk.t}' ('${tk.v}') at ${tk.pos}`);

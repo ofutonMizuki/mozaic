@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -96,6 +96,7 @@ function emitExpr(e: Expr): string {
     case "None": return "{}";                        // empty optional (nullopt) via the target type
     case "Ok":  return `{ true, ${emitExpr(e.expr)} }`;       // mz::Result aggregate: {ok, val, err=default}
     case "Err": return `{ false, {}, ${emitExpr(e.expr)} }`;  // {ok=false, val=default, err}
+    case "Array": return `{ ${e.elems.map(emitExpr).join(", ")} }`;   // braced -> adapts to std::array<T,N>
     case "OrElse": return `(${emitExpr(e.opt)}).value_or(${emitExpr(e.alt)})`;
     case "Try":   // GCC/clang statement-expression: unwrap, or early-return the empty/Err carrier
       return resultArgs(e.expr.ty ?? "") !== null
@@ -111,6 +112,8 @@ function emitExpr(e: Expr): string {
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `grid_${e.prop}`;
       if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) return `mz::Device{}`;
+      // std::array has .size(), not a .len field (Buffer/Slice both have a .len member).
+      if (e.prop === "len" && arrayParts(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "") !== null) return `(uint32_t)(${emitExpr(e.obj)}).size()`;
       return `${emitExpr(e.obj)}.${e.prop}`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
@@ -165,6 +168,11 @@ function emitExpr(e: Expr): string {
       if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
+      }
+      if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) -> mz::Slice{ ptr, len }
+        const elem = sliceElem(e.ty ?? "[]i32")!;
+        const arr = emitExpr(e.args[0]);
+        return `mz::Slice<${cppType(elem)}>{ (${arr}).data(), (uint32_t)(${arr}).size() }`;
       }
       if (e.callee.kind === "Ident" && e.callee.name === "abort")
         return e.args.length === 1 ? `mz::panic_msg(${emitExpr(e.args[0])})` : `mz::panic("aborted")`;
@@ -321,6 +329,7 @@ function emitKernel(k: KernelDecl): string {
 function mslType(t: string): string {
   if (optInner(t) !== null) throw new Error("kernel: optional types are not allowed");
   if (resultArgs(t) !== null) throw new Error("kernel: Result types are not allowed");
+  if (sliceElem(t) !== null || arrayParts(t) !== null) throw new Error("kernel: array/slice types are not allowed");
   switch (t) {
     case "u8": return "uchar"; case "u16": return "ushort"; case "u32": return "uint"; case "u64": return "ulong";
     case "i8": return "char"; case "i16": return "short"; case "i32": return "int"; case "i64": return "long";
@@ -349,6 +358,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     }
     case "Some": case "None": case "Try": case "OrElse": throw new Error("kernel: optionals are not allowed");
     case "Ok": case "Err": throw new Error("kernel: Result is not allowed");
+    case "Array": throw new Error("kernel: array literals are not allowed");
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

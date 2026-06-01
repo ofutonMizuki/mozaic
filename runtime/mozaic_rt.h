@@ -10,6 +10,7 @@
 #include <chrono>
 #include <optional>
 #include <type_traits>
+#include <array>
 
 namespace mz {
 
@@ -75,6 +76,15 @@ template <class T> T wmul(T a, T b) { T r; __builtin_mul_overflow(a, b, &r); ret
 template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r)) return b >= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
+
+// `[]T` slice: a {ptr, len} view (no ownership). Built from a fixed array via slice(arr).
+// Lifetimes are not yet checked (M5), so a slice must not outlive its backing storage.
+template <class T> struct Slice {
+  T* ptr;
+  uint32_t len;
+  T& operator[](uint32_t i) { return ptr[i]; }
+  const T& operator[](uint32_t i) const { return ptr[i]; }
+};
 
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
 // (so truncation, sign loss, or a non-integral float all yield none). To is always an integer.

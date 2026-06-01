@@ -1,0 +1,3 @@
+std::array<int32_t, 4>
+mz::Slice<int32_t>{ (nums).data(), (uint32_t)(nums).size() }
+(uint32_t)(nums).size()

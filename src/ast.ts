@@ -37,6 +37,7 @@ export type Expr =
   | { kind: "OrElse"; opt: Expr; alt: Expr; ty?: string }   // a ?? b — unwrap or default
   | { kind: "Ok"; expr: Expr; ty?: string }         // Ok(x)  : Result<T, E>
   | { kind: "Err"; expr: Expr; ty?: string }        // Err(e) : Result<T, E>
+  | { kind: "Array"; elems: Expr[]; ty?: string }   // [a, b, c] : [T; N]
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }
@@ -57,7 +58,11 @@ export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
 // Copy types are duplicated freely on assign/pass; everything else is move-only (single owner).
 // Non-Copy: str/String, Buffer<T>, structs, enums-with-payload, Atomic<...>.
-export function isCopy(t: string): boolean { return isInt(t) || isFloat(t) || t === "bool" || t === "char"; }
+export function isCopy(t: string): boolean {
+  if (sliceElem(t) !== null) return true;                       // a slice is a cheap {ptr,len} view
+  const ap = arrayParts(t); if (ap !== null) return isCopy(ap[0]);   // [T;N] is Copy iff T is
+  return isInt(t) || isFloat(t) || t === "bool" || t === "char";
+}
 // References are encoded as a string prefix: `&T` (shared) / `&mut T` (exclusive).
 export function isRef(t: string): boolean { return t.startsWith("&"); }
 export function isMutRef(t: string): boolean { return t.startsWith("&mut "); }
@@ -65,6 +70,14 @@ export function refInner(t: string): string | null { return t.startsWith("&mut "
 export function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 // Optionals are encoded as a trailing `?` (like refs use a leading `&`). `i32?` -> std::optional<int32_t>.
 export function optInner(t: string): string | null { return (!t.startsWith("&") && t.endsWith("?")) ? t.slice(0, -1) : null; }
+// Slices are `[]T` (a {ptr,len} view); fixed arrays are `[T;N]`.
+export function sliceElem(t: string): string | null { return t.startsWith("[]") ? t.slice(2) : null; }
+export function arrayParts(t: string): [string, string] | null {   // [T;N] -> [T, N]
+  if (!t.startsWith("[") || t.startsWith("[]") || !t.endsWith("]")) return null;
+  const inner = t.slice(1, -1);
+  const semi = inner.lastIndexOf(";");   // lastIndex so nested arrays [[i32;2];3] split outermost
+  return semi < 0 ? null : [inner.slice(0, semi).trim(), inner.slice(semi + 1).trim()];
+}
 // Result<T, E> -> [T, E], splitting on the top-level comma (respecting < > nesting). null if not a Result.
 export function resultArgs(t: string): [string, string] | null {
   if (!t.startsWith("Result<") || !t.endsWith(">")) return null;
@@ -105,6 +118,10 @@ export function unifyFloat(a: string, b: string): string | null {
   return a === b ? a : null;
 }
 export function cppType(t: string): string {
+  const se = sliceElem(t);
+  if (se !== null) return `mz::Slice<${cppType(se)}>`;
+  const ap = arrayParts(t);
+  if (ap !== null) return `std::array<${cppType(ap[0])}, ${ap[1]}>`;
   const oi = optInner(t);
   if (oi !== null) return `std::optional<${cppType(oi)}>`;
   const ri = refInner(t);

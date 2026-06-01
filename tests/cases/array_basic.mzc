@@ -1,0 +1,25 @@
+// Fixed arrays [T;N] and slices []T.
+function sum3(a: [i32;3]): i32 {
+  return a[0] + a[1] + a[2];
+}
+function sumSlice(s: []i32): i32 {
+  let total: i32 = 0;
+  let i: u32 = 0;
+  while (i < s.len) {
+    total = total + s[i];
+    i = i +% 1;
+  }
+  return total;
+}
+function main() {
+  let nums: [i32;4] = [10, 20, 30, 40];
+  stdout.println(nums.len);          // 4
+  stdout.println(nums[2]);           // 30
+  stdout.println(sum3([1, 2, 3]));   // 6
+  let s = slice(nums);
+  stdout.println(s.len);             // 4
+  stdout.println(s[3]);              // 40
+  stdout.println(sumSlice(s));       // 100
+  let xs = [100, 200, 300];          // inferred [i32;3]
+  stdout.println(xs[1]);             // 200
+}

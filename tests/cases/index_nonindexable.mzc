@@ -1,0 +1,4 @@
+function main() {
+  let x: i32 = 5;
+  stdout.println(x[0]);
+}

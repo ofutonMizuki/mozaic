@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -196,6 +196,8 @@ class Checker {
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
+    const se = sliceElem(t); if (se !== null) return this.typeKnown(se);
+    const ap = arrayParts(t); if (ap !== null) return this.typeKnown(ap[0]) && /^\d+$/.test(ap[1]);
     const ra = resultArgs(t); if (ra !== null) return this.typeKnown(ra[0]) && this.typeKnown(ra[1]);
     const be = bufferElem(t);
     return be !== null && this.typeKnown(be);
@@ -310,6 +312,8 @@ class Checker {
           else { declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
             if (optInner(declTy) === "intlit") declTy = "i32?";          // some(5) -> i32?
             else if (optInner(declTy) === "floatlit") declTy = "f64?";   // some(1.5) -> f64?
+            const ap = arrayParts(declTy);                               // [1,2,3] -> [i32;3]
+            if (ap !== null) declTy = `[${ap[0] === "intlit" ? "i32" : ap[0] === "floatlit" ? "f64" : ap[0]};${ap[1]}]`;
             if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
@@ -464,6 +468,10 @@ class Checker {
       return vo !== null && this.assignable(vo, to);
     }
     if (vt === "none" || vo !== null) return false;   // an optional value needs an optional target
+    // fixed arrays: same length, element-wise assignable (so [1,2,3] : [intlit;3] fits [i64;3]).
+    const tap = arrayParts(tt), vap = arrayParts(vt);
+    if (tap !== null) return vap !== null && tap[1] === vap[1] && this.assignable(vap[0], tap[0]);
+    if (vap !== null) return false;
     // Result: Ok(x)/Err(e) carry only one half; check against the matching half of the target.
     const tra = resultArgs(tt);
     if (tra !== null) {
@@ -503,6 +511,16 @@ class Checker {
         if (!this.typeKnown(e.toTy)) this.err(`unknown type '${e.toTy}' in cast`);
         else if (!scalarSrc || !okTarget) this.err(`cannot cast ${st} as ${e.toTy} (only numeric / char / bool scalar conversions)`);
         e.ty = e.toTy; return e.ty;
+      }
+      case "Array": {
+        if (e.elems.length === 0) { this.err("empty array literal needs a type annotation (e.g. : [i32; 0])"); e.ty = "[i32;0]"; return e.ty; }
+        let elemTy = this.noConstruct(this.checkExpr(e.elems[0]), "an array literal");
+        for (let k = 1; k < e.elems.length; k++) {
+          const et = this.noConstruct(this.checkExpr(e.elems[k]), "an array literal");
+          const u = (isInt(elemTy) && isInt(et)) ? unifyInt(elemTy, et) : (isFloat(elemTy) && isFloat(et)) ? unifyFloat(elemTy, et) : (elemTy === et ? elemTy : null);
+          if (u === null) this.err(`array element ${k + 1} has type ${et}, expected ${elemTy}`); else elemTy = u;
+        }
+        e.ty = `[${elemTy};${e.elems.length}]`; return e.ty;   // elem may stay intlit/floatlit; annotation/inference resolves it
       }
       case "Some": { e.ty = this.noConstruct(this.checkExpr(e.expr), "some(...)") + "?"; return e.ty; }
       case "None": { e.ty = "none"; return e.ty; }
@@ -551,6 +569,7 @@ class Checker {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
         }
+        if ((sliceElem(ot) !== null || arrayParts(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const fm = this.structs.get(ot);
         if (fm) {
           const ft = fm.get(e.prop);
@@ -562,12 +581,13 @@ class Checker {
       case "Index": {
         const ot0 = this.checkExpr(e.obj);
         const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
-        const be = bufferElem(ot);
-        if (be === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
-        if (e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
+        const ap = arrayParts(ot);
+        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null);
+        if (elem === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
+        if (bufferElem(ot) !== null && e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
         const it = this.checkExpr(e.index);
-        if (!isInt(it)) this.err(`buffer index must be an integer (got ${it})`);
-        e.ty = be; return be;
+        if (!isInt(it)) this.err(`index must be an integer (got ${it})`);
+        e.ty = elem; return elem;
       }
       case "StructLit": {
         const fm = this.structs.get(e.name);
@@ -652,6 +672,14 @@ class Checker {
           if (this.checkExpr(e.callee.obj) !== "Job") this.err("'.await' can only be called on a Job");
           if (e.args.length) this.err("await takes no arguments");
           e.ty = "unit"; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) : []T — view over a named fixed array
+          if (e.args.length !== 1) { this.err("slice(arr) takes one array argument"); e.ty = "[]i32"; return e.ty; }
+          if (e.args[0].kind !== "Ident") this.err("slice(...) argument must be a named array variable (a temporary would dangle)");
+          const at0 = this.checkExpr(e.args[0]); const at = refInner(at0) ?? at0;
+          const ap = arrayParts(at);
+          if (ap === null) { this.err(`slice(...) expects a fixed array (got ${at})`); e.ty = "[]i32"; return e.ty; }
+          e.ty = "[]" + ap[0]; return e.ty;
         }
         if (e.callee.kind === "Ident" && e.callee.name === "abort") {
           if (e.args.length > 1) this.err("abort takes an optional message: abort() or abort(msg)");
