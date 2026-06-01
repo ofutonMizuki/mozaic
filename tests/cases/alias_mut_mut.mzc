@@ -1,0 +1,8 @@
+// Negative: a variable cannot be &mut borrowed twice in the same call.
+struct Point { x: i32; y: i32; }
+function swap2(a: &mut Point, b: &mut Point) { let t: i32 = a.x; a.x = b.x; b.x = t; }
+function main() {
+  let p: Point = Point { x: 1, y: 2 };
+  swap2(&mut p, &mut p);
+  stdout.println(p.x);
+}

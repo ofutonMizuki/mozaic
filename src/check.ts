@@ -146,6 +146,24 @@ class Checker {
     if (src.loopDepth < this.loopDepth) this.err(`cannot move '${e.name}' inside a loop (it is declared outside the loop)`);
     else src.moved = true;
   }
+  // Aliasing within a single call's argument list: a variable borrowed &mut may not be borrowed again
+  // (& or &mut) in the same call. Multiple shared (&) borrows of one variable are fine. (launch/spawn
+  // enforce their own version via registerBorrows against the in-flight borrow set.)
+  checkArgAliasing(args: Expr[], where: string) {
+    const mut = new Set<string>(), shared = new Set<string>();
+    for (const a of args) {
+      if (a.kind !== "Borrow" || a.expr.kind !== "Ident") continue;
+      const root = a.expr.name;
+      if (a.mut) {
+        if (mut.has(root)) this.err(`'${root}' is borrowed as &mut more than once in ${where}`);
+        else if (shared.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
+        mut.add(root);
+      } else {
+        if (mut.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
+        shared.add(root);
+      }
+    }
+  }
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
@@ -534,6 +552,7 @@ class Checker {
               const p = sig.params[k];
               if (p && !this.assignable(at, p.ty)) this.err(`arg ${k + 1} of '${e.callee.name}': cannot pass ${at} as ${p.ty}`);
             }
+            this.checkArgAliasing(e.args, `call to '${e.callee.name}'`);
             e.ty = sig.retTy ?? "unit";
             return e.ty;
           }
@@ -589,6 +608,7 @@ class Checker {
               const at = this.checkExpr(e.args[k]); const p = m.params[k];
               if (p && !this.assignable(at, p.ty)) this.err(`method '${e.callee.prop}' arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
             }
+            this.checkArgAliasing(e.args, `call to '${e.callee.prop}'`);
             e.ty = m.retTy ?? "unit"; return e.ty;
           }
         }
