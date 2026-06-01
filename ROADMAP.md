@@ -30,7 +30,7 @@
 | M | テーマ | 主な中身 | 依存 | 規模 |
 |---|---|---|---|---|
 | ~~**M2**~~ ✅ | 言語コア充実(**実装済み**) | `as`/`as?` ・ `T?` ・ `Result<T,E>` ・ `defer` ・ `[T;N]` / `[]T` ・ `char`+文字リテラル ・ `str`/`String`(`.len`/`+`/`[i]`/`format`)+ テンプレート `` `…${e}…` `` ・ `abort`/`assert`。残: `Result` コンビネータ、可変 `String` API、境界検査、単項マイナス | — | 完了 |
-| **M3** | 抽象化(進行中) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct（データ保持、C++ テンプレートへ降ろし）。残: 総称 struct のメソッド、`comptime`、ベクタ/SIMD(`f32x4`)、`i128`/`u128`/`f16` | M2 | 大 |
+| **M3** | 抽象化(進行中) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct + **総称 struct のメソッド**（C++ テンプレートへ降ろし、コンテナ実装可能）。✅ `i128`/`u128`/`f16`。残: `comptime`、ベクタ/SIMD(`f32x4`) | M2 | 大 |
 | **M4** | 並行性の完成 | `Mutex<T>` / `Channel<T>` / `Arc<T>` ・ 結果返し `join`(`Task<R>`)・ `Send`/`Sync` 自動判定 ・ `Atomic` の `SeqCst` ・ カーネル `local.{x,y,z}` / `barrier()` / `shared [T;N]` ・ 実行時 Device 選択 | M2(一部 M3) | 中〜大 |
 | **M5** | 借用チェッカ完全形 | 格納参照の文跨ぎ別名 ・ NLL(最終使用での解放)・ disjoint-field 借用 ・ 明示 lifetime 注釈 + 多引数関係 | 現在地(独立) | 中 |
 | **M6** | モジュール & 標準ライブラリ | `import` / コンパイル単位 / 名前解決 ・ 最小 stdlib(collections / math / 文字列)・ **ファイル I/O**(セルフホスト必須) | M2, M3 | 大 |
