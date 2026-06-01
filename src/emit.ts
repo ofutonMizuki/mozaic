@@ -1,5 +1,5 @@
 // Code generation: typed AST -> C++ source.
-import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
+import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
 import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
@@ -93,8 +93,42 @@ function formatArg(e: Expr): string {
   return `mz::format(${x})`;   // str / bool
 }
 
+// Render an integer literal as a valid C++ token (suffixes for >63-bit; 128-bit via hi<<64|lo).
+function renderInt(v: bigint): string {
+  if (v < 0n) return `(-${renderInt(-v)})`;
+  if (v <= 9223372036854775807n) return v.toString();
+  if (v <= 18446744073709551615n) return v.toString() + "ull";
+  const hi = v >> 64n, lo = v & ((1n << 64n) - 1n);
+  return `(((unsigned __int128)${renderInt(hi)} << 64) | (unsigned __int128)${lo}ull)`;
+}
+function renderFloat(v: number): string {
+  if (Number.isNaN(v)) return "__builtin_nan(\"\")";
+  if (v === Infinity) return "__builtin_inf()";
+  if (v === -Infinity) return "(-__builtin_inf())";
+  const s = String(v);
+  return /[.eE]/.test(s) ? s : s + ".0";   // keep it a floating literal
+}
+// A comptime value -> C++ initializer text. Arrays use the std::array double-brace form;
+// structs are filled in declared field order (matches the StructLit emitter).
+function renderCT(v: CTValue): string {
+  switch (v.k) {
+    case "int": return renderInt(v.v);
+    case "float": return renderFloat(v.v);
+    case "bool": return v.v ? "true" : "false";
+    case "char": return `(char32_t)${v.v}`;
+    case "str": return cstr(v.v);
+    case "arr": return `{{ ${v.v.map(renderCT).join(", ")} }}`;
+    case "struct": {
+      const base = v.name.includes("<") ? v.name.slice(0, v.name.indexOf("<")) : v.name;
+      const order = STRUCT_FIELDS.get(base) ?? [...v.fields.keys()];
+      return `${cppType(v.name)}{ ${order.map((fn) => (v.fields.has(fn) ? renderCT(v.fields.get(fn)!) : "{}")).join(", ")} }`;
+    }
+  }
+}
+
 function emitExpr(e: Expr): string {
   switch (e.kind) {
+    case "Comptime": return renderCT(e.cval!);
     case "Num": return e.value;
     case "Float": return e.value;
     case "Str": return cstr(e.value);
@@ -388,6 +422,13 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
   switch (e.kind) {
     case "Num": return e.value;
     case "Float": return e.value;
+    case "Comptime": {   // folded constant: only scalars make sense in a kernel
+      const v = e.cval!;
+      if (v.k === "int") return v.v.toString();
+      if (v.k === "float") return renderFloat(v.v);
+      if (v.k === "bool") return v.v ? "true" : "false";
+      throw new Error("kernel: only scalar comptime values are allowed");
+    }
     case "Char": throw new Error("kernel: char literals are not allowed");
     case "Bool": return e.value ? "true" : "false";
     case "Cast": {
@@ -496,6 +537,7 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const types = prog.items.filter((it): it is StructDecl | EnumDecl => it.kind === "StructDecl" || it.kind === "EnumDecl");
   const kernels = prog.items.filter((it): it is KernelDecl => it.kind === "KernelDecl");
   const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
+  const consts = prog.items.filter((it): it is ConstDecl => it.kind === "ConstDecl");
 
   STRUCT_FIELDS = new Map();
   STRUCT_FIELD_TYPES = new Map();
@@ -514,6 +556,8 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   for (const f of fns) FN_PARAMS.set(f.name, f.params);
 
   const typeDecls = types.map(emitTypeDecl).join("\n");
+  // Top-level consts -> file-scope `static const` globals (folded at build time; defined before fns use them).
+  const constDecls = consts.map((c) => `static const ${cppType(c.ty)} ${c.name} = ${renderCT(c.cval!)};`).join("\n");
   // Metal: kernels become MSL source strings (compiled at runtime); no C++ kernel fn/proto.
   // CPU:   kernels become C++ functions launched by a serial mz::launch loop.
   const mslDecls = target === "metal"
@@ -530,13 +574,13 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const methodDefs = types.flatMap((it) => it.kind === "StructDecl" ? it.methods.map((m) => emitMethodDef(it.name, m, it.typeParams ?? [])) : []).join("\n\n");
   const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.filter((f) => !isGeneric(f)).map(emitFn)].join("\n\n");
   // Pull in <atomic> / <thread> only when the program actually uses them (the emitted code names them).
-  const allCode = typeDecls + mslDecls + protos + genericDefs + methodDefs + defs;
+  const allCode = typeDecls + constDecls + mslDecls + protos + genericDefs + methodDefs + defs;
   const sysIncludes = (allCode.includes("std::atomic") ? "#include <atomic>\n" : "") +
                       (allCode.includes("std::thread") ? "#include <thread>\n" : "") +
                       (allCode.includes("std::move") ? "#include <utility>\n" : "");
   return `// generated by mozaic (M0)${target === "metal" ? " [Metal/MSL backend]" : ""}
 ${sysIncludes}#include "mozaic_rt.h"
 
-${typeDecls ? typeDecls + "\n\n" : ""}${mslDecls ? mslDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${genericDefs ? genericDefs + "\n\n" : ""}${methodDefs ? methodDefs + "\n\n" : ""}${defs}
+${typeDecls ? typeDecls + "\n\n" : ""}${constDecls ? constDecls + "\n\n" : ""}${mslDecls ? mslDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${genericDefs ? genericDefs + "\n\n" : ""}${methodDefs ? methodDefs + "\n\n" : ""}${defs}
 `;
 }

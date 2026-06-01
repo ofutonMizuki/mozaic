@@ -1,0 +1,6 @@
+// comptime cannot read a runtime value.
+function main() {
+  let x: i32 = 3;
+  let y = comptime (x + 1);   // error: x is not known at build time
+  stdout.println(y);
+}

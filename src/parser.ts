@@ -1,6 +1,6 @@
 // Recursive-descent parser: tokens -> AST.
 import type {
-  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, Arm, Stmt, Expr,
+  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, Arm, Stmt, Expr,
 } from "./ast.ts";
 import type { Tok } from "./lexer.ts";
 import { lex } from "./lexer.ts";
@@ -56,6 +56,7 @@ export class Parser {
       if (this.at("struct")) items.push(this.parseStruct());
       else if (this.at("enum")) items.push(this.parseEnum());
       else if (this.at("kernel")) items.push(this.parseKernel());
+      else if (this.at("const")) items.push(this.parseConstItem());
       else items.push(this.parseFn());
     }
     return { kind: "Program", items };
@@ -139,6 +140,16 @@ export class Parser {
     while (this.at(",")) { this.next(); ps.push(this.eat("id").v); }
     this.eat(">");
     return ps;
+  }
+  parseConstItem(): ConstDecl {   // top-level `const NAME: T = Expr;` — a build-time constant
+    this.eat("const");
+    const name = this.eat("id").v;
+    this.eat(":");
+    const ty = this.parseType();
+    this.eat("=");
+    const value = this.parseExpr();
+    this.eat(";");
+    return { kind: "ConstDecl", name, ty, value };
   }
   parseKernel(): KernelDecl {
     this.eat("kernel");
@@ -292,6 +303,7 @@ export class Parser {
       if (this.at("mut")) { this.next(); mut = true; }
       return { kind: "Borrow", mut, expr: this.parseUnary() };
     }
+    if (this.at("comptime")) { this.next(); return { kind: "Comptime", expr: this.parseUnary() }; }
     return this.parsePostfix();
   }
   parsePostfix(): Expr {

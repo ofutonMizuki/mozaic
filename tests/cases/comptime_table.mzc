@@ -1,0 +1,23 @@
+// comptime: build-time constant folding + a generated lookup table.
+const N: i32 = 5;
+const DOUBLE_N: i32 = comptime N + N;        // folded to 10
+
+function squares(): [i32; 8] {               // run at build time to fill the table
+  let t: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+  let i: i32 = 0;
+  while (i < 8) { t[i] = i * i; i = i + 1; }
+  return t;
+}
+const SQ: [i32; 8] = comptime squares();     // {0,1,4,9,16,25,36,49} baked into the binary
+
+function main() {
+  stdout.println(N);                         // 5
+  stdout.println(DOUBLE_N);                  // 10
+  stdout.println(SQ[3]);                     // 9
+  stdout.println(SQ[7]);                     // 49
+  stdout.println(comptime squares()[2]);     // 4  (folded inline)
+  let total: i32 = 0;
+  let i: i32 = 0;
+  while (i < 8) { total = total + SQ[i]; i = i + 1; }
+  stdout.println(total);                     // 140
+}

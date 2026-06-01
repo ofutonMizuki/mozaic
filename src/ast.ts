@@ -1,7 +1,8 @@
 // AST node types + shared type-system helpers.
 
 export type Program = { kind: "Program"; items: Item[] };
-export type Item = FnDecl | StructDecl | EnumDecl | KernelDecl;
+export type Item = FnDecl | StructDecl | EnumDecl | KernelDecl | ConstDecl;
+export type ConstDecl = { kind: "ConstDecl"; name: string; ty: string; value: Expr; cval?: CTValue };
 export type Param = { name: string; ty: string };
 export type Field = { name: string; ty: string };
 export type Variant = { name: string; payload: string[] };
@@ -46,7 +47,18 @@ export type Expr =
   | { kind: "StructLit"; name: string; fields: { name: string; value: Expr }[]; ty?: string }
   | { kind: "Borrow"; mut: boolean; expr: Expr; ty?: string }
   | { kind: "SpawnExpr"; call: Expr; ty?: string }
+  | { kind: "Comptime"; expr: Expr; ty?: string; cval?: CTValue }   // comptime e — fold to a constant at build time
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
+
+// A compile-time constant value produced by the comptime evaluator (see comptime.ts).
+export type CTValue =
+  | { k: "int"; v: bigint }
+  | { k: "float"; v: number }
+  | { k: "bool"; v: boolean }
+  | { k: "char"; v: number }                              // codepoint
+  | { k: "str"; v: string }
+  | { k: "arr"; elem: string; v: CTValue[] }              // elem = element type
+  | { k: "struct"; name: string; fields: Map<string, CTValue> };
 
 export type Sig = { params: Param[]; retTy: string | null; typeParams?: string[] };
 export type VarInfo = { enumName: string; index: number; payload: string[] };

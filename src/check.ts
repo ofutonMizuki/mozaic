@@ -1,9 +1,10 @@
 // Semantic analysis: name resolution + strict type checking.
-import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
+import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo, CTValue } from "./ast.ts";
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
 } from "./ast.ts";
+import { Comptime, CompileError } from "./comptime.ts";
 
 // borrow = device sync: a buffer borrowed by an in-flight Job (between dev.launch and
 // job.await) cannot be touched by the host. & = shared (CPU reads still OK), &mut = exclusive.
@@ -38,6 +39,9 @@ class Checker {
   scopeCount = 0;
   target: "cpu" | "metal" = "cpu";         // emit target (Buffer<Atomic<T>> is CPU-only)
   curTypeParams = new Set<string>();       // generic type params in scope (opaque, treated as known types)
+  consts = new Map<string, string>();      // top-level const name -> type
+  constVals = new Map<string, CTValue>();  // top-level const name -> evaluated compile-time value
+  comptimeEval!: Comptime;                 // tree-walking evaluator for `comptime` / const folding
   // Does a type transitively contain an Atomic? (uses the registered struct field types)
   hasAtomic(t: string): boolean {
     const sf = new Map<string, string[]>();
@@ -306,6 +310,26 @@ class Checker {
     if (!this.fns.has("main")) this.err("no `main` function");
     const main = this.fns.get("main");
     if (main && (main.params.length > 0 || main.retTy)) this.err("`main` must take no parameters and declare no return type");
+    // top-level const declarations: register all types first (so values may reference each other),
+    // then fold each value at compile time in source order. The evaluator shares constVals.
+    this.comptimeEval = new Comptime(p);
+    this.comptimeEval.consts = this.constVals;
+    for (const it of p.items) if (it.kind === "ConstDecl") {
+      if (this.consts.has(it.name) || this.fns.has(it.name)) this.err(`duplicate top-level name '${it.name}'`);
+      if (!this.typeKnown(it.ty)) this.err(`unknown type '${it.ty}' for const '${it.name}'`);
+      else { const bad = this.badAtomicElem(it.ty); if (bad) this.err(`${bad} (const '${it.name}')`); }
+      if (this.hasAtomic(it.ty)) this.err(`const '${it.name}': cannot hold an Atomic`);
+      this.consts.set(it.name, it.ty);
+    }
+    for (const it of p.items) if (it.kind === "ConstDecl") {
+      this.push();
+      this.curRet = "unit"; this.curParams = new Set(); this.curTypeParams = new Set(); this.inKernel = false;
+      const vt = this.checkExpr(it.value);
+      if (!this.assignable(vt, it.ty)) this.err(`const '${it.name}': cannot initialize ${it.ty} with ${vt}`);
+      this.pop();
+      try { it.cval = this.comptimeEval.evalConst(it.value, it.ty); this.constVals.set(it.name, it.cval); }
+      catch (e) { if (e instanceof CompileError) this.err(`const '${it.name}': ${e.message}`); else throw e; }
+    }
     for (const it of p.items) if (it.kind === "FnDecl" || it.kind === "KernelDecl") {
       this.push();
       this.curRet = (it.kind === "FnDecl" ? it.retTy : null) ?? "unit";
@@ -611,12 +635,22 @@ class Checker {
         if (!this.assignable(at, inner)) this.err(`'??' default type ${at} does not match ${inner}`);
         e.ty = inner; return e.ty;
       }
+      case "Comptime": {
+        const it = this.checkExpr(e.expr);
+        if (it === "unit" || it === "none" || it.startsWith("ok<") || it.startsWith("err<")) this.err(`comptime: cannot fold ${it}`);
+        e.ty = it;
+        try { e.cval = this.comptimeEval.evalConst(e.expr, it); }
+        catch (er) { if (er instanceof CompileError) this.err(er.message); else throw er; }
+        return e.ty;
+      }
       case "Ident": {
         const vs = this.lookupVar(e.name);
         if (vs) {
           if (vs.moved && this.suppressMovedCheck !== e.name) this.err(`use of moved value '${e.name}'`);
           e.ty = vs.ty; return vs.ty;
         }
+        const ct = this.consts.get(e.name);
+        if (ct) { if (this.inKernel) this.err(`top-level const '${e.name}' is not available inside a kernel`); e.ty = ct; return ct; }
         if (ORDERINGS.has(e.name)) { e.ty = "Ordering"; return e.ty; }
         const v = this.variants.get(e.name);
         if (v && v.payload.length === 0) { e.ty = v.enumName; return e.ty; }
