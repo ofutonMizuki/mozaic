@@ -19,6 +19,12 @@ export class Parser {
     return tk;
   }
   parseType(): string {
+    if (this.at("&")) {   // reference type: &T (shared) / &mut T (exclusive)
+      this.next();
+      let mut = false;
+      if (this.at("mut")) { this.next(); mut = true; }
+      return (mut ? "&mut " : "&") + this.parseType();
+    }
     const name = this.eat("id").v;
     if (this.at("<")) { this.next(); const inner = this.parseType(); this.eat(">"); return `${name}<${inner}>`; }
     return name;
@@ -122,21 +128,21 @@ export class Parser {
       this.next();
       const value = this.parseExpr();
       this.eat(";");
-      if (e.kind !== "Ident" && e.kind !== "Index") throw new Error("parse error: invalid assignment target");
+      if (e.kind !== "Ident" && e.kind !== "Index" && e.kind !== "Member") throw new Error("parse error: invalid assignment target");
       return { kind: "Assign", target: e, value };
     }
     this.eat(";");
     return { kind: "ExprStmt", expr: e };
   }
   parseLet(): Stmt {
-    this.next();
+    const isConst = this.next().t === "const";
     const name = this.eat("id").v;
     let annot: string | null = null;
     if (this.at(":")) { this.next(); annot = this.parseType(); }
     this.eat("=");
     const value = this.parseExpr();
     this.eat(";");
-    return { kind: "Let", name, annot, value };
+    return { kind: "Let", name, annot, value, isConst };
   }
   parseWhile(): Stmt {
     this.eat("while"); this.eat("(");

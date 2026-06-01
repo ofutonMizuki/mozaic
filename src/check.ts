@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -11,7 +11,7 @@ import {
 type Borrow = { mut: boolean; job: string };
 // Per-binding state for ownership/move tracking. `moved` = ownership transferred out (later use is an
 // error); `loopDepth` = the loop nesting at definition (moving an outer binding inside a loop is unsound).
-type VarState = { ty: string; moved: boolean; loopDepth: number };
+type VarState = { ty: string; moved: boolean; loopDepth: number; mutable: boolean };
 
 // Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
 const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
@@ -129,7 +129,7 @@ class Checker {
   }
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
-  define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, { ty: t, moved: false, loopDepth: this.loopDepth }); }
+  define(n: string, t: string, mutable = true) { this.scopes[this.scopes.length - 1].set(n, { ty: t, moved: false, loopDepth: this.loopDepth, mutable }); }
   lookup(n: string): string | null { const v = this.lookupVar(n); return v ? v.ty : null; }
   lookupVar(n: string): VarState | null {
     for (let i = this.scopes.length - 1; i >= 0; i--) { const v = this.scopes[i].get(n); if (v) return v; }
@@ -147,6 +147,7 @@ class Checker {
   }
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
+    const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
@@ -187,6 +188,7 @@ class Checker {
       for (const pa of it.params) {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
         if (this.hasAtomic(pa.ty)) this.err(`Atomic is not supported inside a kernel (parameter '${pa.name}')`);
+        if (refInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a reference (host-data refs are not allowed in kernels)`);
       }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
@@ -237,7 +239,7 @@ class Checker {
             if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
-        this.define(s.name, declTy);
+        this.define(s.name, declTy, !s.isConst);
         // Atomic<T>: validate the initial value against T.
         const ael = atomicElem(declTy);
         if (ael !== null && isAtomicNew(s.value)) {
@@ -272,6 +274,12 @@ class Checker {
         this.suppressBufRead = null;
         this.suppressMovedCheck = null;
         if (this.hasAtomic(tt)) { this.err(`cannot assign to an Atomic; use .store(value, order)`); break; }
+        // field-assignment mutability: through a shared `&` ref, or via a const/immutable root, is illegal.
+        if (s.target.kind === "Member" && s.target.obj.kind === "Ident") {
+          const ov = this.lookupVar(s.target.obj.name);
+          if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`cannot assign to a field through a shared reference '${s.target.obj.name}' (need &mut)`); }
+          else if (ov && !ov.mutable) this.err(`cannot assign to a field of immutable '${s.target.obj.name}' (use 'let')`);
+        }
         const vt = this.checkExpr(s.value);
         if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
         this.moveIfBinding(s.value);   // RHS binding moves...
@@ -360,6 +368,12 @@ class Checker {
   assignable(vt: string, tt: string): boolean {
     if (vt === "buffernew" && bufferElem(tt) !== null) return true;
     if (vt === "atomicnew" && atomicElem(tt) !== null) return true;
+    const tr = refInner(tt), vr = refInner(vt);
+    // ref param: &->&, &mut->&mut, and &mut coerces to & (same referent type required).
+    if (tr !== null) return vr !== null && tr === vr && (!isMutRef(tt) || isMutRef(vt));
+    // a borrow (&Buf / &Atomic / &atomic-struct) is usable where the plain value type is expected
+    // — this is exactly the launch/spawn argument case (their params are plain Buffer/Atomic/struct).
+    if (vr !== null) return vr === tt && (bufferElem(tt) !== null || this.hasAtomic(tt));
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
     return vt === tt;
@@ -383,7 +397,8 @@ class Checker {
       case "Member": {
         if (e.obj.kind === "Ident" && e.obj.name === "grid" && (e.prop === "x" || e.prop === "y" || e.prop === "z")) { e.ty = "u32"; return e.ty; }
         if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) { e.ty = "Device"; return e.ty; }
-        const ot = this.checkExpr(e.obj);
+        const ot0 = this.checkExpr(e.obj);
+        const ot = refInner(ot0) ?? ot0;   // auto-deref &T for field/len access
         if (bufferElem(ot) !== null && e.prop === "len") {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
@@ -397,7 +412,8 @@ class Checker {
         e.ty = "unknown"; return e.ty;
       }
       case "Index": {
-        const ot = this.checkExpr(e.obj);
+        const ot0 = this.checkExpr(e.obj);
+        const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
         const be = bufferElem(ot);
         if (be === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
         if (e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
@@ -541,9 +557,13 @@ class Checker {
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;
       }
       case "Borrow": {
-        const it = this.checkExpr(e.expr);
-        if (bufferElem(it) === null && !this.hasAtomic(it)) this.err(`'&' borrow is only for Buffer or Atomic arguments (got ${it})`);
-        e.ty = it; return e.ty;
+        const it = this.checkExpr(e.expr);   // &x : &T  /  &mut x : &mut T  (validity checked at the use site)
+        if (e.mut && e.expr.kind === "Ident") {
+          const vs = this.lookupVar(e.expr.name);
+          if (vs && !vs.mutable) this.err(`cannot take '&mut ${e.expr.name}': it is a const binding (use 'let')`);
+        }
+        e.ty = (e.mut ? "&mut " : "&") + it;
+        return e.ty;
       }
       case "SpawnExpr": {
         if (this.inKernel) this.err("spawn is not allowed inside a kernel");
