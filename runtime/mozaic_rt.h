@@ -301,9 +301,20 @@ inline std::vector<String> stdin_lines() {
   return lines;
 }
 
+// 128-bit integers have no std::to_string; format/print them by hand.
+inline std::string u128_str(unsigned __int128 v) {
+  if (v == 0) return "0";
+  char buf[40]; int i = 40;
+  while (v > 0) { buf[--i] = (char)('0' + (int)(v % 10)); v /= 10; }
+  return std::string(buf + i, buf + 40);
+}
+inline std::string i128_str(__int128 v) { return v < 0 ? "-" + u128_str((unsigned __int128)(-v)) : u128_str((unsigned __int128)v); }
+
 inline void println(const String& s)        { std::cout << encodeUtf8(s) << "\n"; }
 inline void println(const char* s)           { std::cout << s << "\n"; }
 inline void println(char32_t cp)             { std::cout << encodeUtf8(std::u32string(1, cp)) << "\n"; }
+inline void println(__int128 v)              { std::cout << i128_str(v) << "\n"; }
+inline void println(unsigned __int128 v)     { std::cout << u128_str(v) << "\n"; }
 inline void println(long long v)             { std::cout << v << "\n"; }
 inline void println(unsigned long long v)    { std::cout << v << "\n"; }
 inline void println(double v)                { std::cout << v << "\n"; }
@@ -318,6 +329,8 @@ inline String format(char32_t c)            { return String(1, c); }
 inline String format(bool b)                { return decodeUtf8(b ? "true" : "false"); }
 inline String format(long long v)           { return decodeUtf8(std::to_string(v)); }
 inline String format(unsigned long long v)  { return decodeUtf8(std::to_string(v)); }
+inline String format(__int128 v)            { return decodeUtf8(i128_str(v)); }
+inline String format(unsigned __int128 v)   { return decodeUtf8(u128_str(v)); }
 inline String format(double v)              { std::ostringstream os; os << v; return decodeUtf8(os.str()); }   // match println(double)
 
 // abort / assert. panic_msg takes an mz::String (needs encodeUtf8, defined above).

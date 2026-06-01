@@ -86,6 +86,8 @@ function formatArg(e: Expr): string {
   const at = e.ty ?? "unit";
   const x = emitExpr(e);
   if (at === "char") return `mz::format((char32_t)(${x}))`;
+  if (at === "i128") return `mz::format((__int128)(${x}))`;
+  if (at === "u128") return `mz::format((unsigned __int128)(${x}))`;
   if (isInt(at)) return `mz::format((${isUnsigned(at) ? "unsigned long long" : "long long"})(${x}))`;
   if (isFloat(at)) return `mz::format((double)(${x}))`;
   return `mz::format(${x})`;   // str / bool
@@ -215,6 +217,8 @@ function emitExpr(e: Expr): string {
           const at = a.ty ?? "unit";
           if (at === "str" || at === "bool") return `mz::println(${emitExpr(a)})`;
           if (at === "char") return `mz::println((char32_t)(${emitExpr(a)}))`;
+          if (at === "i128") return `mz::println((__int128)(${emitExpr(a)}))`;
+          if (at === "u128") return `mz::println((unsigned __int128)(${emitExpr(a)}))`;
           if (isInt(at)) return `mz::println((${isUnsigned(at) ? "unsigned long long" : "long long"})(${emitExpr(a)}))`;
           if (isFloat(at)) return `mz::println((double)(${emitExpr(a)}))`;
           return `mz::println(${emitExpr(a)})`;
@@ -354,6 +358,7 @@ function mslType(t: string): string {
   switch (t) {
     case "u8": return "uchar"; case "u16": return "ushort"; case "u32": return "uint"; case "u64": return "ulong";
     case "i8": return "char"; case "i16": return "short"; case "i32": return "int"; case "i64": return "long";
+    case "i128": case "u128": throw new Error("kernel: 128-bit integers are not supported in MSL");
     case "intlit": return "int";
     case "f16": return "half"; case "f32": return "float"; case "f64": return "float"; case "floatlit": return "float";
     case "bool": return "bool";

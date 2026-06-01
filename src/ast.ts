@@ -52,8 +52,8 @@ export type Sig = { params: Param[]; retTy: string | null; typeParams?: string[]
 export type VarInfo = { enumName: string; index: number; payload: string[] };
 
 // ---------- type-system helpers ----------
-export const INTS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"];
-export const FLOATS = ["f32", "f64"];
+export const INTS = ["i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128"];
+export const FLOATS = ["f16", "f32", "f64"];
 export function isInt(t: string): boolean { return t === "intlit" || INTS.includes(t); }
 export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
@@ -166,8 +166,9 @@ export function cppType(t: string): string {
   switch (t) {
     case "i8": return "int8_t"; case "i16": return "int16_t"; case "i32": return "int32_t"; case "i64": return "int64_t";
     case "u8": return "uint8_t"; case "u16": return "uint16_t"; case "u32": return "uint32_t"; case "u64": return "uint64_t";
+    case "i128": return "__int128"; case "u128": return "unsigned __int128";
     case "intlit": return "int32_t";
-    case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
+    case "f16": return "_Float16"; case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
     case "char": return "char32_t";
     case "str": return "mz::String";

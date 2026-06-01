@@ -1,0 +1,14 @@
+// i128 / u128 (no native printf) and f16 (rides the float path).
+function main() {
+  let big: u128 = 0;
+  let i: u32 = 0;
+  while (i < 40) { big = big +% 1000000000000; i = i +% 1; }   // overflows u64, fits u128
+  stdout.println(big);          // 40000000000000
+  let neg: i128 = 0;
+  neg = neg - 100;
+  stdout.println(neg);          // -100
+  stdout.println(`big=${big}`); // template/format path
+  let h: f16 = 1.5;
+  let h2 = h + h;
+  stdout.println(h2);           // 3
+}
