@@ -6,7 +6,7 @@ export type Param = { name: string; ty: string };
 export type Field = { name: string; ty: string };
 export type Variant = { name: string; payload: string[] };
 export type Method = { name: string; recv: "self" | "&self" | "&mut self"; params: Param[]; retTy: string | null; body: Stmt[] };
-export type StructDecl = { kind: "StructDecl"; name: string; fields: Field[]; methods: Method[] };
+export type StructDecl = { kind: "StructDecl"; name: string; fields: Field[]; methods: Method[]; typeParams?: string[] };
 export type EnumDecl = { kind: "EnumDecl"; name: string; variants: Variant[] };
 export type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[]; typeParams?: string[] };
 export type KernelDecl = { kind: "KernelDecl"; name: string; params: Param[]; body: Stmt[] };
@@ -79,6 +79,25 @@ export function arrayParts(t: string): [string, string] | null {   // [T;N] -> [
   const semi = inner.lastIndexOf(";");   // lastIndex so nested arrays [[i32;2];3] split outermost
   return semi < 0 ? null : [inner.slice(0, semi).trim(), inner.slice(semi + 1).trim()];
 }
+// Generic application `Name<a, b, ...>` -> { base, args } (top-level commas, < > nesting). null if not applied.
+export function genericArgs(t: string): { base: string; args: string[] } | null {
+  if (!t.endsWith(">")) return null;
+  const lt = t.indexOf("<");
+  if (lt <= 0) return null;
+  const base = t.slice(0, lt);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(base)) return null;   // base must be a plain name (not [..]<..> etc.)
+  const inner = t.slice(lt + 1, -1);
+  const args: string[] = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "<") depth++;
+    else if (c === ">") depth--;
+    else if (c === "," && depth === 0) { args.push(inner.slice(start, i).trim()); start = i + 1; }
+  }
+  args.push(inner.slice(start).trim());
+  return { base, args };
+}
 // Result<T, E> -> [T, E], splitting on the top-level comma (respecting < > nesting). null if not a Result.
 export function resultArgs(t: string): [string, string] | null {
   if (!t.startsWith("Result<") || !t.endsWith(">")) return null;
@@ -103,6 +122,7 @@ export function containsAtomic(t: string, structFields: Map<string, string[]>, s
   const ap = arrayParts(t); if (ap !== null) return containsAtomic(ap[0], structFields, seen);   // [T;N]
   const be = bufferElem(t); if (be !== null) return containsAtomic(be, structFields, seen);
   const ra = resultArgs(t); if (ra !== null) return containsAtomic(ra[0], structFields, seen) || containsAtomic(ra[1], structFields, seen);
+  const g = genericArgs(t); if (g !== null) return g.args.some((a) => containsAtomic(a, structFields, seen));   // generic struct instance: conservative
   if (seen.has(t)) return false;
   const fields = structFields.get(t);
   if (fields) { seen.add(t); return fields.some((ft) => containsAtomic(ft, structFields, seen)); }
@@ -119,6 +139,7 @@ export function substituteType(t: string, b: Map<string, string>): string {
   const be = bufferElem(t); if (be !== null) return `Buffer<${substituteType(be, b)}>`;
   const ae = atomicElem(t); if (ae !== null) return `Atomic<${substituteType(ae, b)}>`;
   const ra = resultArgs(t); if (ra !== null) return `Result<${substituteType(ra[0], b)}, ${substituteType(ra[1], b)}>`;
+  const g = genericArgs(t); if (g !== null) return `${g.base}<${g.args.map((a) => substituteType(a, b)).join(", ")}>`;   // generic struct instance
   return t;
 }
 export function unifyInt(a: string, b: string): string | null {
@@ -160,7 +181,9 @@ export function cppType(t: string): string {
       if (be !== null) return `mz::Buffer<${cppType(be)}>`;
       const ra = resultArgs(t);
       if (ra !== null) return `mz::Result<${cppType(ra[0])}, ${cppType(ra[1])}>`;
-      return t;   // user struct/enum types map to their own name
+      const g = genericArgs(t);   // a generic struct instance Name<args> -> Name<cppArgs...>
+      if (g !== null) return `${g.base}<${g.args.map(cppType).join(", ")}>`;
+      return t;   // user struct/enum types (and bare type params) map to their own name
     }
   }
 }

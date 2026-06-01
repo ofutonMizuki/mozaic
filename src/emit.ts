@@ -147,7 +147,7 @@ function emitExpr(e: Expr): string {
         if (ae !== null && isAtomicNew(v)) return `std::atomic<${cppType(ae)}>{ ${emitExpr((v as Extract<Expr, { kind: "Call" }>).args[0])} }`;
         return emitExpr(v);
       });
-      return `${e.name}{ ${vals.join(", ")} }`;
+      return `${cppType(e.ty ?? e.name)}{ ${vals.join(", ")} }`;   // generic -> Name<cppArgs>{...}; plain -> Name{...}
     }
     case "Binary": {
       // optional presence test: opt == none / opt != none -> has_value()
@@ -445,6 +445,9 @@ function methodSig(m: Method): string {   // return-type name(params) [const]  â
 function emitTypeDecl(it: StructDecl | EnumDecl): string {
   if (it.kind === "StructDecl") {
     const fields = it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ");
+    if (it.typeParams && it.typeParams.length) {   // generic struct -> class template (no methods yet)
+      return `template <${it.typeParams.map((t) => `class ${t}`).join(", ")}> struct ${it.name} { ${fields} };`;
+    }
     const decls = it.methods.map((m) => `${methodSig(m)};`).join(" ");   // declarations; bodies emitted out-of-line
     return `struct ${it.name} { ${[fields, decls].filter((s) => s).join(" ")} };`;
   }

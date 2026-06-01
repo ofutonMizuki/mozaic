@@ -63,6 +63,7 @@ export class Parser {
   parseStruct(): StructDecl {
     this.eat("struct");
     const name = this.eat("id").v;
+    const typeParams = this.parseTypeParams();
     this.eat("{");
     const fields: Field[] = [];
     const methods: Method[] = [];
@@ -75,7 +76,7 @@ export class Parser {
       fields.push({ name: fname, ty });
     }
     this.eat("}");
-    return { kind: "StructDecl", name, fields, methods };
+    return { kind: "StructDecl", name, fields, methods, typeParams };
   }
   parseMethod(): Method {
     this.eat("function");

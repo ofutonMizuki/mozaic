@@ -2,7 +2,7 @@
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
-  bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
+  bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
 // borrow = device sync: a buffer borrowed by an in-flight Job (between dev.launch and
@@ -23,6 +23,7 @@ class Checker {
   kernels = new Map<string, Param[]>();
   structs = new Map<string, Map<string, string>>();
   structMethods = new Map<string, Map<string, Method>>();   // struct name -> method name -> Method
+  structTypeParams = new Map<string, string[]>();            // struct name -> its generic type params
   enums = new Map<string, Map<string, string[]>>();
   variants = new Map<string, VarInfo>();
   curRet = "unit";
@@ -224,8 +225,21 @@ class Checker {
     const se = sliceElem(t); if (se !== null) return this.typeKnown(se);
     const ap = arrayParts(t); if (ap !== null) return this.typeKnown(ap[0]) && /^\d+$/.test(ap[1]);
     const ra = resultArgs(t); if (ra !== null) return this.typeKnown(ra[0]) && this.typeKnown(ra[1]);
+    const g = genericArgs(t);   // a generic struct instance Name<args>
+    if (g !== null && this.structs.has(g.base)) return (this.structTypeParams.get(g.base) ?? []).length === g.args.length && g.args.every((a) => this.typeKnown(a));
     const be = bufferElem(t);
     return be !== null && this.typeKnown(be);
+  }
+  // Fields + type-param substitution for a struct type (plain `Name` or instance `Name<args>`). null if not a struct.
+  structFields(t: string): { fields: Map<string, string>; subst: Map<string, string> } | null {
+    if (this.structs.has(t)) return { fields: this.structs.get(t)!, subst: new Map() };
+    const g = genericArgs(t);
+    if (g !== null && this.structs.has(g.base)) {
+      const subst = new Map<string, string>();
+      (this.structTypeParams.get(g.base) ?? []).forEach((tp, i) => subst.set(tp, g.args[i] ?? tp));
+      return { fields: this.structs.get(g.base)!, subst };
+    }
+    return null;
   }
 
   checkProgram(p: Program) {
@@ -234,6 +248,8 @@ class Checker {
       const fm = new Map<string, string>();
       for (const f of it.fields) fm.set(f.name, f.ty);
       this.structs.set(it.name, fm);
+      this.structTypeParams.set(it.name, it.typeParams ?? []);
+      if (it.typeParams && it.typeParams.length && it.methods.length) this.err(`methods on generic struct '${it.name}' are not supported yet`);
       const mm = new Map<string, Method>();
       for (const m of it.methods) { if (mm.has(m.name)) this.err(`duplicate method '${it.name}.${m.name}'`); mm.set(m.name, m); }
       this.structMethods.set(it.name, mm);
@@ -249,11 +265,14 @@ class Checker {
       });
       this.enums.set(it.name, vm);
     }
-    for (const it of p.items) if (it.kind === "StructDecl")
+    for (const it of p.items) if (it.kind === "StructDecl") {
+      this.curTypeParams = new Set(it.typeParams ?? []);   // field types may reference the struct's params
       for (const f of it.fields) {
         if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
         const bad = this.badAtomicElem(f.ty); if (bad) this.err(`${bad} (field '${it.name}.${f.name}')`);
       }
+      this.curTypeParams = new Set();
+    }
     for (const it of p.items) if (it.kind === "EnumDecl")
       for (const v of it.variants) for (const pt of v.payload) {
         if (!this.typeKnown(pt)) this.err(`unknown type '${pt}' in variant '${v.name}'`);
@@ -520,6 +539,10 @@ class Checker {
     if (vr !== null) return vr === tt && (bufferElem(tt) !== null || this.hasAtomic(tt));
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
+    // generic struct instance: same base + element-wise assignable args (e.g. Pair<intlit,str> -> Pair<i32,str>)
+    const tg = genericArgs(tt), vg = genericArgs(vt);
+    if (tg !== null && vg !== null && tg.base === vg.base && this.structs.has(tg.base) && tg.args.length === vg.args.length)
+      return tg.args.every((a, i) => this.assignable(vg.args[i], a));
     return vt === tt;
   }
   checkExpr(e: Expr): string {
@@ -605,10 +628,10 @@ class Checker {
           e.ty = "u32"; return e.ty;
         }
         if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str") && e.prop === "len") { e.ty = "u32"; return e.ty; }
-        const fm = this.structs.get(ot);
-        if (fm) {
-          const ft = fm.get(e.prop);
-          if (ft) { e.ty = ft; return ft; }
+        const si = this.structFields(ot);
+        if (si) {
+          const ft = si.fields.get(e.prop);
+          if (ft) { e.ty = substituteType(ft, si.subst); return e.ty; }
           this.err(`no field '${e.prop}' on ${ot}`); e.ty = "i32"; return e.ty;
         }
         e.ty = "unknown"; return e.ty;
@@ -627,16 +650,27 @@ class Checker {
       case "StructLit": {
         const fm = this.structs.get(e.name);
         if (!fm) { this.err(`unknown struct '${e.name}'`); e.ty = "i32"; return e.ty; }
+        const tps = this.structTypeParams.get(e.name) ?? [];
+        const bind = new Map<string, string>();
         const seen = new Set<string>();
+        const valTy = new Map<string, string>();
         for (const fld of e.fields) {
           const ft = fm.get(fld.name);
           const vt = this.checkExpr(fld.value);
+          valTy.set(fld.name, vt);
           if (!ft) { this.err(`no field '${fld.name}' on ${e.name}`); continue; }
           seen.add(fld.name);
-          if (!this.assignable(vt, ft)) this.err(`field '${e.name}.${fld.name}': cannot assign ${vt} to ${ft}`);
+          if (tps.length) this.inferTypeParam(ft, vt, tps, bind);   // generic: infer type params from field values
         }
         for (const fname of fm.keys()) if (!seen.has(fname)) this.err(`missing field '${fname}' in ${e.name} literal`);
-        e.ty = e.name; return e.ty;
+        if (tps.length) for (const tp of tps) if (!bind.has(tp)) this.err(`cannot infer type parameter ${tp} of ${e.name} from the fields`);
+        for (const fld of e.fields) {   // assignability post-substitution
+          const ft = fm.get(fld.name); if (!ft) continue;
+          const want = substituteType(ft, bind);
+          if (!this.assignable(valTy.get(fld.name)!, want)) this.err(`field '${e.name}.${fld.name}': cannot assign ${valTy.get(fld.name)} to ${want}`);
+        }
+        e.ty = tps.length ? `${e.name}<${tps.map((tp) => bind.get(tp) ?? tp).join(", ")}>` : e.name;
+        return e.ty;
       }
       case "Call": {
         if (e.callee.kind === "Ident" && e.callee.name === "launch") {
