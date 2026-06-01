@@ -25,6 +25,7 @@ export type Stmt =
   | { kind: "Continue" }
   | { kind: "Scope"; body: Stmt[] }
   | { kind: "Defer"; body: Stmt[] }          // run `body` at enclosing-scope exit, LIFO
+  | { kind: "Shared"; name: string; ty: string }   // kernel: `shared name: [T;N];` — threadgroup memory
   | { kind: "ExprStmt"; expr: Expr };
 export type Expr =
   | { kind: "Num"; value: string; ty?: string }
@@ -239,6 +240,53 @@ export const ARITH_FN: Record<string, string> = {
   "+|": "sadd", "-|": "ssub", "*|": "smul",
 };
 
+// Does a kernel body use workgroup features (shared / local / group / barrier)? Such kernels
+// get the threadgroup-aware codegen (MSL threadgroup memory; CPU thread-per-lane + barrier).
+export function usesWorkgroup(stmts: Stmt[]): boolean {
+  const ex = (e: Expr): boolean => {
+    switch (e.kind) {
+      case "Member": return (e.obj.kind === "Ident" && (e.obj.name === "local" || e.obj.name === "group")) || ex(e.obj);
+      case "Call": return (e.callee.kind === "Ident" && e.callee.name === "barrier") || ex(e.callee) || e.args.some(ex);
+      case "Unary": case "Comptime": case "Some": case "Try": case "Cast": case "Borrow": case "Ok": case "Err": return ex(e.expr);
+      case "OrElse": return ex(e.opt) || ex(e.alt);
+      case "Index": return ex(e.obj) || ex(e.index);
+      case "Array": return e.elems.some(ex);
+      case "Template": return e.exprs.some(ex);
+      case "StructLit": return e.fields.some((f) => ex(f.value));
+      case "SpawnExpr": return ex(e.call);
+      case "Binary": return ex(e.left) || ex(e.right);
+      default: return false;
+    }
+  };
+  const st = (s: Stmt): boolean => {
+    switch (s.kind) {
+      case "Shared": return true;
+      case "Let": return ex(s.value);
+      case "Assign": return ex(s.target) || ex(s.value);
+      case "While": return ex(s.cond) || s.body.some(st);
+      case "If": return ex(s.cond) || s.then.some(st) || (s.els?.some(st) ?? false);
+      case "ForOf": return ex(s.iter) || s.body.some(st);
+      case "Match": return ex(s.scrut) || s.arms.some((a) => a.body.some(st));
+      case "Return": return s.value ? ex(s.value) : false;
+      case "Scope": case "Defer": return s.body.some(st);
+      case "ExprStmt": return ex(s.expr);
+      default: return false;
+    }
+  };
+  return stmts.some(st);
+}
+// All `shared name: [T;N];` declarations in a kernel body (recursively), in order.
+export function collectShared(stmts: Stmt[]): { name: string; ty: string }[] {
+  const out: { name: string; ty: string }[] = [];
+  const walk = (ss: Stmt[]) => { for (const s of ss) {
+    if (s.kind === "Shared") out.push({ name: s.name, ty: s.ty });
+    else if (s.kind === "While" || s.kind === "Scope" || s.kind === "Defer" || s.kind === "ForOf") walk(s.body);
+    else if (s.kind === "If") { walk(s.then); if (s.els) walk(s.els); }
+    else if (s.kind === "Match") for (const a of s.arms) walk(a.body);
+  } };
+  walk(stmts);
+  return out;
+}
 export function isStdinLines(e: Expr): boolean {
   return e.kind === "Call" && e.callee.kind === "Member" &&
     e.callee.obj.kind === "Ident" && e.callee.obj.name === "stdin" && e.callee.prop === "lines";

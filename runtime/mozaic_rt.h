@@ -18,6 +18,7 @@
 #include <queue>
 #include <unordered_map>
 #include <fstream>
+#include <barrier>
 
 namespace mz {
 
@@ -215,7 +216,9 @@ template <class T, class E> E result_unwrap_err(const Result<T, E>& r) {
 //                    waits synchronously. Compile the generated unit as Objective-C++.
 
 // A 1/2/3-D launch grid. grid.{x,y,z} in a kernel index into this (1 for unused dims).
-struct Grid { uint32_t x, y, z; };
+// tx/ty/tz = an explicit threadgroup (workgroup) size; 0 = let the backend pick. A workgroup
+// kernel (local/group/barrier/shared) must be launched with an explicit threadgroup via gridGroups.
+struct Grid { uint32_t x, y, z; uint32_t tx, ty, tz; };
 
 #ifdef MZ_METAL
 } // namespace mz  (reopen after importing Metal)
@@ -289,11 +292,15 @@ struct MetalDispatch {
   template <class T> void length(int idx, Buffer<T>& b) { uint32_t l = b.len; [enc setBytes:&l length:sizeof(l) atIndex:idx]; }
   void encode() {
     if (grid.x == 0 || grid.y == 0 || grid.z == 0) return;
-    // Pick a threadgroup whose volume stays within the device limit (greedy x,y,z).
-    NSUInteger maxT = pso.maxTotalThreadsPerThreadgroup;
-    NSUInteger tx = grid.x < maxT ? grid.x : maxT;
-    NSUInteger ty = grid.y < (maxT / tx) ? grid.y : (maxT / tx ? maxT / tx : 1);
-    NSUInteger tz = grid.z < (maxT / (tx * ty)) ? grid.z : (maxT / (tx * ty) ? maxT / (tx * ty) : 1);
+    NSUInteger tx, ty, tz;
+    if (grid.tx) {   // explicit threadgroup (workgroup kernels): use it as given
+      tx = grid.tx; ty = grid.ty ? grid.ty : 1; tz = grid.tz ? grid.tz : 1;
+    } else {         // pick a threadgroup whose volume stays within the device limit (greedy x,y,z)
+      NSUInteger maxT = pso.maxTotalThreadsPerThreadgroup;
+      tx = grid.x < maxT ? grid.x : maxT;
+      ty = grid.y < (maxT / tx) ? grid.y : (maxT / tx ? maxT / tx : 1);
+      tz = grid.z < (maxT / (tx * ty)) ? grid.z : (maxT / (tx * ty) ? maxT / (tx * ty) : 1);
+    }
     [enc dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
        threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
   }

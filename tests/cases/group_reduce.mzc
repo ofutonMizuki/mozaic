@@ -1,0 +1,27 @@
+// Workgroup features (M4d): shared threadgroup memory + barrier() + local/group indices.
+// Each threadgroup (64 lanes) sums its slice of `input` via a tree reduction in shared memory,
+// and lane 0 writes the group total to output[group.x].
+kernel groupSum(input: Buffer<i32>, output: Buffer<i32>) {
+  shared scratch: [i32; 64];
+  let lid: u32 = local.x;
+  let gid: u32 = grid.x;
+  if (gid < input.len) { scratch[lid] = input[gid]; } else { scratch[lid] = 0; }
+  barrier();
+  let stride: u32 = 32;
+  while (stride > 0) {
+    if (lid < stride) { scratch[lid] = scratch[lid] +% scratch[lid +% stride]; }
+    barrier();
+    stride = stride / 2;
+  }
+  if (lid == 0) { output[group.x] = scratch[0]; }
+}
+function main() {
+  let n: u32 = 256;                                  // 4 groups of 64
+  let input: Buffer<i32> = Buffer.shared(n);
+  let output: Buffer<i32> = Buffer.shared(4);
+  let i: u32 = 0;
+  while (i < n) { input[i] = (i as i32) +% 1; i = i +% 1; }   // values 1..256
+  launch(groupSum, gridGroups(4, 64), input, output);
+  let g: u32 = 0;
+  while (g < 4) { stdout.println(output[g]); g = g +% 1; }    // 2080 6176 10272 14368
+}

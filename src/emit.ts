@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew, isBoxNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew, isBoxNew, usesWorkgroup, collectShared } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -8,6 +8,7 @@ let VARIANTS = new Map<string, VarInfo>();
 let KERNELS = new Map<string, Param[]>();
 let FN_PARAMS = new Map<string, Param[]>();              // fn name -> params (to decide std::ref in spawn)
 let TARGET: "cpu" | "metal" = "cpu";
+let WG_KERNELS = new Set<string>();   // kernels that use workgroup features (threadgroup codegen)
 let matchCounter = 0;
 let scopeCounter = 0;
 let deferCounter = 0;
@@ -166,6 +167,7 @@ function emitExpr(e: Expr): string {
     }
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `grid_${e.prop}`;
+      if (e.obj.kind === "Ident" && (e.obj.name === "local" || e.obj.name === "group")) return `${e.obj.name}_${e.prop}`;
       if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) return `mz::Device{}`;
       // std::array and mz::String use .size(); Buffer/Slice have a .len member.
       if (e.prop === "len") {
@@ -217,6 +219,7 @@ function emitExpr(e: Expr): string {
         const kargs = e.args.slice(2);
         if (TARGET === "metal") return `([&]{ ${[...metalBindLines(kn, grid, kargs), "_d.run();"].join(" ")} }())`;
         const ka = kargs.map(emitExpr);
+        if (WG_KERNELS.has(kn)) return `_wg_${kn}(${gridExpr(grid)}${ka.length ? ", " + ka.join(", ") : ""})`;
         return `mz::launch(${gridExpr(grid)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${ka.length ? ", " + ka.join(", ") : ""}); })`;
       }
       // dev.launch(kernel, grid, &buf, &mut out, ...) — async; returns a Job to await later
@@ -226,6 +229,7 @@ function emitExpr(e: Expr): string {
         const kargs = e.args.slice(2);
         if (TARGET === "metal") return `([&]{ ${[...metalBindLines(kn, grid, kargs), "return _d.commit();"].join(" ")} }())`;
         const ka = kargs.map(emitExpr);
+        if (WG_KERNELS.has(kn)) return `([&]{ _wg_${kn}(${gridExpr(grid)}${ka.length ? ", " + ka.join(", ") : ""}); return mz::Job{}; }())`;
         return `([&]{ mz::launch(${gridExpr(grid)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${ka.length ? ", " + ka.join(", ") : ""}); }); return mz::Job{}; }())`;
       }
       // grid2(w,h) / grid3(w,h,d) -> mz::Grid{...}
@@ -233,6 +237,12 @@ function emitExpr(e: Expr): string {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
       }
+      // gridGroups(ng, gs) -> total = ng*gs threads, threadgroup size = gs (1-D)
+      if (e.callee.kind === "Ident" && e.callee.name === "gridGroups") {
+        const ng = `(uint32_t)(${emitExpr(e.args[0])})`, gs = `(uint32_t)(${emitExpr(e.args[1])})`;
+        return `mz::Grid{ ${ng} * ${gs}, 1, 1, ${gs}, 1, 1 }`;
+      }
+      if (e.callee.kind === "Ident" && e.callee.name === "barrier") return `_bar.arrive_and_wait()`;   // CPU threadgroup barrier
       // Box.new(v) -> mz::Box<T>{ make_shared<T>(v) }  (usable nested / in enum payloads)
       if (isBoxNew(e)) {
         const inner = genericArgs(e.ty ?? "")!.args[0];
@@ -394,6 +404,7 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
       scopeVarStack.pop();
       return `${ind}{\n${ind}  std::vector<std::thread> ${sv};\n${body}\n${ind}  for (auto& _t : ${sv}) _t.join();\n${ind}}`;
     }
+    case "Shared": return `${ind}// shared ${s.name}: ${s.ty} (threadgroup memory, passed in per group)`;
     case "Defer": {   // RAII guard: destructor runs body at enclosing C++ scope exit (LIFO, also on return)
       const body = s.body.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n");
       return `${ind}auto _def${deferCounter++} = mz::defer([&]{\n${body}\n${ind}});`;
@@ -417,10 +428,45 @@ function emitFn(fn: FnDecl): string {
   const tmpl = fn.typeParams && fn.typeParams.length ? `template <${fn.typeParams.map((t) => `class ${t}`).join(", ")}>\n` : "";
   return `${tmpl}${ret} ${fn.name}(${fn.params.map(emitParam).join(", ")}) {\n${body}\n}`;
 }
+// CPU kernel. A plain kernel is `void k(uint32_t grid_x,y,z, params...)` run by a serial loop.
+// A WORKGROUP kernel additionally takes local_*, group_*, a std::barrier&, and one reference per
+// `shared` array (the per-group threadgroup memory); it is driven by the generated _wg_<k> runner.
 function emitKernel(k: KernelDecl): string {
   const body = k.body.map((s) => emitStmt(s, "  ", "void")).join("\n");
   const params = k.params.map(emitParam);
+  if (WG_KERNELS.has(k.name)) {
+    const sh = collectShared(k.body).map((s) => `${cppType(s.ty)}& ${s.name}`);
+    const sig = ["uint32_t grid_x", "uint32_t grid_y", "uint32_t grid_z",
+                 "uint32_t local_x", "uint32_t local_y", "uint32_t local_z",
+                 "uint32_t group_x", "uint32_t group_y", "uint32_t group_z",
+                 "std::barrier<>& _bar", ...sh, ...params];
+    return `void ${k.name}(${sig.join(", ")}) {\n${body}\n}`;
+  }
   return `void ${k.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z${params.length ? ", " + params.join(", ") : ""}) {\n${body}\n}`;
+}
+// CPU driver for a workgroup kernel: run groups sequentially; within a group, run `groupSize`
+// lanes as real threads sharing one std::barrier and the per-group `shared` arrays — so barrier()
+// and threadgroup memory have correct cross-lane semantics (the serial loop can't express them).
+function emitWgRunner(k: KernelDecl): string {
+  const sh = collectShared(k.body);
+  const shDecls = sh.map((s) => `      ${cppType(s.ty)} ${s.name}{};`).join("\n");
+  const callArgs = ["_gid", "0u", "0u", "_l", "0u", "0u", "_grp", "0u", "0u", "_bar",
+                    ...sh.map((s) => s.name), ...k.params.map((p) => p.name)];
+  const params = k.params.map(emitParam).join(", ");
+  return `void _wg_${k.name}(mz::Grid _g${params ? ", " + params : ""}) {
+  uint32_t _total = _g.x;
+  uint32_t _gs = _g.tx ? _g.tx : _total;
+  uint32_t _ngrp = _gs ? (_total + _gs - 1) / _gs : 0;
+  for (uint32_t _grp = 0; _grp < _ngrp; _grp++) {
+${shDecls ? shDecls + "\n" : ""}    std::barrier<> _bar((std::ptrdiff_t)_gs);
+    std::vector<std::thread> _ts;
+    for (uint32_t _l = 0; _l < _gs; _l++) {
+      uint32_t _gid = _grp * _gs + _l;
+      _ts.emplace_back([&, _gid, _l, _grp]{ ${k.name}(${callArgs.join(", ")}); });
+    }
+    for (auto& _t : _ts) _t.join();
+  }
+}`;
 }
 
 // ---- MSL (Metal Shading Language) backend for kernels ----
@@ -480,6 +526,8 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;
+      if (e.obj.kind === "Ident" && e.obj.name === "local") return `_tpit.${e.prop}`;
+      if (e.obj.kind === "Ident" && e.obj.name === "group") return `_grp.${e.prop}`;
       if (e.obj.kind === "Ident" && bufs.has(e.obj.name) && e.prop === "len") return `${e.obj.name}_len`;
       return `${emitMslExpr(e.obj, bufs)}.${e.prop}`;
     case "Index": return `${emitMslExpr(e.obj, bufs)}[${emitMslExpr(e.index, bufs)}]`;
@@ -497,6 +545,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
         return `${mslType(e.callee.name)}(${e.args.map((a) => emitMslExpr(a, bufs)).join(", ")})`;
       if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && vecParts(e.callee.obj.name) !== null && e.callee.prop === "splat")
         return `${mslType(e.callee.obj.name)}(${emitMslExpr(e.args[0], bufs)})`;
+      if (e.callee.kind === "Ident" && e.callee.name === "barrier") return `threadgroup_barrier(mem_flags::mem_threadgroup)`;
       throw new Error("kernel: function/variant calls are not allowed (M-stage)");
     }
     case "StructLit": {
@@ -525,6 +574,7 @@ function emitMslStmt(s: Stmt, ind: string, bufs: Set<string>): string {
     case "Break": return `${ind}break;`;
     case "Continue": return `${ind}continue;`;
     case "ExprStmt": return `${ind}${emitMslExpr(s.expr, bufs)};`;
+    case "Shared": { const ap = arrayParts(s.ty)!; return `${ind}threadgroup ${mslType(ap[0])} ${s.name}[${ap[1]}];`; }
     case "Match": case "ForOf": case "Scope": case "Defer": throw new Error(`kernel: '${s.kind}' is not supported`);
   }
 }
@@ -539,6 +589,10 @@ function emitMslKernel(k: KernelDecl): string {
   });
   for (const [name, idx] of lenIdx) sig.push(`constant uint& ${name}_len [[buffer(${idx})]]`);
   sig.push(`uint3 _tpig [[thread_position_in_grid]]`);
+  if (usesWorkgroup(k.body)) {   // workgroup kernels also see threadgroup-local / group indices
+    sig.push(`uint3 _tpit [[thread_position_in_threadgroup]]`);
+    sig.push(`uint3 _grp [[threadgroup_position_in_grid]]`);
+  }
   const body = k.body.map((s) => emitMslStmt(s, "  ", bufs)).join("\n");
   const indent = "\n                 ";
   return `#include <metal_stdlib>\nusing namespace metal;\nkernel void ${k.name}(${sig.join("," + indent)}) {\n${body}\n}`;
@@ -584,6 +638,8 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   KERNELS = new Map();
   FN_PARAMS = new Map();
   TARGET = target;
+  WG_KERNELS = new Set();
+  for (const k of kernels) if (usesWorkgroup(k.body)) WG_KERNELS.add(k.name);
   matchCounter = 0;
   scopeCounter = 0;
   deferCounter = 0;
@@ -603,7 +659,13 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
     ? kernels.map((k) => `static const char* _msl_${k.name} = R"MSL(\n${emitMslKernel(k)}\n)MSL";`).join("\n\n")
     : "";
   const byRefTy = (p: Param) => isByRef(p.ty) ? cppType(p.ty) + "&" : cppType(p.ty);
-  const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + byRefTy(p)).join("")});`).join("\n");
+  const kernelProto = (k: KernelDecl) => {
+    if (!WG_KERNELS.has(k.name)) return `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + byRefTy(p)).join("")});`;
+    const sh = collectShared(k.body).map((s) => cppType(s.ty) + "&");
+    const types = ["uint32_t", "uint32_t", "uint32_t", "uint32_t", "uint32_t", "uint32_t", "uint32_t", "uint32_t", "uint32_t", "std::barrier<>&", ...sh, ...k.params.map(byRefTy)];
+    return `void ${k.name}(${types.join(", ")});\nvoid _wg_${k.name}(mz::Grid${k.params.map((p) => ", " + byRefTy(p)).join("")});`;
+  };
+  const kernelProtos = target === "metal" ? "" : kernels.map(kernelProto).join("\n");
   const isGeneric = (f: FnDecl) => !!(f.typeParams && f.typeParams.length);
   // Generic fns are C++ templates: no separate prototype, and emitted (fully) before any caller.
   const fnProtos = fns.filter((f) => f.name !== "main" && !isGeneric(f)).map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map(byRefTy).join(", ")});`).join("\n");
@@ -611,7 +673,8 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const genericDefs = fns.filter(isGeneric).map(emitFn).join("\n\n");   // after protos (can call non-generic fns), before methods/defs
   // Struct method bodies, out-of-line, AFTER prototypes so a method may call free functions.
   const methodDefs = types.flatMap((it) => it.kind === "StructDecl" ? it.methods.map((m) => emitMethodDef(it.name, m, it.typeParams ?? [])) : []).join("\n\n");
-  const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.filter((f) => !isGeneric(f)).map(emitFn)].join("\n\n");
+  const wgRunners = target === "metal" ? [] : kernels.filter((k) => WG_KERNELS.has(k.name)).map(emitWgRunner);
+  const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...wgRunners, ...fns.filter((f) => !isGeneric(f)).map(emitFn)].join("\n\n");
   // Pull in <atomic> / <thread> only when the program actually uses them (the emitted code names them).
   const allCode = typeDecls + constDecls + mslDecls + protos + genericDefs + methodDefs + defs;
   const sysIncludes = (allCode.includes("std::atomic") ? "#include <atomic>\n" : "") +

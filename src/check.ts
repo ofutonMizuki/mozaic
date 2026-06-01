@@ -535,6 +535,14 @@ class Checker {
         break;
       }
       case "Break": case "Continue": break;
+      case "Shared": {   // kernel threadgroup memory: `shared name: [T; N];`
+        if (!this.inKernel) this.err("'shared' is only available inside a kernel");
+        const ap = arrayParts(s.ty);
+        if (ap === null) this.err(`'shared ${s.name}' must be a fixed array [T; N] (got ${s.ty})`);
+        else if (!this.typeKnown(s.ty)) this.err(`unknown type '${s.ty}' for shared '${s.name}'`);
+        this.define(s.name, s.ty);
+        break;
+      }
       case "Defer": {
         // checked in the current scope (the body runs at scope exit, but sees names in scope here)
         this.push();
@@ -693,6 +701,10 @@ class Checker {
       }
       case "Member": {
         if (e.obj.kind === "Ident" && e.obj.name === "grid" && (e.prop === "x" || e.prop === "y" || e.prop === "z")) { e.ty = "u32"; return e.ty; }
+        if (e.obj.kind === "Ident" && (e.obj.name === "local" || e.obj.name === "group") && (e.prop === "x" || e.prop === "y" || e.prop === "z")) {
+          if (!this.inKernel) this.err(`'${e.obj.name}.${e.prop}' is only available inside a kernel`);
+          e.ty = "u32"; return e.ty;
+        }
         if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) { e.ty = "Device"; return e.ty; }
         const ot0 = this.checkExpr(e.obj);
         const ot = refInner(ot0) ?? ot0;   // auto-deref &T for field/len access
@@ -820,6 +832,17 @@ class Checker {
           if (e.args.length !== want) this.err(`${e.callee.name} takes ${want} integer dimensions`);
           for (const a of e.args) if (!isInt(this.checkExpr(a))) this.err(`${e.callee.name}: dimensions must be integers`);
           e.ty = "Grid"; return e.ty;
+        }
+        // gridGroups(numGroups, groupSize): a 1-D grid with an explicit threadgroup (for workgroup kernels)
+        if (e.callee.kind === "Ident" && e.callee.name === "gridGroups") {
+          if (e.args.length !== 2) this.err("gridGroups(numGroups, groupSize) takes two integers");
+          for (const a of e.args) if (!isInt(this.checkExpr(a))) this.err("gridGroups: arguments must be integers");
+          e.ty = "Grid"; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "barrier") {   // threadgroup barrier
+          if (!this.inKernel) this.err("barrier() is only available inside a kernel");
+          if (e.args.length) this.err("barrier() takes no arguments");
+          e.ty = "unit"; return e.ty;
         }
         // SIMD vector lane-constructor: f32x4(a, b, c, d) — one scalar per lane (no broadcast).
         if (e.callee.kind === "Ident") {

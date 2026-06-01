@@ -179,6 +179,16 @@ export class Parser {
     if (t === "match") return this.parseMatch();
     if (t === "scope") return this.parseScope();
     if (t === "defer") return this.parseDefer();
+    // `shared name: [T; N];` — kernel threadgroup memory. `shared` is a contextual keyword (so
+    // Buffer.shared still works): only a leading `shared <ident>` starts a threadgroup declaration.
+    if (t === "id" && this.peek().v === "shared" && this.toks[this.i + 1]?.t === "id") {
+      this.next();
+      const name = this.eat("id").v;
+      this.eat(":");
+      const ty = this.parseType();
+      this.eat(";");
+      return { kind: "Shared", name, ty };
+    }
     if (t === "let" || t === "const") return this.parseLet();
     if (t === "return") {
       this.next();
