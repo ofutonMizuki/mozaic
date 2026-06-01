@@ -168,7 +168,7 @@ function emitExpr(e: Expr): string {
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `grid_${e.prop}`;
       if (e.obj.kind === "Ident" && (e.obj.name === "local" || e.obj.name === "group")) return `${e.obj.name}_${e.prop}`;
-      if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) return `mz::Device{}`;
+      if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) return `mz::Device{ ${e.prop === "gpu" ? 1 : 0} }`;
       // std::array and mz::String use .size(); Buffer/Slice have a .len member.
       if (e.prop === "len") {
         const ot = refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "";

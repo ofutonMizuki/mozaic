@@ -981,6 +981,10 @@ class Checker {
         // and user struct methods (recv.method(args), auto-deref through &T).
         if (e.callee.kind === "Member") {
           const recvTy = this.checkExpr(e.callee.obj);
+          if (recvTy === "Device" && e.callee.prop === "first") {   // Device.gpu.first(): Device? (present-or-none)
+            if (e.args.length) this.err("Device.first() takes no arguments");
+            e.ty = "Device?"; return e.ty;
+          }
           const ae = atomicElem(refInner(recvTy) ?? recvTy);   // also dispatch through &Atomic<T>
           if (ae !== null) {
             if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");

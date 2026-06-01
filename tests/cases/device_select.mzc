@@ -1,0 +1,19 @@
+// Runtime device selection (M4d): the portable idiom `Device.gpu.first() ?? Device.cpu`.
+// Compiled with --gpu (and a GPU present) it selects the GPU; a plain CPU build selects the CPU.
+// Either way the same source builds and runs; here (CPU build) it falls back to Device.cpu.
+kernel addk(input: Buffer<u32>, output: Buffer<u32>, k: u32) {
+  let i: u32 = grid.x;
+  if (i < output.len) { output[i] = input[i] +% k; }
+}
+function main() {
+  let dev: Device = Device.gpu.first() ?? Device.cpu;
+  let n: u32 = 4;
+  let inp: Buffer<u32> = Buffer.shared(n);
+  let out: Buffer<u32> = Buffer.shared(n);
+  let i: u32 = 0;
+  while (i < n) { inp[i] = i; i = i +% 1; }
+  let job: Job = dev.launch(addk, n, &inp, &mut out, 10);
+  job.await();
+  let j: u32 = 0;
+  while (j < n) { stdout.println(out[j]); j = j +% 1; }   // 10 11 12 13
+}

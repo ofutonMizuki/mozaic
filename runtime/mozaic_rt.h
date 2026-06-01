@@ -250,9 +250,17 @@ template <class T> struct Buffer {
   const T& operator[](uint32_t i) const { return ((const T*)buf.contents)[i]; }
 };
 
-// Device value. The backend is fixed at compile time (--gpu), so this is currently a marker;
-// runtime Device.gpu/cpu selection is a later milestone.
-struct Device { };
+// Device value (kind: 0 = cpu, 1 = gpu). The compute backend is chosen at compile time (--gpu),
+// but `Device.gpu.first()` reports whether a GPU is actually present, so the portable idiom
+// `Device.gpu.first() ?? Device.cpu` resolves correctly per build (Metal build with a GPU -> gpu;
+// CPU build -> none -> cpu). first() yields some(self) when this device kind is available, else none.
+struct Device {
+  uint32_t kind;
+  std::optional<Device> first() const {
+    if (kind == 1) { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); return d ? std::optional<Device>{*this} : std::nullopt; }
+    return std::optional<Device>{*this};
+  }
+};
 
 // A launched-but-not-yet-joined kernel. Holds the in-flight command buffer; await() is the
 // sync point (the borrow returns here). On UMA this is a fence only — no copy-back.
@@ -331,7 +339,11 @@ template <class F> void launch(Grid g, F fn) {
 }
 
 // CPU dev.launch runs the loop eagerly, so the Job is already complete; await() is a no-op.
-struct Device { };
+// In a CPU build there is no GPU, so Device.gpu.first() (kind==1) yields none.
+struct Device {
+  uint32_t kind;
+  std::optional<Device> first() const { return kind == 1 ? std::nullopt : std::optional<Device>{*this}; }
+};
 struct Job { void await() {} };
 
 #endif
