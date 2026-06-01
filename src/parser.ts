@@ -227,12 +227,22 @@ export class Parser {
     return left;
   }
   parseMul(): Expr {
-    let left = this.parseUnary();
+    let left = this.parseCast();
     while (this.at("*") || this.at("/") || this.at("%") || this.at("*%") || this.at("*|")) {
       const op = this.next().t;
-      left = { kind: "Binary", op, left, right: this.parseUnary() };
+      left = { kind: "Binary", op, left, right: this.parseCast() };
     }
     return left;
+  }
+  parseCast(): Expr {   // `e as T` / `e as? T` — the only (explicit) conversion; binds tighter than * /
+    let e = this.parseUnary();
+    while (this.at("as")) {
+      this.next();
+      let opt = false;
+      if (this.at("?")) { this.next(); opt = true; }
+      e = { kind: "Cast", expr: e, toTy: this.parseType(), opt };
+    }
+    return e;
   }
   parseUnary(): Expr {
     if (this.at("&")) {
@@ -273,6 +283,7 @@ export class Parser {
     if (tk.t === "fnum") { this.next(); return { kind: "Float", value: tk.v }; }
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
     if (tk.t === "char") { this.next(); return { kind: "Char", value: tk.v }; }
+    if (tk.t === "true" || tk.t === "false") { this.next(); return { kind: "Bool", value: tk.t === "true" }; }
     if (tk.t === "id") {
       this.next();
       if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);

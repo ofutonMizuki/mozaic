@@ -28,6 +28,8 @@ export type Expr =
   | { kind: "Float"; value: string; ty?: string }
   | { kind: "Str"; value: string; ty?: string }
   | { kind: "Char"; value: string; ty?: string }   // value = codepoint (decimal); type `char` (UTF-32)
+  | { kind: "Bool"; value: boolean; ty?: string }
+  | { kind: "Cast"; expr: Expr; toTy: string; opt: boolean; ty?: string }   // `e as T` / `e as? T`
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }

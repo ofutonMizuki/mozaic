@@ -449,6 +449,17 @@ class Checker {
       case "Float": e.ty = "floatlit"; return e.ty;
       case "Str": e.ty = "str"; return e.ty;
       case "Char": e.ty = "char"; return e.ty;
+      case "Bool": e.ty = "bool"; return e.ty;
+      case "Cast": {
+        const st0 = this.checkExpr(e.expr);
+        const st = refInner(st0) ?? st0;
+        const scalarSrc = isInt(st) || isFloat(st) || st === "char" || st === "bool";
+        const okTarget = isInt(e.toTy) || isFloat(e.toTy) || e.toTy === "char";
+        if (e.opt) this.err("`as?` (fallible cast) is not supported yet");
+        else if (!this.typeKnown(e.toTy)) this.err(`unknown type '${e.toTy}' in cast`);
+        else if (!scalarSrc || !okTarget) this.err(`cannot cast ${st} as ${e.toTy} (only numeric / char / bool scalar conversions)`);
+        e.ty = e.toTy; return e.ty;
+      }
       case "Ident": {
         const vs = this.lookupVar(e.name);
         if (vs) {

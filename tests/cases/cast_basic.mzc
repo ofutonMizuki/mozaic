@@ -1,0 +1,15 @@
+// `as` is the only conversion (SPEC §0: no implicit conversions). Possibly lossy.
+function main() {
+  const big: i32 = 300;
+  stdout.println(big as u8);       // 300 -> 44 (truncation)
+  const pi: f64 = 3.9;
+  stdout.println(pi as i32);       // 3 (toward zero)
+  stdout.println('A' as u32);      // 65 (char -> codepoint)
+  stdout.println(66 as char);      // B  (codepoint -> char)
+  // bool literals
+  const t = true;
+  const f = false;
+  stdout.println(t);               // true
+  stdout.println(f);               // false
+  if (t == true) { stdout.println("yes"); }
+}

@@ -86,6 +86,8 @@ function emitExpr(e: Expr): string {
     case "Float": return e.value;
     case "Str": return cstr(e.value);
     case "Char": return `(char32_t)${e.value}`;
+    case "Bool": return e.value ? "true" : "false";
+    case "Cast": return `(${cppType(e.toTy)})(${emitExpr(e.expr)})`;   // explicit (possibly lossy) conversion
     case "Ident": {
       if (e.name === "self") return "(*this)";   // method receiver -> the C++ instance
       if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
@@ -303,6 +305,11 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     case "Num": return e.value;
     case "Float": return e.value;
     case "Char": throw new Error("kernel: char literals are not allowed");
+    case "Bool": return e.value ? "true" : "false";
+    case "Cast": {
+      if (!(isInt(e.toTy) || isFloat(e.toTy))) throw new Error("kernel: only numeric casts are allowed");
+      return `(${mslType(e.toTy)})(${emitMslExpr(e.expr, bufs)})`;
+    }
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

@@ -1,0 +1,6 @@
+// casting a non-scalar (str) is rejected — no escape hatch around the type system.
+function main() {
+  const s = "hi";
+  const n = s as i32;
+  stdout.println(n);
+}
