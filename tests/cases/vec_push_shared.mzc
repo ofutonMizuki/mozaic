@@ -1,0 +1,7 @@
+// Negative: a shared &Vec cannot be mutated (push needs a mutable Vec / &mut).
+function tryPush(v: &Vec<i32>) { v.push(1); }
+function main() {
+  let xs: Vec<i32> = Vec.new();
+  tryPush(&xs);
+  stdout.println(xs.len);
+}

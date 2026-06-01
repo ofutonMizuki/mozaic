@@ -3,7 +3,7 @@ import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo, CTValue } from "
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
-  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS,
+  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem,
 } from "./ast.ts";
 import { Comptime, CompileError } from "./comptime.ts";
 
@@ -390,6 +390,7 @@ class Checker {
           else if (vt === "arcnew") { this.err(`'${s.name}': Arc.new needs a type annotation (e.g. : Arc<i32>)`); declTy = "i32"; }
           else if (vt === "mutexnew") { this.err(`'${s.name}': Mutex.new needs a type annotation (e.g. : Mutex<i64>)`); declTy = "i32"; }
           else if (vt === "channelnew") { this.err(`'${s.name}': Channel.new needs a type annotation (e.g. : Channel<i32>)`); declTy = "i32"; }
+          else if (vt === "vecnew") { this.err(`'${s.name}': Vec.new needs a type annotation (e.g. : Vec<i32>)`); declTy = "i32"; }
           else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
           else if (vt === "none") { this.err(`'${s.name}': bare none has no type — annotate it (e.g. : i32?)`); declTy = "i32"; }
           else if (vt.startsWith("ok<") || vt.startsWith("err<")) { this.err(`'${s.name}': Ok/Err need a Result type annotation (e.g. : Result<i32, str>)`); declTy = "i32"; }
@@ -553,6 +554,7 @@ class Checker {
     if (vt === "arcnew") return genericArgs(tt)?.base === "Arc";
     if (vt === "mutexnew") return genericArgs(tt)?.base === "Mutex";
     if (vt === "channelnew") return genericArgs(tt)?.base === "Channel";
+    if (vt === "vecnew") return genericArgs(tt)?.base === "Vec";
     // optionals: none fits any T?; U? -> T? iff U -> T; no implicit wrap of a bare value.
     const to = optInner(tt), vo = optInner(vt);
     if (to !== null) {
@@ -679,7 +681,7 @@ class Checker {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
         }
-        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null || dynVecElem(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const lg = genericArgs(ot);   // MutexGuard<T>.val : the guarded T (an lvalue, read+write under the lock)
         if (lg !== null && lg.base === "MutexGuard") {
           if (e.prop !== "val") this.err(`MutexGuard exposes only '.val' (got '${e.prop}')`);
@@ -698,7 +700,7 @@ class Checker {
         const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
         const ap = arrayParts(ot);
         const vp = vecParts(ot);
-        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null) ?? (vp !== null ? vp.scalar : null) ?? (ot === "str" ? "char" : null);
+        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null) ?? (vp !== null ? vp.scalar : null) ?? dynVecElem(ot) ?? (ot === "str" ? "char" : null);
         if (elem === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
         if (bufferElem(ot) !== null && e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
         const it = this.checkExpr(e.index);
@@ -775,6 +777,11 @@ class Checker {
           if (this.inKernel) this.err("Channel is not supported inside a kernel");
           if (e.args.length !== 0) this.err("Channel.new takes no arguments");
           e.ty = "channelnew"; return e.ty;
+        }
+        if (isVecNew(e)) {   // Vec.new(): growable array (needs a typed binding for T)
+          if (this.inKernel) this.err("Vec is not supported inside a kernel");
+          if (e.args.length !== 0) this.err("Vec.new takes no arguments (push elements after)");
+          e.ty = "vecnew"; return e.ty;
         }
         // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
         if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
@@ -915,10 +922,23 @@ class Checker {
             if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
             return this.checkAtomicMethod(e, ae);
           }
-          // concurrency library methods (Arc / Mutex / Channel), through &T too
+          // concurrency/collection library methods (Arc / Mutex / Channel / Vec), through &T too
           const lg = genericArgs(refInner(recvTy) ?? recvTy);
-          if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel")) {
+          if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel" || lg.base === "Vec")) {
             const inner = lg.args[0], m = e.callee.prop;
+            if (lg.base === "Vec") {
+              if (m === "push" || m === "pop") {   // mutating: receiver must be a mutable binding or &mut
+                if (e.callee.obj.kind === "Ident") {
+                  const ov = this.lookupVar(e.callee.obj.name);
+                  if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`Vec.${m} needs a mutable Vec but '${e.callee.obj.name}' is a shared reference`); }
+                  else if (ov && !ov.mutable) this.err(`Vec.${m} needs a mutable Vec but '${e.callee.obj.name}' is immutable (use 'let')`);
+                }
+              }
+              if (m === "push") { if (e.args.length !== 1) this.err("Vec.push(v) takes one argument"); else { const at = this.checkExpr(e.args[0]); if (!this.assignable(at, inner)) this.err(`Vec.push: cannot push ${at} as ${inner}`); } e.ty = "unit"; }
+              else if (m === "pop") { if (e.args.length) this.err("Vec.pop() takes no arguments"); e.ty = `${inner}?`; }
+              else { this.err(`unknown Vec method '${m}' (use push / pop / len / [i])`); e.ty = inner; }
+              return e.ty;
+            }
             if (lg.base === "Arc") {
               if (m === "clone") { if (e.args.length) this.err("Arc.clone() takes no arguments"); e.ty = `Arc<${inner}>`; }
               else if (m === "get") { if (e.args.length) this.err("Arc.get() takes no arguments"); e.ty = `&${inner}`; }

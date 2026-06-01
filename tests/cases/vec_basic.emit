@@ -1,2 +1,2 @@
-mz::Vec<float, 4>
-mz::Vec<float, 4>::splat
+mz::Simd<float, 4>
+mz::Simd<float, 4>::splat

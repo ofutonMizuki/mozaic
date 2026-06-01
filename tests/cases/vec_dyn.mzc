@@ -1,0 +1,25 @@
+// Dynamic Vec<T>: the growable array. push/pop/len/indexing, generic element, &mut Vec to mutate.
+function fillSquares(v: &mut Vec<i32>, n: i32) {
+  let i: i32 = 0;
+  while (i < n) { v.push(i * i); i = i +% 1; }
+}
+function main() {
+  let xs: Vec<i32> = Vec.new();
+  fillSquares(&mut xs, 6);          // 0 1 4 9 16 25
+  stdout.println(xs.len);           // 6
+  stdout.println(xs[3]);            // 9
+  xs[3] = 100;                      // index-write
+  stdout.println(xs[3]);            // 100
+  let total: i32 = 0;
+  let i: u32 = 0;
+  while (i < xs.len) { total = total +% xs[i]; i = i +% 1; }
+  stdout.println(total);            // 0+1+4+100+16+25 = 146
+  let last: i32 = xs.pop() ?? 0;    // 25
+  stdout.println(last);             // 25
+  stdout.println(xs.len);           // 5
+
+  let names: Vec<str> = Vec.new();  // Vec of a non-Copy element type
+  names.push("ada");
+  names.push("alan");
+  stdout.println(names[1]);         // alan
+}

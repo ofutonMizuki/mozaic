@@ -94,17 +94,17 @@ template <class T> struct Slice {
 // SIMD vector `<scalar>xN` (e.g. f32x4). A flat, Copy value of N lanes. Lane-wise arithmetic;
 // build via the lane-constructor f32x4(a,b,c,d) or f32x4.splat(s). Indexed by lane: v[i].
 // (-O2 auto-vectorizes the lane loops; the semantics are what the language guarantees.)
-template <class T, int N> struct Vec {
+template <class T, int N> struct Simd {
   T lane[N];
   T& operator[](uint32_t i) { return lane[i]; }
   const T& operator[](uint32_t i) const { return lane[i]; }
-  static Vec splat(T s) { Vec v{}; for (int i = 0; i < N; i++) v.lane[i] = s; return v; }
+  static Simd splat(T s) { Simd v{}; for (int i = 0; i < N; i++) v.lane[i] = s; return v; }
 };
-template <class T, int N> Vec<T, N> operator+(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] + b.lane[i]; return r; }
-template <class T, int N> Vec<T, N> operator-(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] - b.lane[i]; return r; }
-template <class T, int N> Vec<T, N> operator*(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] * b.lane[i]; return r; }
-template <class T, int N> Vec<T, N> operator/(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] / b.lane[i]; return r; }
-template <class T, int N> Vec<T, N> operator%(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] % b.lane[i]; return r; }
+template <class T, int N> Simd<T, N> operator+(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] + b.lane[i]; return r; }
+template <class T, int N> Simd<T, N> operator-(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] - b.lane[i]; return r; }
+template <class T, int N> Simd<T, N> operator*(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] * b.lane[i]; return r; }
+template <class T, int N> Simd<T, N> operator/(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] / b.lane[i]; return r; }
+template <class T, int N> Simd<T, N> operator%(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] % b.lane[i]; return r; }
 
 // ---- concurrency library types (M4) ----
 // Arc<T>: atomically reference-counted shared ownership. clone() hands out another owning handle
@@ -137,6 +137,18 @@ template <class T> struct Channel {
   std::queue<T> q;
   void send(const T& v) { { std::lock_guard<std::mutex> lk(m); q.push(v); } cv.notify_one(); }
   T recv() { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return !q.empty(); }); T v = std::move(q.front()); q.pop(); return v; }
+};
+
+// Vec<T>: a growable, owned array (std::vector). push/pop/len, O(1) indexing v[i]. Move-only
+// at the language level (single owner); pass &mut Vec<T> to mutate it in a callee. The workhorse
+// container for real programs (token lists, AST nodes, symbol tables, ...).
+template <class T> struct Vec {
+  std::vector<T> data;
+  void push(const T& v) { data.push_back(v); }
+  std::optional<T> pop() { if (data.empty()) return std::nullopt; T v = std::move(data.back()); data.pop_back(); return v; }
+  uint32_t len() const { return (uint32_t)data.size(); }
+  T& operator[](uint32_t i) { return data[i]; }
+  const T& operator[](uint32_t i) const { return data[i]; }
 };
 
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
