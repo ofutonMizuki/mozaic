@@ -85,6 +85,7 @@ function emitExpr(e: Expr): string {
     case "Num": return e.value;
     case "Float": return e.value;
     case "Str": return cstr(e.value);
+    case "Char": return `(char32_t)${e.value}`;
     case "Ident": {
       if (e.name === "self") return "(*this)";   // method receiver -> the C++ instance
       if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
@@ -160,6 +161,7 @@ function emitExpr(e: Expr): string {
           const a = e.args[0];
           const at = a.ty ?? "unit";
           if (at === "str" || at === "bool") return `mz::println(${emitExpr(a)})`;
+          if (at === "char") return `mz::println((char32_t)(${emitExpr(a)}))`;
           if (isInt(at)) return `mz::println((${isUnsigned(at) ? "unsigned long long" : "long long"})(${emitExpr(a)}))`;
           if (isFloat(at)) return `mz::println((double)(${emitExpr(a)}))`;
           return `mz::println(${emitExpr(a)})`;
@@ -300,6 +302,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
   switch (e.kind) {
     case "Num": return e.value;
     case "Float": return e.value;
+    case "Char": throw new Error("kernel: char literals are not allowed");
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

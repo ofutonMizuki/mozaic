@@ -27,6 +27,7 @@ export type Expr =
   | { kind: "Num"; value: string; ty?: string }
   | { kind: "Float"; value: string; ty?: string }
   | { kind: "Str"; value: string; ty?: string }
+  | { kind: "Char"; value: string; ty?: string }   // value = codepoint (decimal); type `char` (UTF-32)
   | { kind: "Ident"; name: string; ty?: string }
   | { kind: "Member"; obj: Expr; prop: string; ty?: string }
   | { kind: "Index"; obj: Expr; index: Expr; ty?: string }
@@ -47,7 +48,7 @@ export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
 // Copy types are duplicated freely on assign/pass; everything else is move-only (single owner).
 // Non-Copy: str/String, Buffer<T>, structs, enums-with-payload, Atomic<...>.
-export function isCopy(t: string): boolean { return isInt(t) || isFloat(t) || t === "bool"; }
+export function isCopy(t: string): boolean { return isInt(t) || isFloat(t) || t === "bool" || t === "char"; }
 // References are encoded as a string prefix: `&T` (shared) / `&mut T` (exclusive).
 export function isRef(t: string): boolean { return t.startsWith("&"); }
 export function isMutRef(t: string): boolean { return t.startsWith("&mut "); }
@@ -87,6 +88,7 @@ export function cppType(t: string): string {
     case "intlit": return "int32_t";
     case "f32": return "float"; case "f64": return "double"; case "floatlit": return "double";
     case "bool": return "bool";
+    case "char": return "char32_t";
     case "str": return "mz::String";
     case "Device": return "mz::Device";
     case "Job": return "mz::Job";
@@ -100,7 +102,7 @@ export function cppType(t: string): string {
     }
   }
 }
-export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "str", "Device", "Job", "Grid"]);
+export const BUILTIN_TYPES = new Set([...INTS, ...FLOATS, "bool", "char", "str", "Device", "Job", "Grid"]);
 export const ARITH_OPS = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "+|", "-|", "*|"];
 export const ARITH_FN: Record<string, string> = {
   "+": "add", "-": "sub", "*": "mul", "/": "divi", "%": "modi",

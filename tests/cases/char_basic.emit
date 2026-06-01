@@ -1,0 +1,3 @@
+char32_t a = (char32_t)65;
+char32_t ja = (char32_t)12354;
+mz::println((char32_t)(a));

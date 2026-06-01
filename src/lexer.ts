@@ -33,6 +33,23 @@ export function lex(src: string): Tok[] {
       toks.push({ t: "str", v: s, pos: i });
       continue;
     }
+    if (c === "'") {   // char literal -> codepoint (UTF-32). 'a' / '\n' / 'あ'
+      i++;
+      let cp: number;
+      if (src[i] === "\\") {
+        const e = src[i + 1];
+        const esc: Record<string, number> = { n: 10, t: 9, r: 13, "0": 0, "'": 39, '"': 34, "\\": 92 };
+        cp = e in esc ? esc[e] : (e.codePointAt(0) ?? 0);
+        i += 2;
+      } else {
+        cp = src.codePointAt(i) ?? 0;
+        i += String.fromCodePoint(cp).length;   // advance past a possible surrogate pair
+      }
+      if (src[i] !== "'") throw new Error(`lex error: unterminated char literal at ${i}`);
+      i++;
+      toks.push({ t: "char", v: String(cp), pos: i });
+      continue;
+    }
     if (/[0-9]/.test(c)) {
       let j = i;
       while (j < n && /[0-9_]/.test(src[j])) j++;

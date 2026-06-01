@@ -448,6 +448,7 @@ class Checker {
       case "Num": e.ty = "intlit"; return e.ty;
       case "Float": e.ty = "floatlit"; return e.ty;
       case "Str": e.ty = "str"; return e.ty;
+      case "Char": e.ty = "char"; return e.ty;
       case "Ident": {
         const vs = this.lookupVar(e.name);
         if (vs) {
@@ -603,7 +604,7 @@ class Checker {
           if (recv === "stdin" && m === "lines") { e.ty = "str-iter"; return e.ty; }
           if (recv === "stdout" && m === "println") {
             const at = e.args.length === 1 ? this.checkExpr(e.args[0]) : "unit";
-            if (!(at === "str" || at === "bool" || isInt(at) || isFloat(at))) this.err(`stdout.println: cannot print ${at}`);
+            if (!(at === "str" || at === "bool" || at === "char" || isInt(at) || isFloat(at))) this.err(`stdout.println: cannot print ${at}`);
             e.ty = "unit"; return e.ty;
           }
         }
@@ -676,10 +677,10 @@ class Checker {
         if (e.op === "==" || e.op === "!=") {
           if (isInt(lt) && isInt(rt)) { if (unifyInt(lt, rt) === null) this.err(`cannot compare ${lt} and ${rt}`); }
           else if (isFloat(lt) && isFloat(rt)) { if (unifyFloat(lt, rt) === null) this.err(`cannot compare ${lt} and ${rt}`); }
-          else if (!((lt === "str" && rt === "str") || (lt === "bool" && rt === "bool"))) this.err(`cannot compare ${lt} and ${rt}`);
+          else if (!((lt === "str" && rt === "str") || (lt === "bool" && rt === "bool") || (lt === "char" && rt === "char"))) this.err(`cannot compare ${lt} and ${rt}`);
           e.ty = "bool"; return e.ty;
         }
-        const okOrd = (isInt(lt) && isInt(rt) && unifyInt(lt, rt) !== null) || (isFloat(lt) && isFloat(rt) && unifyFloat(lt, rt) !== null);
+        const okOrd = (isInt(lt) && isInt(rt) && unifyInt(lt, rt) !== null) || (isFloat(lt) && isFloat(rt) && unifyFloat(lt, rt) !== null) || (lt === "char" && rt === "char");
         if (!okOrd) this.err(`'${e.op}' requires matching numeric types (got ${lt}, ${rt})`);
         e.ty = "bool"; return e.ty;
       }

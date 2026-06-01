@@ -1,0 +1,13 @@
+// char is a UTF-32 code point (Copy scalar). Literals: 'a' / '\n' / 'あ'.
+function main() {
+  const a: char = 'A';          // annotated
+  const ja = 'あ';              // inferred -> char
+  const nl: char = '\n';
+  stdout.println(a);            // A
+  stdout.println(ja);           // あ
+  if (a == 'A') { stdout.println("eq"); }
+  if (a != ja) { stdout.println("neq"); }
+  if (a < 'a') { stdout.println("A<a"); }   // 65 < 97
+  if ('z' > 'a') { stdout.println("z>a"); }
+  stdout.println(nl);           // a blank line
+}

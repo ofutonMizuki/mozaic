@@ -245,6 +245,7 @@ inline std::vector<String> stdin_lines() {
 
 inline void println(const String& s)        { std::cout << encodeUtf8(s) << "\n"; }
 inline void println(const char* s)           { std::cout << s << "\n"; }
+inline void println(char32_t cp)             { std::cout << encodeUtf8(std::u32string(1, cp)) << "\n"; }
 inline void println(long long v)             { std::cout << v << "\n"; }
 inline void println(unsigned long long v)    { std::cout << v << "\n"; }
 inline void println(double v)                { std::cout << v << "\n"; }

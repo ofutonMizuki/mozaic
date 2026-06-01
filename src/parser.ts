@@ -272,6 +272,7 @@ export class Parser {
     if (tk.t === "num") { this.next(); return { kind: "Num", value: tk.v }; }
     if (tk.t === "fnum") { this.next(); return { kind: "Float", value: tk.v }; }
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
+    if (tk.t === "char") { this.next(); return { kind: "Char", value: tk.v }; }
     if (tk.t === "id") {
       this.next();
       if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);
