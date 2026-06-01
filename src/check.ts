@@ -14,8 +14,9 @@ type Borrow = { mut: boolean; job: string };
 // error); `loopDepth` = the loop nesting at definition (moving an outer binding inside a loop is unsound).
 type VarState = { ty: string; moved: boolean; loopDepth: number; mutable: boolean; paramRooted?: boolean };
 
-// Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
-const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
+// Memory orderings (SPEC §5). Atomic ops take a LITERAL one. SeqCst is the strongest and is
+// valid for every op (load/store/rmw/failure); the per-op lists below add it everywhere.
+const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"]);
 
 class Checker {
   errs: string[] = [];
@@ -122,17 +123,17 @@ class Checker {
     const val = (a: Expr | undefined, k: number) => { if (a) { const at = this.checkExpr(a); if (!this.assignable(at, t)) this.err(`atomic ${m} arg ${k}: cannot pass ${at} as ${t}`); } };
     switch (m) {
       case "load":
-        if (e.args.length !== 1) this.err("load(order) takes 1 argument"); else order(e.args[0], ["Relaxed", "Acquire"], "load's");
+        if (e.args.length !== 1) this.err("load(order) takes 1 argument"); else order(e.args[0], ["Relaxed", "Acquire", "SeqCst"], "load's");
         return (e.ty = t);
       case "store":
-        if (e.args.length !== 2) this.err("store(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Release"], "store's"); }
+        if (e.args.length !== 2) this.err("store(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Release", "SeqCst"], "store's"); }
         return (e.ty = "unit");
       case "fetchAdd":
-        if (e.args.length !== 2) this.err("fetchAdd(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Acquire", "Release", "AcqRel"], "fetchAdd's"); }
+        if (e.args.length !== 2) this.err("fetchAdd(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"], "fetchAdd's"); }
         return (e.ty = t);
       case "compareExchange":
         if (e.args.length !== 4) this.err("compareExchange(expected, desired, success, failure) takes 4 arguments");
-        else { val(e.args[0], 1); val(e.args[1], 2); order(e.args[2], ["Relaxed", "Acquire", "Release", "AcqRel"], "compareExchange success"); order(e.args[3], ["Relaxed", "Acquire"], "compareExchange failure"); }
+        else { val(e.args[0], 1); val(e.args[1], 2); order(e.args[2], ["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"], "compareExchange success"); order(e.args[3], ["Relaxed", "Acquire", "SeqCst"], "compareExchange failure"); }
         return (e.ty = "bool");
       default:
         this.err(`unknown atomic method '${m}' (use load / store / fetchAdd / compareExchange)`);
@@ -226,7 +227,8 @@ class Checker {
     const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
-    if (t === "Task") return true;                    // spawn handle
+    if (t === "Task") return true;                    // spawn handle (void result)
+    { const g = genericArgs(t); if (g !== null && g.base === "Task") return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Task<R>: a result-returning task
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
     const se = sliceElem(t); if (se !== null) return this.typeKnown(se);
     const ap = arrayParts(t); if (ap !== null) return this.typeKnown(ap[0]) && /^\d+$/.test(ap[1]);
@@ -411,8 +413,8 @@ class Checker {
         if (declTy === "Job" && s.value.kind === "Call" &&
             s.value.callee.kind === "Member" && s.value.callee.prop === "launch")
           this.registerBorrows(s.value, s.name);
-        // `let t: Task = spawn f(...)` holds its &/&mut args until t.join()
-        if (declTy === "Task" && s.value.kind === "SpawnExpr" && s.value.call.kind === "Call") {
+        // `let t: Task = spawn f(...)` / `let t: Task<R> = spawn g(...)` holds its &/&mut args until t.join()
+        if ((declTy === "Task" || genericArgs(declTy)?.base === "Task") && s.value.kind === "SpawnExpr" && s.value.call.kind === "Call") {
           this.tasks.set(s.name, { joined: false });
           this.registerSpawnBorrows(s.value.call, s.name);
         }
@@ -525,13 +527,8 @@ class Checker {
           if (this.scopeStack.length === 0) this.err("a bare `spawn` must be inside a scope { } (or bind it: let t: Task = spawn ...)");
           else if (e.call.kind === "Call") this.registerSpawnBorrows(e.call, this.scopeStack[this.scopeStack.length - 1]);
         }
-        // job.await() / task.join() return the borrows held by that job/task.
-        if (e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" &&
-            (e.callee.prop === "await" || e.callee.prop === "join")) {
-          const job = e.callee.obj.name;
-          if (e.callee.prop === "join") { const t = this.tasks.get(job); if (t) t.joined = true; }
-          for (const [name, b] of [...this.borrows]) if (b.job === job) this.borrows.delete(name);
-        }
+        // (job.await() / task.join() release their borrows inside checkExpr, so they work as
+        // expressions too — e.g. `let r = t.join();`.)
         break;
       }
     }
@@ -788,6 +785,7 @@ class Checker {
         if (e.callee.kind === "Member" && e.callee.prop === "await") {
           if (this.checkExpr(e.callee.obj) !== "Job") this.err("'.await' can only be called on a Job");
           if (e.args.length) this.err("await takes no arguments");
+          if (e.callee.obj.kind === "Ident") for (const [name, b] of [...this.borrows]) if (b.job === e.callee.obj.name) this.borrows.delete(name);   // device borrow returns here
           e.ty = "unit"; return e.ty;
         }
         if (e.callee.kind === "Ident" && e.callee.name === "format") {   // format(x) : str
@@ -881,9 +879,15 @@ class Checker {
             if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
             return this.checkAtomicMethod(e, ae);
           }
-          if (recvTy === "Task" && e.callee.prop === "join") {
+          const tg = genericArgs(recvTy);
+          if ((recvTy === "Task" || tg?.base === "Task") && e.callee.prop === "join") {
             if (e.args.length) this.err("join() takes no arguments");
-            e.ty = "unit"; return e.ty;
+            if (e.callee.obj.kind === "Ident") {   // mark joined + return the &/&mut borrows held by this task
+              const tn = e.callee.obj.name;
+              const t = this.tasks.get(tn); if (t) t.joined = true;
+              for (const [name, b] of [...this.borrows]) if (b.job === tn) this.borrows.delete(name);
+            }
+            e.ty = tg ? tg.args[0] : "unit"; return e.ty;   // Task<R>.join() -> R; Task.join() -> unit
           }
           const rra = resultArgs(recvTy);
           if (rra !== null) {   // Result<T,E> terminal accessors
@@ -933,9 +937,11 @@ class Checker {
       }
       case "SpawnExpr": {
         if (this.inKernel) this.err("spawn is not allowed inside a kernel");
-        if (e.call.kind === "Call") this.checkSpawnArgs(e.call);
+        let ret: string | null = null;
+        if (e.call.kind === "Call") { this.checkSpawnArgs(e.call); if (e.call.callee.kind === "Ident") ret = this.fns.get(e.call.callee.name)?.retTy ?? null; }
         else this.err("spawn requires a function call");
-        e.ty = "Task"; return e.ty;
+        e.ty = ret ? `Task<${ret}>` : "Task";   // a value-returning fn yields Task<R>; join() gives R back
+        return e.ty;
       }
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);

@@ -1,0 +1,14 @@
+// Task<R>: a spawned function that returns a value; join() hands the result back (M4).
+function sumTo(n: u32): u64 {
+  let s: u64 = 0;
+  let i: u32 = 0;
+  while (i < n) { s = s +% (i as u64); i = i + 1; }
+  return s;
+}
+function main() {
+  let t: Task<u64> = spawn sumTo(1000);   // runs on another thread (std::async)
+  let other: u64 = sumTo(10);             // 0..9 = 45, computed meanwhile
+  let r: u64 = t.join();                  // 0..999 = 499500
+  stdout.println(other);                  // 45
+  stdout.println(r);                      // 499500
+}

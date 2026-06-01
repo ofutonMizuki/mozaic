@@ -1,0 +1,11 @@
+// SeqCst: the strongest ordering, now usable on every atomic op (M4).
+function main() {
+  let a: Atomic<i64> = Atomic.new(0);
+  a.store(10, SeqCst);
+  stdout.println(a.load(SeqCst));            // 10
+  let ok: bool = a.compareExchange(10, 42, SeqCst, SeqCst);
+  stdout.println(a.load(SeqCst));            // 42
+  let prev: i64 = a.fetchAdd(8, SeqCst);
+  stdout.println(prev);                      // 42 (returns previous value)
+  stdout.println(a.load(SeqCst));            // 50
+}

@@ -1,0 +1,3 @@
+std::future<uint64_t>
+std::async(std::launch::async
+.get()
