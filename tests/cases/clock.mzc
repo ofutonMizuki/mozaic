@@ -1,0 +1,7 @@
+// clock.now() returns a monotonic u64 (nanoseconds); a later read is never smaller.
+function main() {
+  let t0: u64 = clock.now();
+  let t1: u64 = clock.now();
+  let ok: bool = t1 >= t0;
+  stdout.println(ok);
+}

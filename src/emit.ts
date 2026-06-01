@@ -121,6 +121,7 @@ function emitExpr(e: Expr): string {
       }
       if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
         const recv = e.callee.obj.name, m = e.callee.prop;
+        if (recv === "clock" && m === "now") return `mz::now_ns()`;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
         if (recv === "stdout" && m === "println") {
           const a = e.args[0];

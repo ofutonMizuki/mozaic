@@ -337,6 +337,10 @@ class Checker {
         }
         if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
           const recv = e.callee.obj.name, m = e.callee.prop;
+          if (recv === "clock" && m === "now") {
+            if (e.args.length) this.err("clock.now() takes no arguments");
+            e.ty = "u64"; return e.ty;
+          }
           if (recv === "stdin" && m === "lines") { e.ty = "str-iter"; return e.ty; }
           if (recv === "stdout" && m === "println") {
             const at = e.args.length === 1 ? this.checkExpr(e.args[0]) : "unit";

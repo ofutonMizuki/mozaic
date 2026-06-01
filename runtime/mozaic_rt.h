@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <cstdlib>
+#include <chrono>
 
 namespace mz {
 
@@ -16,6 +17,12 @@ using str    = std::u32string;
 // ---- integer arithmetic (overflow-aware) ----
 // Default add/sub/mul: trap on overflow in debug, wrap in release (-DMZ_RELEASE).
 [[noreturn]] inline void panic(const char* msg) { std::cerr << "mozaic: " << msg << "\n"; std::abort(); }
+
+// Monotonic wall-clock in nanoseconds (for `clock.now()` — benchmarking/timing).
+inline uint64_t now_ns() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 template <class T> T add(T a, T b) { T r; bool o = __builtin_add_overflow(a, b, &r);
 #ifndef MZ_RELEASE
