@@ -13,8 +13,8 @@
 - **M2 言語コア実装済み**(branch `m2-language-core`): `char`+文字リテラル / `true`/`false` / `as`・`as?` /
   `str` リテラルを所有 `String` 化 / `abort`・`assert` / `defer` / `T?`(`some`/`none`/`??`/後置 `?`) /
   `Result<T,E>`(`Ok`/`Err`/`?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`) / `[T;N]`・`[]T`(`slice`) /
-  文字列 `.len`/`+`/`[i]`・`format`・テンプレート `` `…${e}…` ``。敵対的レビュー 2 回で健全性バグ 5 件修正。
-- ゴールデンテスト **58/58 pass**。
+  文字列 `.len`/`+`/`[i]`・`format`・テンプレート `` `…${e}…` ``。敵対的レビュー 2 回で健全性/コード生成バグ 11 件修正。
+- ゴールデンテスト **66/66 pass**。
 - M2 の残り(将来の磨き込み): `Result` コンビネータ、可変 `String` 構築 API(`push` 等)、配列/スライスの境界検査、`slice` の生存期間検査(M5)、単項マイナス。
 
 ## 完成の定義

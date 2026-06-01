@@ -8,12 +8,12 @@ GPU/Metal バックエンド(UMA ゼロコピー + 借用=同期)が動作。以
 `abort`・`assert` / `defer`(LIFO RAII) / `T?` オプショナル(`some`/`none`/`??`/後置 `?`) /
 `Result<T,E>`(`Ok`/`Err`/後置 `?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`) / 固定長配列 `[T;N]`・スライス `[]T`(`slice(arr)`) /
 文字列 `.len`(コードポイント数)/`+`/`[i]`→`char`・`format(x)`・テンプレート `` `…${e}…` ``。
-ゴールデン **58/58**。2 回の敵対的レビュー(workflow)で健全性バグ 5 件を修正済み。
+ゴールデン **66/66**。2 回の敵対的レビュー(workflow)で健全性/コード生成バグ計 11 件を修正済み。
 残: M3 以降(comptime/総称型/SIMD、並行性の完成、借用完全形、モジュール/stdlib、セルフホスト)。詳細は [ROADMAP.md](ROADMAP.md)。
 
 ## TL;DR(2026-06-01 時点で動くもの)
 - `node src/main.ts run examples/addk_async.mzc --gpu` → Apple Silicon GPU(Metal)で `10 11 12 13`。CPU と完全一致。
-- GPU/Metal + `Atomic<T>` + spawn/scope/join は **main にマージ済み**。**M2 言語コア**は branch `m2-language-core`(main 未マージ)。ゴールデン **58/58**(`node tests/run.ts`)。
+- GPU/Metal + `Atomic<T>` + spawn/scope/join は **main にマージ済み**。**M2 言語コア**は branch `m2-language-core`(main 未マージ)。ゴールデン **66/66**(`node tests/run.ts`)。
 - **採用した実装方針**:metal-cpp は使わず **Objective‑C++ + システム Metal.framework**(`clang++ -x objective-c++ -fobjc-arc -framework Metal -framework Foundation -DMZ_METAL`)。外部 DL 不要で Xcode のみで完結。MSL は `newLibraryWithSource` で実行時コンパイル。
 - **借用=同期(キーストーン)達成**:`dev.launch(k, grid, &in, &mut out, …) -> Job` / `job.await()`。`await` 前に借用中バッファへ CPU が触ると **コンパイルエラー**([src/check.ts](src/check.ts) の `borrows` 追跡)。`&`=共有(CPU 並走読み可)/ `&mut`=排他。
 - **UMA ゼロコピー実証**:生成 `.mm` に host↔device の `memcpy` ゼロ。`buf.contents` 直接読み書き = GPU と同一メモリ。
