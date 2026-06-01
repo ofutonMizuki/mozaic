@@ -3,12 +3,14 @@
 ステータス:**草案**。[VISION.md](VISION.md) の方針を具体構文へ落としたもの。M0–M2 を実装できる範囲を対象とし、
 未確定箇所は §8 に TBD として明記する。構文は実装(M0)で確定する。
 
-> **実装状況(M2 完了、branch `m2-language-core`)**: §1–§2 の `char`+文字リテラル / `as`・`as?` /
+> **実装状況(M3 完了、branch `m3-abstraction`)**: §1–§2 の `char`+文字リテラル / `as`・`as?` /
 > `T?`(`some`/`none`/`??`/後置 `?`)/ `Result<T,E>`(`Ok`/`Err`/後置 `?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`)/
 > 固定長配列 `[T;N]` / スライス `[]T`(`slice(arr)`)/ `str`・`String`(`.len`/`+`/`[i]`/`format`)/
-> テンプレート文字列 `` `…${e}…` `` / `defer` / `abort`・`assert` は**実装済み**。
-> 未実装(§8 TBD / 後続 M): `i128`/`u128`/`f16`、ベクタ型 `f32x4` 等、`comptime`、ユーザ総称型、
-> 可変 `String` 構築 API、配列/スライスの境界検査、単項マイナス、`Result` コンビネータ。
+> テンプレート文字列 `` `…${e}…` `` / `defer` / `abort`・`assert` は**実装済み**(M2)。
+> **M3 で追加実装**: `i128`/`u128`/`f16`、ベクタ型 `f32x4` 等(`splat`/レーン構築/レーン演算/添字)、
+> `comptime` + トップレベル `const`、ユーザ総称型(generic fn / struct / メソッド)。
+> 未実装(§8 TBD / 後続 M): 可変 `String` 構築 API、配列/スライスの境界検査、単項マイナス、`Result` コンビネータ、
+> `Mutex`/`Channel`/`Arc`・結果返し `join`(M4)、借用チェッカ完全形(M5)、モジュール/stdlib/file I/O(M6)、セルフホスト(M7)。
 
 ## 0. 設計原則(要約)
 

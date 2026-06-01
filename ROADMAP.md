@@ -4,12 +4,14 @@
 > 他社 UMA は**非目標**で、長期構想として [VISION.md](VISION.md) に残置する(完成の定義には含めない)。
 > GPU は Apple Silicon / Metal のまま。
 
-## 現在地（M2 ほぼ完了）
+## 現在地（M3 完了 / 次は M4・M5）
 - パイプライン `lexer → parser → check → emit`(C++ 生成)+ ランタイム `runtime/mozaic_rt.h`。
 - GPU/Metal バックエンド(Objective-C++、UMA ゼロコピー、`borrow=device-sync` キーストーン)。
 - `Atomic<T>`(ホスト `std::atomic`)+ 最小の構造化並行(`spawn`/`scope`/`Task.join`、`std::thread`)。
 - 借用チェッカ P1〜P4 実装済み: 単一所有 + ムーブ / 一級 `&T`・`&mut T` + struct メソッド /
   別名規則(`&mut` 排他 xor `&` 複数, device・task 統合)/ レキシカル escape(単一引数 provenance)。
+- **M3 実装済み**(branch `m3-abstraction`): 総称型(fn+struct+メソッド) / `i128`/`u128`/`f16` /
+  SIMD ベクタ(`f32x4` 等) / `comptime` + トップレベル `const`。ゴールデン **76/76**。
 - **M2 言語コア実装済み**(branch `m2-language-core`): `char`+文字リテラル / `true`/`false` / `as`・`as?` /
   `str` リテラルを所有 `String` 化 / `abort`・`assert` / `defer` / `T?`(`some`/`none`/`??`/後置 `?`) /
   `Result<T,E>`(`Ok`/`Err`/`?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`) / `[T;N]`・`[]T`(`slice`) /
@@ -30,7 +32,7 @@
 | M | テーマ | 主な中身 | 依存 | 規模 |
 |---|---|---|---|---|
 | ~~**M2**~~ ✅ | 言語コア充実(**実装済み**) | `as`/`as?` ・ `T?` ・ `Result<T,E>` ・ `defer` ・ `[T;N]` / `[]T` ・ `char`+文字リテラル ・ `str`/`String`(`.len`/`+`/`[i]`/`format`)+ テンプレート `` `…${e}…` `` ・ `abort`/`assert`。残: `Result` コンビネータ、可変 `String` API、境界検査、単項マイナス | — | 完了 |
-| **M3** | 抽象化(進行中) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct + **総称 struct のメソッド**（C++ テンプレートへ降ろし、コンテナ実装可能）。✅ `i128`/`u128`/`f16`。残: `comptime`、ベクタ/SIMD(`f32x4`) | M2 | 大 |
+| ~~**M3**~~ ✅ | 抽象化(**実装済み**) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct + **総称 struct のメソッド**（C++ テンプレートへ降ろし、コンテナ実装可能）。✅ `i128`/`u128`/`f16`。✅ ベクタ/SIMD(`f32x4` 等: splat/レーン構築/レーン演算/添字、host=`mz::Vec` / kernel=MSL native)。✅ `comptime` + トップレベル `const`(ビルド時評価器でテーブル生成) | M2 | 完了 |
 | **M4** | 並行性の完成 | `Mutex<T>` / `Channel<T>` / `Arc<T>` ・ 結果返し `join`(`Task<R>`)・ `Send`/`Sync` 自動判定 ・ `Atomic` の `SeqCst` ・ カーネル `local.{x,y,z}` / `barrier()` / `shared [T;N]` ・ 実行時 Device 選択 | M2(一部 M3) | 中〜大 |
 | **M5** | 借用チェッカ完全形 | 格納参照の文跨ぎ別名 ・ NLL(最終使用での解放)・ disjoint-field 借用 ・ 明示 lifetime 注釈 + 多引数関係 | 現在地(独立) | 中 |
 | **M6** | モジュール & 標準ライブラリ | `import` / コンパイル単位 / 名前解決 ・ 最小 stdlib(collections / math / 文字列)・ **ファイル I/O**(セルフホスト必須) | M2, M3 | 大 |
