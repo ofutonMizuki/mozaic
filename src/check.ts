@@ -906,6 +906,7 @@ class Checker {
             if (e.args.length) this.err("clock.now() takes no arguments");
             e.ty = "u64"; return e.ty;
           }
+          if (recv === "String" && m === "new") { if (e.args.length) this.err("String.new() takes no arguments"); e.ty = "str"; return e.ty; }
           if (recv === "stdin" && m === "lines") { e.ty = "str-iter"; return e.ty; }
           if (recv === "stdin" && m === "readAll") { if (e.args.length) this.err("stdin.readAll() takes no arguments"); e.ty = "str"; return e.ty; }
           if (recv === "stdout" && m === "println") {
@@ -963,6 +964,22 @@ class Checker {
               for (const [name, b] of [...this.borrows]) if (b.job === tn) this.borrows.delete(name);
             }
             e.ty = tg ? tg.args[0] : "unit"; return e.ty;   // Task<R>.join() -> R; Task.join() -> unit
+          }
+          // mutable String builder API: s.push(c: char) / s.pushStr(v: str)
+          if ((refInner(recvTy) ?? recvTy) === "str") {
+            const m = e.callee.prop;
+            if (m === "push" || m === "pushStr") {
+              if (e.callee.obj.kind === "Ident") {
+                const ov = this.lookupVar(e.callee.obj.name);
+                if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`String.${m} needs a mutable String but '${e.callee.obj.name}' is a shared reference`); }
+                else if (ov && !ov.mutable) this.err(`String.${m} needs a mutable String but '${e.callee.obj.name}' is immutable (use 'let')`);
+              }
+              const want = m === "push" ? "char" : "str";
+              if (e.args.length !== 1) this.err(`String.${m} takes one argument`);
+              else { const at = this.checkExpr(e.args[0]); if (!this.assignable(at, want)) this.err(`String.${m}: cannot pass ${at} as ${want}`); }
+              e.ty = "unit"; return e.ty;
+            }
+            this.err(`unknown str method '${m}' (use push / pushStr / .len / [i] / +)`); e.ty = "str"; return e.ty;
           }
           const rra = resultArgs(recvTy);
           if (rra !== null) {   // Result<T,E> terminal accessors

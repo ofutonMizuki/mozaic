@@ -258,6 +258,7 @@ function emitExpr(e: Expr): string {
         const recv = e.callee.obj.name, m = e.callee.prop;
         if (vecParts(recv) !== null && m === "splat") return `${cppType(recv)}::splat(${emitExpr(e.args[0])})`;
         if (recv === "clock" && m === "now") return `mz::now_ns()`;
+        if (recv === "String" && m === "new") return `mz::String{}`;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
         if (recv === "stdin" && m === "readAll") return `mz::read_all_stdin()`;
         if (recv === "stdout" && m === "println") {
@@ -293,6 +294,11 @@ function emitExpr(e: Expr): string {
       // Task<R>.join() -> future.get() (returns R). Void Task.join() falls through to std::thread::join().
       if (e.callee.kind === "Member" && e.callee.prop === "join" && genericArgs(e.callee.obj.ty ?? "")?.base === "Task")
         return `${emitExpr(e.callee.obj)}.get()`;
+      // String builder: s.push(c) -> push_back(char32_t); s.pushStr(v) -> append
+      if (e.callee.kind === "Member" && (refInner(e.callee.obj.ty ?? "") ?? e.callee.obj.ty) === "str") {
+        if (e.callee.prop === "push") return `(${emitExpr(e.callee.obj)}).push_back((char32_t)(${emitExpr(e.args[0])}))`;
+        if (e.callee.prop === "pushStr") return `(${emitExpr(e.callee.obj)}).append(${emitExpr(e.args[0])})`;
+      }
       if (isAtomicNew(e)) throw new Error("Atomic.new must directly initialize a binding or struct field");
       return `${emitExpr(e.callee)}(${e.args.map(emitExpr).join(", ")})`;
     }

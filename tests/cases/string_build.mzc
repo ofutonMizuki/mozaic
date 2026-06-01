@@ -1,0 +1,16 @@
+// Mutable String builder (SPEC §2): String.new() + push(char) / pushStr(str).
+function repeat(c: char, n: u32): str {
+  let s: str = String.new();
+  let i: u32 = 0;
+  while (i < n) { s.push(c); i = i +% 1; }
+  return s;
+}
+function main() {
+  let s: str = String.new();
+  s.push('h');
+  s.push('i');
+  s.pushStr(" there");
+  stdout.println(s);            // hi there
+  stdout.println(s.len);        // 8
+  stdout.println(repeat('*', 5));   // *****
+}
