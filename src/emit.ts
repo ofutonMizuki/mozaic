@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -133,6 +133,7 @@ function emitExpr(e: Expr): string {
       if (e.prop === "len") {
         const ot = refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "";
         if (arrayParts(ot) !== null || ot === "str") return `(uint32_t)(${emitExpr(e.obj)}).size()`;
+        const vp = vecParts(ot); if (vp !== null) return `(uint32_t)${vp.lanes}`;   // lane count (comptime constant)
       }
       return `${emitExpr(e.obj)}.${e.prop}`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
@@ -190,6 +191,9 @@ function emitExpr(e: Expr): string {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
       }
+      // SIMD vector lane-constructor f32x4(a,b,c,d) -> mz::Vec<float,4>{ {a,b,c,d} }
+      if (e.callee.kind === "Ident" && vecParts(e.callee.name) !== null)
+        return `${cppType(e.callee.name)}{ { ${e.args.map(emitExpr).join(", ")} } }`;
       if (e.callee.kind === "Ident" && e.callee.name === "format") return formatArg(e.args[0]);
       if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) -> mz::Slice{ ptr, len }
         const elem = sliceElem(e.ty ?? "[]i32")!;
@@ -210,6 +214,7 @@ function emitExpr(e: Expr): string {
       }
       if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
         const recv = e.callee.obj.name, m = e.callee.prop;
+        if (vecParts(recv) !== null && m === "splat") return `${cppType(recv)}::splat(${emitExpr(e.args[0])})`;
         if (recv === "clock" && m === "now") return `mz::now_ns()`;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
         if (recv === "stdout" && m === "println") {
@@ -355,6 +360,13 @@ function mslType(t: string): string {
   if (optInner(t) !== null) throw new Error("kernel: optional types are not allowed");
   if (resultArgs(t) !== null) throw new Error("kernel: Result types are not allowed");
   if (sliceElem(t) !== null || arrayParts(t) !== null) throw new Error("kernel: array/slice types are not allowed");
+  const vp = vecParts(t);
+  if (vp !== null) {   // MSL native vectors: 2/3/4 lanes only, no 64/128-bit element types
+    const base: Record<string, string> = { i8: "char", u8: "uchar", i16: "short", u16: "ushort", i32: "int", u32: "uint", f16: "half", f32: "float" };
+    if (!(vp.scalar in base)) throw new Error(`kernel: vector element ${vp.scalar} is not supported in MSL`);
+    if (vp.lanes < 2 || vp.lanes > 4) throw new Error(`kernel: MSL vectors support 2-4 lanes (got ${t})`);
+    return base[vp.scalar] + vp.lanes;
+  }
   switch (t) {
     case "u8": return "uchar"; case "u16": return "ushort"; case "u32": return "uint"; case "u64": return "ulong";
     case "i8": return "char"; case "i16": return "short"; case "i32": return "int"; case "i64": return "long";
@@ -399,7 +411,14 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     case "Str": throw new Error("kernel: strings are not allowed");
     case "Borrow": throw new Error("kernel: '&' borrows are not allowed");
     case "SpawnExpr": throw new Error("kernel: 'spawn' is not allowed");
-    case "Call": throw new Error("kernel: function/variant calls are not allowed (M-stage)");
+    case "Call": {
+      // SIMD vectors are the only calls allowed in a kernel: f32x4(a,b,c,d) / f32x4.splat(s) -> float4(...)
+      if (e.callee.kind === "Ident" && vecParts(e.callee.name) !== null)
+        return `${mslType(e.callee.name)}(${e.args.map((a) => emitMslExpr(a, bufs)).join(", ")})`;
+      if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && vecParts(e.callee.obj.name) !== null && e.callee.prop === "splat")
+        return `${mslType(e.callee.obj.name)}(${emitMslExpr(e.args[0], bufs)})`;
+      throw new Error("kernel: function/variant calls are not allowed (M-stage)");
+    }
     case "StructLit": {
       const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
       const byName = new Map(e.fields.map((f) => [f.name, f.value]));

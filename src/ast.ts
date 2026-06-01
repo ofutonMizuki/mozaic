@@ -57,10 +57,19 @@ export const FLOATS = ["f16", "f32", "f64"];
 export function isInt(t: string): boolean { return t === "intlit" || INTS.includes(t); }
 export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
+// SIMD vector type `<scalar>x<lanes>` (e.g. f32x4, i16x8, u64x2). null if not a vector type.
+export function vecParts(t: string): { scalar: string; lanes: number } | null {
+  const m = /^([iuf](?:8|16|32|64|128))x([0-9]+)$/.exec(t);
+  if (!m) return null;
+  const scalar = m[1], lanes = parseInt(m[2], 10);
+  if (lanes < 2 || !(INTS.includes(scalar) || FLOATS.includes(scalar))) return null;
+  return { scalar, lanes };
+}
 // Copy types are duplicated freely on assign/pass; everything else is move-only (single owner).
 // Non-Copy: str/String, Buffer<T>, structs, enums-with-payload, Atomic<...>.
 export function isCopy(t: string): boolean {
   if (sliceElem(t) !== null) return true;                       // a slice is a cheap {ptr,len} view
+  if (vecParts(t) !== null) return true;                        // a SIMD vector is a flat value
   const ap = arrayParts(t); if (ap !== null) return isCopy(ap[0]);   // [T;N] is Copy iff T is
   return isInt(t) || isFloat(t) || t === "bool" || t === "char";
 }
@@ -176,6 +185,8 @@ export function cppType(t: string): string {
     case "Job": return "mz::Job";
     case "Grid": return "mz::Grid";
     default: {
+      const vp = vecParts(t);
+      if (vp !== null) return `mz::Vec<${cppType(vp.scalar)}, ${vp.lanes}>`;
       const ae = atomicElem(t);
       if (ae !== null) return `std::atomic<${cppType(ae)}>`;
       const be = bufferElem(t);

@@ -87,6 +87,21 @@ template <class T> struct Slice {
   const T& operator[](uint32_t i) const { return ptr[i]; }
 };
 
+// SIMD vector `<scalar>xN` (e.g. f32x4). A flat, Copy value of N lanes. Lane-wise arithmetic;
+// build via the lane-constructor f32x4(a,b,c,d) or f32x4.splat(s). Indexed by lane: v[i].
+// (-O2 auto-vectorizes the lane loops; the semantics are what the language guarantees.)
+template <class T, int N> struct Vec {
+  T lane[N];
+  T& operator[](uint32_t i) { return lane[i]; }
+  const T& operator[](uint32_t i) const { return lane[i]; }
+  static Vec splat(T s) { Vec v{}; for (int i = 0; i < N; i++) v.lane[i] = s; return v; }
+};
+template <class T, int N> Vec<T, N> operator+(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] + b.lane[i]; return r; }
+template <class T, int N> Vec<T, N> operator-(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] - b.lane[i]; return r; }
+template <class T, int N> Vec<T, N> operator*(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] * b.lane[i]; return r; }
+template <class T, int N> Vec<T, N> operator/(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] / b.lane[i]; return r; }
+template <class T, int N> Vec<T, N> operator%(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] % b.lane[i]; return r; }
+
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
 // (so truncation, sign loss, or a non-integral float all yield none). To is always an integer.
 template <class To, class From>

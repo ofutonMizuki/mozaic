@@ -1,0 +1,19 @@
+// SIMD vectors: lane-constructor, splat, lane-wise arithmetic, indexing, .len.
+function main() {
+  let a: f32x4 = f32x4(1.0, 2.0, 3.0, 4.0);
+  let b = f32x4.splat(2.0);
+  let prod = a * b;                 // 2 4 6 8
+  stdout.println(prod[0]);          // 2
+  stdout.println(prod[3]);          // 8
+  let sum = a + b;                  // 3 4 5 6
+  stdout.println(sum[1]);           // 4
+  stdout.println(sum.len);          // 4
+
+  let iv: i32x4 = i32x4(10, 20, 30, 40);
+  let iw = i32x4.splat(3);
+  let im = iv + iw;                 // 13 23 33 43
+  stdout.println(im[2]);            // 33
+  let mod = iv % i32x4.splat(7);    // 3 6 2 5
+  stdout.println(mod[0]);           // 3
+  stdout.println(mod[1]);           // 6
+}

@@ -1,0 +1,6 @@
+// No implicit broadcast: a vector and a scalar (or two different vector widths) cannot mix.
+function main() {
+  let a = f32x4.splat(1.0);
+  let b = a + 2.0;        // error: scalar has no implicit broadcast to f32x4
+  stdout.println(b[0]);
+}

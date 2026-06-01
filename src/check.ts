@@ -2,7 +2,7 @@
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
-  bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
+  bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
 } from "./ast.ts";
 
 // borrow = device sync: a buffer borrowed by an in-flight Job (between dev.launch and
@@ -217,6 +217,8 @@ class Checker {
   formattable(t: string): boolean { return t === "str" || t === "bool" || t === "char" || isInt(t) || isFloat(t); }
   typeKnown(t: string): boolean {
     if (this.curTypeParams.has(t)) return true;                          // generic type param (opaque)
+    if (vecParts(t) !== null) return true;                               // SIMD vector type
+
     const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
@@ -629,7 +631,7 @@ class Checker {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
         }
-        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str") && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const si = this.structFields(ot);
         if (si) {
           const ft = si.fields.get(e.prop);
@@ -642,7 +644,8 @@ class Checker {
         const ot0 = this.checkExpr(e.obj);
         const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
         const ap = arrayParts(ot);
-        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null) ?? (ot === "str" ? "char" : null);
+        const vp = vecParts(ot);
+        const elem = bufferElem(ot) ?? sliceElem(ot) ?? (ap !== null ? ap[0] : null) ?? (vp !== null ? vp.scalar : null) ?? (ot === "str" ? "char" : null);
         if (elem === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
         if (bufferElem(ot) !== null && e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
         const it = this.checkExpr(e.index);
@@ -712,6 +715,15 @@ class Checker {
           if (e.args.length !== want) this.err(`${e.callee.name} takes ${want} integer dimensions`);
           for (const a of e.args) if (!isInt(this.checkExpr(a))) this.err(`${e.callee.name}: dimensions must be integers`);
           e.ty = "Grid"; return e.ty;
+        }
+        // SIMD vector lane-constructor: f32x4(a, b, c, d) — one scalar per lane (no broadcast).
+        if (e.callee.kind === "Ident") {
+          const vp = vecParts(e.callee.name);
+          if (vp !== null) {
+            if (e.args.length !== vp.lanes) this.err(`${e.callee.name} takes ${vp.lanes} lane value(s), got ${e.args.length}`);
+            for (let k = 0; k < e.args.length; k++) { const at = this.checkExpr(e.args[k]); if (!this.assignable(at, vp.scalar)) this.err(`${e.callee.name}: lane ${k + 1} is ${at}, expected ${vp.scalar}`); }
+            e.ty = e.callee.name; return e.ty;
+          }
         }
         // dev.launch(kernel, grid, &buf, &mut out, ...scalars) -> Job  (async; borrows held until await)
         if (e.callee.kind === "Member" && e.callee.prop === "launch") {
@@ -808,6 +820,13 @@ class Checker {
         }
         if (e.callee.kind === "Member" && e.callee.obj.kind === "Ident") {
           const recv = e.callee.obj.name, m = e.callee.prop;
+          const vp = vecParts(recv);   // f32x4.splat(s) — broadcast a scalar to every lane
+          if (vp !== null) {
+            if (m !== "splat") this.err(`unknown vector operation '${recv}.${m}' (use ${recv}.splat(s) or ${recv}(lanes...))`);
+            else if (e.args.length !== 1) this.err(`${recv}.splat(s) takes one scalar`);
+            else { const at = this.checkExpr(e.args[0]); if (!this.assignable(at, vp.scalar)) this.err(`${recv}.splat: ${at} is not ${vp.scalar}`); }
+            e.ty = recv; return e.ty;
+          }
           if (recv === "clock" && m === "now") {
             if (e.args.length) this.err("clock.now() takes no arguments");
             e.ty = "u64"; return e.ty;
@@ -887,6 +906,15 @@ class Checker {
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
         if (this.hasAtomic(lt) || this.hasAtomic(rt)) { this.err(`Atomic can only be accessed via load/store/fetchAdd/compareExchange (not used as a value)`); e.ty = "i32"; return e.ty; }
+        // SIMD vectors: lane-wise + - * / (% int-only). Both sides must be the SAME vector type
+        // (no implicit broadcast — write `v * f32x4.splat(s)` for a scalar).
+        const lv = vecParts(lt), rv = vecParts(rt);
+        if (lv !== null || rv !== null) {
+          if (!["+", "-", "*", "/", "%"].includes(e.op)) this.err(`operator '${e.op}' is not defined on vectors (got ${lt}, ${rt})`);
+          else if (lt !== rt) this.err(`vector op '${e.op}' requires matching vector types (got ${lt}, ${rt}); no implicit broadcast`);
+          else if (e.op === "%" && lv && !isInt(lv.scalar)) this.err(`'%' on a float vector ${lt} is not allowed`);
+          e.ty = lv !== null ? lt : rt; return e.ty;
+        }
         if (e.op === "+" && lt === "str" && rt === "str") { e.ty = "str"; return e.ty; }   // string concatenation
         if (ARITH_OPS.includes(e.op)) {
           const intOnly = e.op.length === 2 || e.op === "%";
