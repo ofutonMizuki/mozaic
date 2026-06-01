@@ -4,28 +4,31 @@
 > 他社 UMA は**非目標**で、長期構想として [VISION.md](VISION.md) に残置する(完成の定義には含めない)。
 > GPU は Apple Silicon / Metal のまま。
 
-## 現在地（M3 完了・M4 大半・M6 着手 / branch `m3-abstraction`、ゴールデン **89/89**）
+## 現在地（M3 完了・M4 大半・M5 一部・M6 完了・M7 実証 / branch `m3-abstraction`、ゴールデン **96/96**）
 - パイプライン `lexer → parser → check → emit`(C++ 生成)+ ランタイム `runtime/mozaic_rt.h`。
 - GPU/Metal バックエンド(Objective-C++、UMA ゼロコピー、`borrow=device-sync` キーストーン)。
-- 借用チェッカ P1〜P4 実装済み: 単一所有 + ムーブ / 一級 `&T`・`&mut T` + struct メソッド /
-  別名規則(`&mut` 排他 xor `&` 複数, device・task 統合)/ レキシカル escape(単一引数 provenance)。
 - **M3 完了**: 総称型(fn+struct+メソッド) / `i128`/`u128`/`f16` / SIMD ベクタ(`f32x4` 等、host=`mz::Simd`/kernel=MSL) /
   `comptime` + トップレベル `const`(ビルド時評価器 `src/comptime.ts`)。
 - **M4 大半**: `Atomic<T>`(`SeqCst` 含む全 Ordering)/ 構造化並行 `spawn`/`scope` /
-  **結果返し `Task<R>.join()`**(`std::async`/`future`)/ **`Arc<T>`**(共有所有)・**`Mutex<T>`**(ガード)・**`Channel<T>`**(MPSC)。
-- **M6 着手**: 可変長 **`Vec<T>`**(`push`/`pop`/`len`/`[i]`、`&mut Vec` で被呼出し変更)/
-  可変 **`String` 構築**(`String.new`/`push`/`pushStr`)/ `stdin.readAll()`(全入力読込)。
+  結果返し `Task<R>.join()`(`std::async`/`future`)/ `Arc<T>`(共有所有)・`Mutex<T>`(ガード)・`Channel<T>`(MPSC)。
+- **M5 一部**: **disjoint-field 借用**(`&mut v.a` と `&mut v.b` は独立、アクセスパスで別名判定)。
+- **M6 完了**: `import`(複数ファイル解決・diamond dedup)/ 可変長 `Vec<T>` / `Map<K,V>`(ハッシュマップ)/
+  可変 `String` 構築(`String.new`/`push`/`pushStr`)/ ファイル I/O(`readFile`/`writeFile`)/ `stdin.readAll()`。
 - **言語コア補完**: 論理演算子 `&& || !`(短絡)、`else if` 連鎖。
-- **M7 布石**: [tests/cases/lexer_mz.mzc](tests/cases/lexer_mz.mzc) = **mozaic で書いた字句解析器**(stdin を読み Vec にトークン収集 → 出力)。
-  言語がコンパイラ段を記述できる表現力に達したことの実証。
+- **M7 実証**: 再帰データの要 **`Box<T>`**(型推論つき、enum ペイロード可)+ `match` の `&Enum` 透過。
+  [tests/cases/calc_mz.mzc](tests/cases/calc_mz.mzc) = **mozaic で書いた完全な式コンパイラ**(字句解析 +
+  再帰下降パーサ→`Box<Expr>` AST + 評価器、stdin 入力)。[tests/cases/lexer_mz.mzc](tests/cases/lexer_mz.mzc) /
+  [tests/cases/ast_eval.mzc](tests/cases/ast_eval.mzc) も同様。**言語がコンパイラ段を記述できる表現力に到達**。
 
-## 残り(本セッション未完 / 次の着手対象)
-- **M4d(GPU・実行時 device)**: カーネル `local.{x,y,z}`/`barrier()`/`shared [T;N]`(ワークグループ機構、Metal threadgroup 実装が要)、
-  実行時 `Device.gpu.first() ?? Device.cpu` ディスパッチ。CPU ゴールデンでは回帰検証不能・セルフホスト前提でないため後回し。
-- **M5(借用完全形)**: 格納参照の文跨ぎ別名 / NLL / disjoint-field 借用 / 明示 lifetime 注釈。
-- **M6(残り)**: `import`/モジュール・名前解決・コンパイル単位、`Map<K,V>` 等の追加 stdlib、ファイル I/O(当面 `stdin.readAll()` で代替可)。
-- **M7(セルフホスト ★)**: `lexer → parser → check → emit` を mozaic で書き直し、生成 C++ で既存ゴールデンを通す段階 bootstrap。
-  字句解析器の布石は実証済み。残るは parser/check/emit の移植(最大の作業)。
+## 残り(次セッションの着手対象)
+- **M7 完全セルフホスト ★(最大の残作業)**: 上の実証で**言語側の前提は揃った**。残るは `src/*.ts`(約 2700 行:
+  lexer/parser/check/emit/comptime)を mozaic で書き直し、生成 C++ で既存 96 ゴールデンを通す段階 bootstrap。
+  これは数千行規模の移植で、本セッションでは未完(言語の表現力実証までを達成)。
+- **M5(借用完全形の残り)**: NLL(最終使用での解放)・格納参照の文跨ぎフロー解析・明示 lifetime 注釈。
+  データフロー解析が要で、過剰な制約はセルフホストの記述を妨げうるため慎重に。
+- **M4d(GPU・実行時 device)**: カーネル `local.{x,y,z}`/`barrier()`/`shared [T;N]`、実行時 `Device.gpu.first() ?? Device.cpu`。
+  **意図的に後回し**: CPU ゴールデンで回帰検証不能 / CPU バックエンド(逐次ループ)はワークグループ意味論を表現できない /
+  ホストの threadgroup ディスパッチ API が SPEC 未定 / 実行時 device 選択は両バックエンド同梱の再設計が要 / セルフホスト非前提。
 - **M2 言語コア実装済み**(branch `m2-language-core`): `char`+文字リテラル / `true`/`false` / `as`・`as?` /
   `str` リテラルを所有 `String` 化 / `abort`・`assert` / `defer` / `T?`(`some`/`none`/`??`/後置 `?`) /
   `Result<T,E>`(`Ok`/`Err`/`?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`) / `[T;N]`・`[]T`(`slice`) /
@@ -48,9 +51,9 @@
 | ~~**M2**~~ ✅ | 言語コア充実(**実装済み**) | `as`/`as?` ・ `T?` ・ `Result<T,E>` ・ `defer` ・ `[T;N]` / `[]T` ・ `char`+文字リテラル ・ `str`/`String`(`.len`/`+`/`[i]`/`format`)+ テンプレート `` `…${e}…` `` ・ `abort`/`assert`。残: `Result` コンビネータ、可変 `String` API、境界検査、単項マイナス | — | 完了 |
 | ~~**M3**~~ ✅ | 抽象化(**実装済み**) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct + **総称 struct のメソッド**（C++ テンプレートへ降ろし、コンテナ実装可能）。✅ `i128`/`u128`/`f16`。✅ ベクタ/SIMD(`f32x4` 等: splat/レーン構築/レーン演算/添字、host=`mz::Vec` / kernel=MSL native)。✅ `comptime` + トップレベル `const`(ビルド時評価器でテーブル生成) | M2 | 完了 |
 | **M4** | 並行性の完成(大半 ✅) | ✅ `Mutex<T>` / `Channel<T>` / `Arc<T>` ・ ✅ 結果返し `join`(`Task<R>`)・ ✅ `Atomic` の `SeqCst`。残: `Send`/`Sync` の明示的形式化、カーネル `local.{x,y,z}` / `barrier()` / `shared [T;N]`、実行時 Device 選択(= M4d, GPU 依存) | M2(一部 M3) | 中〜大 |
-| **M5** | 借用チェッカ完全形 | 格納参照の文跨ぎ別名 ・ NLL(最終使用での解放)・ disjoint-field 借用 ・ 明示 lifetime 注釈 + 多引数関係 | 現在地(独立) | 中 |
-| **M6** | モジュール & 標準ライブラリ | `import` / コンパイル単位 / 名前解決 ・ 最小 stdlib(collections / math / 文字列)・ **ファイル I/O**(セルフホスト必須) | M2, M3 | 大 |
-| **M7** | セルフホスト ★完成 | `lexer → parser → check → emit` を mozaic で書き直し、生成 C++ をビルドして既存ゴールデンを通す。段階 bootstrap | M2 + M3 + M6 | 最大 |
+| **M5** | 借用チェッカ完全形(一部 ✅) | ✅ disjoint-field 借用。残: 格納参照の文跨ぎ別名 ・ NLL(最終使用での解放)・ 明示 lifetime 注釈 + 多引数関係 | 現在地(独立) | 中 |
+| ~~**M6**~~ ✅ | モジュール & 標準ライブラリ(**実装済み**) | ✅ `import`(複数ファイル解決) ・ `Vec<T>` / `Map<K,V>` collections ・ 可変 `String` 構築 ・ **ファイル I/O** `readFile`/`writeFile` ・ `stdin.readAll` | M2, M3 | 大 |
+| **M7** | セルフホスト ★完成(実証 ✅ / 完全版残) | ✅ 言語の表現力実証(`Box<T>` 再帰型 + mozaic 製の lexer/parser/eval = [calc_mz.mzc](tests/cases/calc_mz.mzc))。残: `lexer→parser→check→emit` 全体を mozaic で書き直し、生成 C++ で既存ゴールデンを通す段階 bootstrap(数千行) | M2 + M3 + M6 | 最大 |
 
 ## クリティカルパス
 **M2(文字列・collections・エラー処理)→ M3(総称型・comptime)→ M6(モジュール + ファイル I/O)→ M7(自己記述)★**

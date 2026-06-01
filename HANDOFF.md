@@ -1,12 +1,13 @@
 # HANDOFF
 
 > **最新状況は [ROADMAP.md](ROADMAP.md) 「現在地」を参照**(本ファイル以下は M1/M2 当時の歴史メモ)。
-> 2026-06-02 時点: **M3 完了・M4 大半・M6 着手**(branch `m3-abstraction`, ゴールデン **89/89**)。
-> 追加実装: 総称型 / SIMD `f32x4` / `comptime`+トップレベル `const` / `Task<R>` 結果返し /
-> `Arc`・`Mutex`・`Channel` / `Atomic` `SeqCst` / 可変長 `Vec<T>` / 可変 `String` 構築 /
-> `stdin.readAll` / 論理 `&& || !` / `else if`。mozaic 製字句解析器
-> [tests/cases/lexer_mz.mzc](tests/cases/lexer_mz.mzc) が動作(M7 布石)。
-> 残り: M4d(GPU ワークグループ・実行時 device)、M5(借用完全形)、M6(`import`/モジュール・ファイル I/O)、M7(セルフホスト)。
+> 2026-06-02 時点: **M3 完了・M4 大半・M5 一部・M6 完了・M7 実証**(branch `m3-abstraction`, ゴールデン **96/96**)。
+> 追加実装: 総称型 / SIMD `f32x4` / `comptime`+`const` / `Task<R>` / `Arc`・`Mutex`・`Channel` / `SeqCst` /
+> `Vec<T>` / `Map<K,V>` / 可変 `String` / `readFile`/`writeFile` / `stdin.readAll` / 論理 `&& || !` / `else if` /
+> `import`(複数ファイル) / disjoint-field 借用 / **`Box<T>` 再帰型**。
+> **M7 実証**: [tests/cases/calc_mz.mzc](tests/cases/calc_mz.mzc) = mozaic で書いた式コンパイラ(lex→parse→eval)。
+> **残り**: M7 完全セルフホスト(`src/*.ts` ~2700 行を mozaic へ移植、最大の作業)、M5 残り(NLL/lifetime)、M4d(GPU、意図的後回し)。
+> コンパイラ編集時の注意は memory `mozaic-compiler-conventions` 参照。
 
 ---
 
