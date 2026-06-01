@@ -216,12 +216,46 @@ let h = spawn compute(&data);   // 結果付きタスク
 let r = h.join();               // 早期に合流して結果取得
 ```
 
-- `spawn f(args…)` は `launch` と同形(クロージャ不要、関数 + 引数)。
-- 共有可変状態:`Atomic<T>`(ロックフリー)/ `Mutex<T>`(ロック→ガード)/ `Channel<T>`(受け渡し)。
-  スレッドをまたぐ共有所有は `Arc<T>`(アトミック参照計数、GC ではない)。
-- 安全性:`&mut` を持てるスレッドは同時に1つ、という借用規則が競合を封じる。`&` 共有はスレッド安全な型に限る(`Sync` 相当・自動判定)。
+- `spawn f(args…)` は `launch` と同形(クロージャ不要、関数 + 引数)。**v0.1 実装範囲**:`scope { spawn f(…); }`(終端で全 join)と `let t: Task = spawn f(…); t.join();`(named)。`join` は値を返さない(結果返しは §8 TBD)。
+- 共有可変状態:**`Atomic<T>` は確定済み(下記「Atomic<T>」)**。`Mutex<T>` / `Channel<T>` / スレッドをまたぐ共有所有 `Arc<T>` は §8 TBD。
+- 安全性:`&mut` を持てるスレッドは同時に1つ、という借用規則が競合を封じる。`&` 共有はスレッド安全な型に限る(`Sync` 相当・自動判定)。**`Atomic<T>` はこの `Sync` な型**であり、`&Atomic<T>` は複数スレッドが同時に持て、**`&` 共有のまま書き込める唯一の例外**。
 - バックエンド:C++=`std::thread`/atomics、WASM=スレッド+共有線形メモリ+atomics、
   JS=`SharedArrayBuffer`(線形メモリ全体)+Web Workers+`Atomics`(要 cross-origin isolation)。線形メモリ採用ゆえ3者に一様に乗る。
+
+### Atomic\<T\> — ロックフリー共有セル(確定)
+
+通常メモリのデータ競合はコンパイル時に禁止される(§0)。`Atomic<T>` は、メモリ安全(UB・torn read 無し)を保ったまま **データ競合自由だけ**を狭く外す唯一の口(例:Lazy SMP 並列探索の置換表を無同期で共有更新)。各アクセスはハードウェアの不可分命令なので、読めるのは常にその幅の妥当な値。失われ得るのは「上書きで消えた書き込み」だけ ── 呼び出し側が許容する論理。
+
+- **型**:`Atomic<T>`、`T` は word サイズ整数 **`u32` / `i32` / `u64` / `i64`** のみ(他はコンパイルエラー)。**非 Copy・非ムーブ**で、束縛・構造体フィールド・`Buffer` 要素としてその場に固定される。共有はすべて `&Atomic<T>` 経由で、セル中身への `&T` / `&mut T` は取得不可(触り方は下記メソッドのみ)。
+- **生成**:`Atomic.new(v: T): Atomic<T>`(`Buffer.shared` と同じ生成スタイル)。`Buffer<Atomic<T>>` も作れる(**ホスト/CPU のみ**。GPU/Metal では不可)。
+- **操作**(すべて `&Atomic<T>` レシーバ。通常の代入・読み出し構文では触れない):
+
+| 操作 | 意味 |
+|---|---|
+| `load(order): T` | 読み出し |
+| `store(value: T, order)` | 書き込み |
+| `fetchAdd(value: T, order): T` | 加算して **旧値** を返す |
+| `compareExchange(expected: T, desired: T, success, failure): bool` | 現在値が `expected` なら `desired` を書いて `true`、違えば `false` |
+
+- **メモリ順序** `Ordering`:`Relaxed` / `Acquire` / `Release` / `AcqRel`(**SeqCst は持たない**)。**既定値なし・呼び出しごとに明示必須**(§0「暗黙変換は無い」と一貫)。整合性検査:`load` に `Release`/`AcqRel` 不可、`store` に `Acquire`/`AcqRel` 不可、`compareExchange` の `failure` に `Release`/`AcqRel` 不可。order 引数はリテラルの `Ordering` 値のみ。
+- **層**:ホスト層(CPU)専用。カーネル内 `Atomic` は不可(§6・§7)。バックエンド:C++ `std::atomic<T>` / `std::memory_order_*`。
+
+```typescript
+function worker(c: Atomic<u32>, iters: u32) {
+  let i: u32 = 0;
+  while (i < iters) { c.fetchAdd(1, Relaxed); i = i + 1; }   // & 共有のまま書ける(Sync)
+}
+function main() {
+  let counter: Atomic<u32> = Atomic.new(0);
+  scope {
+    spawn worker(&counter, 100000);
+    spawn worker(&counter, 100000);
+  }                                          // 終端で全 join、借用返却
+  stdout.println(counter.load(Relaxed));     // 200000(競合下でも決定的)
+}
+```
+
+> `fetchAdd` は読み書き一体なので、論理的競合があっても合計は決定的になる。これが「データ競合自由を狭く外す」の意味。
 
 ## 6. デバイスとカーネル (Devices & Kernels)
 
@@ -245,7 +279,7 @@ job.await();          // 借用返却。UMA=フェンスのみ / discrete=コピ
 - **カーネル組込み**:`grid.{x,y,z}`、`local.{x,y,z}`、`barrier()`、ワークグループ共有 `shared [T; N]`。
 - **カーネル部分集合**:
   - 許可:スカラ/ベクタ演算、`struct`、固定長配列、分岐、有界ループ、`Buffer` 添字。
-  - 禁止:再帰・動的確保・クロージャ・ホストデータ参照・I/O・所有ヒープ型。
+  - 禁止:再帰・動的確保・クロージャ・ホストデータ参照・I/O・所有ヒープ型・**`Atomic` / 共有可変状態**(GPU アトミックは TBD。将来 UMA バックエンドごとに atomic 命令の写し方が変わりうる)。
 
 ## 7. 文法 (EBNF, 抜粋)
 
@@ -286,8 +320,9 @@ Type       = Scalar | Vector | Ident [ "<" Type { "," Type } ">" ]
            | "&" Type | "&mut" Type | Type "?" ;
 Vector     = Scalar "x" Int ;
 
-Expr       = (* 優先順位つき二項/単項、as / as? キャスト、呼び出し、
-                添字、フィールド/メソッド、リテラル。クロージャは無し *) ;
+Expr       = (* 優先順位つき二項/単項、as / as? キャスト、呼び出し、添字、
+                フィールド/メソッド、リテラル、`spawn` 前置(関数呼び出し→`Task`。
+                `let t: Task = spawn f(…)` で束縛可)。クロージャは無し *) ;
 ```
 
 ## 8. 未確定 (TBD)
@@ -295,4 +330,4 @@ Expr       = (* 優先順位つき二項/単項、as / as? キャスト、呼び
 - 生存期間注釈の文面、借用検査の完全形。
 - モジュール / `import` の解決規則とコンパイル単位。
 - `Job` の依存関係・複数同時起動 API。
-- 並行性:アトミックのメモリ順序、`Sync` / `Send` 相当の表面構文、`Arc` / `Channel` / `Mutex` の API 詳細。
+- 並行性:`Sync` / `Send` 相当の表面構文、`Arc` / `Channel` / `Mutex` の API 詳細、`Atomic` の `SeqCst` と結果返し `join`、カーネル内 atomic。(`Atomic<T>` のメモリ順序と基本 API・`scope`/`spawn`/`join` の最小実装は §5 で確定済み。)

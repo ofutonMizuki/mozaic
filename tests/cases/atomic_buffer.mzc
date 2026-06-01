@@ -1,0 +1,21 @@
+// Buffer<Atomic<T>>: the transposition-table shape. Each cell is independently atomic.
+// CPU-only (Atomic is host-layer); building this with --gpu is a compile error.
+function adder(b: Buffer<Atomic<u32>>, slot: u32, iters: u32) {
+  let i: u32 = 0;
+  while (i < iters) {
+    b[slot].fetchAdd(1, Relaxed);
+    i = i + 1;
+  }
+}
+
+function main() {
+  let n: u32 = 2;
+  let b: Buffer<Atomic<u32>> = Buffer.shared(n);
+  scope {
+    spawn adder(&b, 0, 50000);
+    spawn adder(&b, 0, 50000);
+    spawn adder(&b, 1, 30000);
+  }
+  stdout.println(b[0].load(Relaxed));   // 100000
+  stdout.println(b[1].load(Relaxed));   // 30000
+}

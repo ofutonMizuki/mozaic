@@ -1,12 +1,17 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, isInt, isFloat, unifyInt, unifyFloat, bufferElem, isStdinLines, isBufferNew,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, unifyInt, unifyFloat,
+  bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
 // borrow = device sync: a buffer borrowed by an in-flight Job (between dev.launch and
 // job.await) cannot be touched by the host. & = shared (CPU reads still OK), &mut = exclusive.
+// The same machinery backs spawn/scope/join: a task holds its &/&mut args until it joins.
 type Borrow = { mut: boolean; job: string };
+
+// Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
+const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
 
 class Checker {
   errs: string[] = [];
@@ -17,8 +22,26 @@ class Checker {
   enums = new Map<string, Map<string, string[]>>();
   variants = new Map<string, VarInfo>();
   curRet = "unit";
-  borrows = new Map<string, Borrow>();   // buffer name -> in-flight borrow (per function)
+  borrows = new Map<string, Borrow>();   // buffer/atomic name -> in-flight borrow (per function)
   suppressBufRead: string | null = null;  // the lvalue buffer of the current Assign (write, not read)
+  inKernel = false;                        // checking a kernel body? (Atomic is banned there)
+  tasks = new Map<string, { joined: boolean }>();  // named spawn Tasks -> joined yet? (per function)
+  scopeStack: string[] = [];               // active scope ids (bare spawns join at scope end)
+  scopeCount = 0;
+  target: "cpu" | "metal" = "cpu";         // emit target (Buffer<Atomic<T>> is CPU-only)
+  // Does a type transitively contain an Atomic? (uses the registered struct field types)
+  hasAtomic(t: string): boolean {
+    const sf = new Map<string, string[]>();
+    for (const [n, fm] of this.structs) sf.set(n, [...fm.values()]);
+    return containsAtomic(t, sf);
+  }
+  // Message if a type carries an Atomic<T> with an illegal T (else null).
+  badAtomicElem(t: string): string | null {
+    const ae = atomicElem(t);
+    if (ae !== null && !ATOMIC_INTS.includes(ae)) return `Atomic<${ae}>: T must be one of u32, i32, u64, i64`;
+    const be = bufferElem(t);
+    return be !== null ? this.badAtomicElem(be) : null;
+  }
   accessBuf(name: string, write: boolean) {
     const b = this.borrows.get(name);
     if (!b) return;
@@ -40,6 +63,65 @@ class Checker {
       else this.borrows.set(name, { mut: a.mut, job });
     });
   }
+  // spawn f(args): validate like a call; by-ref params (Buffer / atomic-containing) must be borrowed.
+  checkSpawnArgs(call: Extract<Expr, { kind: "Call" }>) {
+    if (call.callee.kind !== "Ident" || !this.fns.has(call.callee.name)) { this.err("spawn requires a call to a named function"); return; }
+    const sig = this.fns.get(call.callee.name)!;
+    if (call.args.length !== sig.params.length) this.err(`spawn '${call.callee.name}': expected ${sig.params.length} arg(s), got ${call.args.length}`);
+    for (let k = 0; k < call.args.length; k++) {
+      const a = call.args[k], p = sig.params[k];
+      const at = this.checkExpr(a);
+      if (!p) continue;
+      const byRef = bufferElem(p.ty) !== null || this.hasAtomic(p.ty);
+      if (byRef) {
+        if (a.kind !== "Borrow" || a.expr.kind !== "Ident") this.err(`spawn arg ${k + 1}: '${p.name}' must be borrowed (&${p.name} or &mut ${p.name})`);
+      } else if (a.kind === "Borrow") this.err(`spawn arg ${k + 1}: scalar '${p.name}' must not be borrowed`);
+      if (!this.assignable(at, p.ty)) this.err(`spawn arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
+    }
+  }
+  // A task holds its &/&mut args until it joins (job = task name, or the scope id for bare spawns).
+  // & of an atomic-containing type is Sync: multiple concurrent shared borrows are allowed.
+  registerSpawnBorrows(call: Extract<Expr, { kind: "Call" }>, job: string) {
+    if (call.callee.kind !== "Ident") return;
+    const sig = this.fns.get(call.callee.name);
+    if (!sig) return;
+    call.args.forEach((a, k) => {
+      const p = sig.params[k];
+      if (!p || (bufferElem(p.ty) === null && !this.hasAtomic(p.ty))) return;
+      if (a.kind !== "Borrow" || a.expr.kind !== "Ident") return;
+      const name = a.expr.name;
+      const existing = this.borrows.get(name);
+      if (existing) { if (existing.mut || a.mut) this.err(`'${name}' is already borrowed in-flight; await/join before borrowing again`); }
+      else this.borrows.set(name, { mut: a.mut, job });
+    });
+  }
+  // Atomic ops (load/store/fetchAdd/compareExchange): arg types vs T, and order/method compatibility.
+  checkAtomicMethod(e: Extract<Expr, { kind: "Call" }>, t: string): string {
+    const m = (e.callee as Extract<Expr, { kind: "Member" }>).prop;
+    const order = (a: Expr | undefined, allowed: string[], label: string) => {
+      if (!a || a.kind !== "Ident" || !ORDERINGS.has(a.name)) this.err(`${label} order must be a literal Ordering variant (Relaxed/Acquire/Release/AcqRel)`);
+      else if (!allowed.includes(a.name)) this.err(`${label} order must be one of ${allowed.join(", ")} (got ${a.name})`);
+    };
+    const val = (a: Expr | undefined, k: number) => { if (a) { const at = this.checkExpr(a); if (!this.assignable(at, t)) this.err(`atomic ${m} arg ${k}: cannot pass ${at} as ${t}`); } };
+    switch (m) {
+      case "load":
+        if (e.args.length !== 1) this.err("load(order) takes 1 argument"); else order(e.args[0], ["Relaxed", "Acquire"], "load's");
+        return (e.ty = t);
+      case "store":
+        if (e.args.length !== 2) this.err("store(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Release"], "store's"); }
+        return (e.ty = "unit");
+      case "fetchAdd":
+        if (e.args.length !== 2) this.err("fetchAdd(value, order) takes 2 arguments"); else { val(e.args[0], 1); order(e.args[1], ["Relaxed", "Acquire", "Release", "AcqRel"], "fetchAdd's"); }
+        return (e.ty = t);
+      case "compareExchange":
+        if (e.args.length !== 4) this.err("compareExchange(expected, desired, success, failure) takes 4 arguments");
+        else { val(e.args[0], 1); val(e.args[1], 2); order(e.args[2], ["Relaxed", "Acquire", "Release", "AcqRel"], "compareExchange success"); order(e.args[3], ["Relaxed", "Acquire"], "compareExchange failure"); }
+        return (e.ty = "bool");
+      default:
+        this.err(`unknown atomic method '${m}' (use load / store / fetchAdd / compareExchange)`);
+        return (e.ty = "unit");
+    }
+  }
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
   define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, t); }
@@ -50,6 +132,8 @@ class Checker {
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
+    if (t === "Task") return true;                    // spawn handle
+    if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
     const be = bufferElem(t);
     return be !== null && this.typeKnown(be);
   }
@@ -72,19 +156,32 @@ class Checker {
       this.enums.set(it.name, vm);
     }
     for (const it of p.items) if (it.kind === "StructDecl")
-      for (const f of it.fields) if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
+      for (const f of it.fields) {
+        if (!this.typeKnown(f.ty)) this.err(`unknown type '${f.ty}' for field '${it.name}.${f.name}'`);
+        const bad = this.badAtomicElem(f.ty); if (bad) this.err(`${bad} (field '${it.name}.${f.name}')`);
+      }
     for (const it of p.items) if (it.kind === "EnumDecl")
-      for (const v of it.variants) for (const pt of v.payload) if (!this.typeKnown(pt)) this.err(`unknown type '${pt}' in variant '${v.name}'`);
+      for (const v of it.variants) for (const pt of v.payload) {
+        if (!this.typeKnown(pt)) this.err(`unknown type '${pt}' in variant '${v.name}'`);
+        if (this.hasAtomic(pt)) this.err(`Atomic is not allowed in enum payloads (variant '${v.name}')`);
+      }
     for (const it of p.items) if (it.kind === "KernelDecl") {
       if (this.kernels.has(it.name)) this.err(`duplicate kernel '${it.name}'`);
       this.kernels.set(it.name, it.params);
-      for (const pa of it.params) if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
+      for (const pa of it.params) {
+        if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
+        if (this.hasAtomic(pa.ty)) this.err(`Atomic is not supported inside a kernel (parameter '${pa.name}')`);
+      }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
       if (this.fns.has(it.name)) this.err(`duplicate function '${it.name}'`);
       this.fns.set(it.name, { params: it.params, retTy: it.retTy });
-      for (const pa of it.params) if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}'`);
+      for (const pa of it.params) {
+        if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}'`);
+        const bad = this.badAtomicElem(pa.ty); if (bad) this.err(`${bad} (parameter '${pa.name}')`);
+      }
       if (it.retTy && !this.typeKnown(it.retTy)) this.err(`unknown return type '${it.retTy}' for '${it.name}'`);
+      if (it.retTy && this.hasAtomic(it.retTy)) this.err(`'${it.name}': cannot return an atomic-containing type by value`);
     }
     if (!this.fns.has("main")) this.err("no `main` function");
     const main = this.fns.get("main");
@@ -93,9 +190,13 @@ class Checker {
       this.push();
       this.curRet = (it.kind === "FnDecl" ? it.retTy : null) ?? "unit";
       this.borrows = new Map();
+      this.tasks = new Map();
+      this.inKernel = it.kind === "KernelDecl";
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
-      for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await the job before it goes out of scope`);
+      for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
+      for (const [name, t] of this.tasks) if (!t.joined) this.err(`'${name}' is a Task that was never joined; join it before it goes out of scope`);
+      this.inKernel = false;
       this.pop();
     }
   }
@@ -107,20 +208,41 @@ class Checker {
         const vt = this.checkExpr(s.value);
         let declTy: string;
         if (s.annot) {
+          const bad = this.badAtomicElem(s.annot);
           if (!this.typeKnown(s.annot)) { this.err(`unknown type '${s.annot}'`); declTy = "i32"; }
+          else if (bad) { this.err(`${bad} ('${s.name}')`); declTy = s.annot; }
           else if (!this.assignable(vt, s.annot)) { this.err(`type mismatch: cannot init '${s.name}: ${s.annot}' with ${vt}`); declTy = s.annot; }
           else declTy = s.annot;
         } else {
           if (vt === "buffernew") { this.err(`'${s.name}': Buffer.shared needs a type annotation (e.g. : Buffer<f32>)`); declTy = "i32"; }
+          else if (vt === "atomicnew") { this.err(`'${s.name}': Atomic.new needs a type annotation (e.g. : Atomic<u64>)`); declTy = "i32"; }
+          else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
           else { declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
             if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
         this.define(s.name, declTy);
+        // Atomic<T>: validate the initial value against T.
+        const ael = atomicElem(declTy);
+        if (ael !== null && isAtomicNew(s.value)) {
+          const arg = (s.value as Extract<Expr, { kind: "Call" }>).args[0];
+          if (arg && !this.assignable(arg.ty ?? "unit", ael)) this.err(`Atomic.new: cannot init Atomic<${ael}> with ${arg.ty}`);
+        }
+        // Buffer<Atomic<...>> is CPU-only (the Metal buffer is raw bytes; std::atomic can't alias it).
+        if (this.target === "metal" && bufferElem(declTy) !== null && this.hasAtomic(declTy))
+          this.err(`Buffer<Atomic<...>> is not supported on the GPU/Metal target (Atomic is host-only)`);
+        // atomic-containing values are non-copyable/non-movable: only fresh construction or & sharing.
+        if (this.hasAtomic(declTy) && !isAtomicNew(s.value) && !isBufferNew(s.value) && s.value.kind !== "StructLit")
+          this.err(`'${s.name}': atomic-containing values cannot be copied or moved (construct in place, or share via &Atomic)`);
         // `let job = dev.launch(...)` borrows its buffer args until job.await()
         if (declTy === "Job" && s.value.kind === "Call" &&
             s.value.callee.kind === "Member" && s.value.callee.prop === "launch")
           this.registerBorrows(s.value, s.name);
+        // `let t: Task = spawn f(...)` holds its &/&mut args until t.join()
+        if (declTy === "Task" && s.value.kind === "SpawnExpr" && s.value.call.kind === "Call") {
+          this.tasks.set(s.name, { joined: false });
+          this.registerSpawnBorrows(s.value.call, s.name);
+        }
         break;
       }
       case "Assign": {
@@ -130,6 +252,7 @@ class Checker {
         }
         const tt = this.checkExpr(s.target);
         this.suppressBufRead = null;
+        if (this.hasAtomic(tt)) { this.err(`cannot assign to an Atomic; use .store(value, order)`); break; }
         const vt = this.checkExpr(s.value);
         if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
         break;
@@ -180,11 +303,29 @@ class Checker {
         break;
       }
       case "Break": case "Continue": break;
+      case "Scope": {
+        const sid = "scope#" + (this.scopeCount++);   // bare spawns inside join here
+        this.scopeStack.push(sid);
+        this.push();
+        for (const st of s.body) this.checkStmt(st);
+        this.pop();
+        this.scopeStack.pop();
+        for (const [name, b] of [...this.borrows]) if (b.job === sid) this.borrows.delete(name);
+        break;
+      }
       case "ExprStmt": {
         this.checkExpr(s.expr);
-        const e = s.expr;   // job.await() returns the borrows held by that job
-        if (e.kind === "Call" && e.callee.kind === "Member" && e.callee.prop === "await" && e.callee.obj.kind === "Ident") {
+        const e = s.expr;
+        // a bare `spawn f(...)` (not bound to a Task) must live in a scope; it joins at scope end.
+        if (e.kind === "SpawnExpr") {
+          if (this.scopeStack.length === 0) this.err("a bare `spawn` must be inside a scope { } (or bind it: let t: Task = spawn ...)");
+          else if (e.call.kind === "Call") this.registerSpawnBorrows(e.call, this.scopeStack[this.scopeStack.length - 1]);
+        }
+        // job.await() / task.join() return the borrows held by that job/task.
+        if (e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" &&
+            (e.callee.prop === "await" || e.callee.prop === "join")) {
           const job = e.callee.obj.name;
+          if (e.callee.prop === "join") { const t = this.tasks.get(job); if (t) t.joined = true; }
           for (const [name, b] of [...this.borrows]) if (b.job === job) this.borrows.delete(name);
         }
         break;
@@ -193,6 +334,7 @@ class Checker {
   }
   assignable(vt: string, tt: string): boolean {
     if (vt === "buffernew" && bufferElem(tt) !== null) return true;
+    if (vt === "atomicnew" && atomicElem(tt) !== null) return true;
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
     return vt === tt;
@@ -205,6 +347,7 @@ class Checker {
       case "Ident": {
         const t = this.lookup(e.name);
         if (t) { e.ty = t; return t; }
+        if (ORDERINGS.has(e.name)) { e.ty = "Ordering"; return e.ty; }
         const v = this.variants.get(e.name);
         if (v && v.payload.length === 0) { e.ty = v.enumName; return e.ty; }
         this.err(`undefined variable '${e.name}'`); e.ty = "i32"; return e.ty;
@@ -273,6 +416,12 @@ class Checker {
           if (e.args.length === 1) { if (!isInt(this.checkExpr(e.args[0]))) this.err("Buffer.shared(n): n must be an integer"); }
           else this.err("Buffer.shared takes one argument");
           e.ty = "buffernew"; return e.ty;
+        }
+        if (isAtomicNew(e)) {
+          if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
+          if (e.args.length === 1) this.checkExpr(e.args[0]);
+          else this.err("Atomic.new takes one argument (the initial value)");
+          e.ty = "atomicnew"; return e.ty;
         }
         // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
         if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
@@ -348,15 +497,35 @@ class Checker {
             e.ty = "unit"; return e.ty;
           }
         }
+        // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), and task.join().
+        if (e.callee.kind === "Member") {
+          const recvTy = this.checkExpr(e.callee.obj);
+          const ae = atomicElem(recvTy);
+          if (ae !== null) {
+            if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
+            return this.checkAtomicMethod(e, ae);
+          }
+          if (recvTy === "Task" && e.callee.prop === "join") {
+            if (e.args.length) this.err("join() takes no arguments");
+            e.ty = "unit"; return e.ty;
+          }
+        }
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;
       }
       case "Borrow": {
         const it = this.checkExpr(e.expr);
-        if (bufferElem(it) === null) this.err(`'&' borrow is only for Buffer arguments to dev.launch (got ${it})`);
+        if (bufferElem(it) === null && !this.hasAtomic(it)) this.err(`'&' borrow is only for Buffer or Atomic arguments (got ${it})`);
         e.ty = it; return e.ty;
+      }
+      case "SpawnExpr": {
+        if (this.inKernel) this.err("spawn is not allowed inside a kernel");
+        if (e.call.kind === "Call") this.checkSpawnArgs(e.call);
+        else this.err("spawn requires a function call");
+        e.ty = "Task"; return e.ty;
       }
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
+        if (this.hasAtomic(lt) || this.hasAtomic(rt)) { this.err(`Atomic can only be accessed via load/store/fetchAdd/compareExchange (not used as a value)`); e.ty = "i32"; return e.ty; }
         if (ARITH_OPS.includes(e.op)) {
           const intOnly = e.op.length === 2 || e.op === "%";
           if ((isFloat(lt) || isFloat(rt)) && !intOnly) {
@@ -385,8 +554,9 @@ class Checker {
   }
 }
 
-export function check(prog: Program): string[] {
+export function check(prog: Program, target: "cpu" | "metal" = "cpu"): string[] {
   const c = new Checker();
+  c.target = target;
   c.checkProgram(prog);
   return c.errs;
 }

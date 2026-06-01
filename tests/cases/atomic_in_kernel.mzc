@@ -1,0 +1,7 @@
+// Negative: Atomic is host-only; GPU/kernel atomics are out of scope.
+kernel bad(a: Atomic<u32>) {
+  let i: u32 = grid.x;
+}
+function main() {
+  stdout.println(1);
+}

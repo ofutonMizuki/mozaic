@@ -169,7 +169,9 @@ struct MetalDispatch {
 template <class T> struct Buffer {
   std::vector<T> data;
   uint32_t len;
-  Buffer(uint32_t n) : data(n, T()), len(n) {}
+  // value-init each element (C++20 zero-inits scalars AND std::atomic). NOT data(n, T()):
+  // the copy-fill form requires T copyable, which std::atomic (Buffer<Atomic<...>>) is not.
+  Buffer(uint32_t n) : data(n), len(n) {}
   T& operator[](uint32_t i) { return data[i]; }
   const T& operator[](uint32_t i) const { return data[i]; }
 };

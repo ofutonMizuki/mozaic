@@ -106,6 +106,7 @@ export class Parser {
     if (t === "while") return this.parseWhile();
     if (t === "if") return this.parseIf();
     if (t === "match") return this.parseMatch();
+    if (t === "scope") return this.parseScope();
     if (t === "let" || t === "const") return this.parseLet();
     if (t === "return") {
       this.next();
@@ -142,6 +143,10 @@ export class Parser {
     const cond = this.parseExpr();
     this.eat(")");
     return { kind: "While", cond, body: this.parseBlock() };
+  }
+  parseScope(): Stmt {
+    this.eat("scope");
+    return { kind: "Scope", body: this.parseBlock() };
   }
   parseFor(): Stmt {
     this.eat("for"); this.eat("(");
@@ -236,6 +241,12 @@ export class Parser {
   }
   parsePrimary(): Expr {
     const tk = this.peek();
+    if (tk.t === "spawn") {
+      this.next();
+      const call = this.parsePostfix();   // spawn f(args...) — launch-shaped: function + args, no closure
+      if (call.kind !== "Call") throw new Error(`parse error: 'spawn' requires a function call at ${tk.pos}`);
+      return { kind: "SpawnExpr", call };
+    }
     if (tk.t === "num") { this.next(); return { kind: "Num", value: tk.v }; }
     if (tk.t === "fnum") { this.next(); return { kind: "Float", value: tk.v }; }
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }

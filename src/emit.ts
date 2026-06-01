@@ -1,12 +1,35 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, bufferElem, cppType, ARITH_FN, isBufferNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, bufferElem, atomicElem, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
+let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
 let VARIANTS = new Map<string, VarInfo>();
 let KERNELS = new Map<string, Param[]>();
+let FN_PARAMS = new Map<string, Param[]>();              // fn name -> params (to decide std::ref in spawn)
 let TARGET: "cpu" | "metal" = "cpu";
 let matchCounter = 0;
+let scopeCounter = 0;
+const scopeVarStack: string[] = [];                      // current scope's std::thread vector name
+
+// Memory orderings lower to std::memory_order_* (SPEC §5). A bare Ordering ident emits the constant.
+const ORDER_CPP: Record<string, string> = {
+  Relaxed: "std::memory_order_relaxed", Acquire: "std::memory_order_acquire",
+  Release: "std::memory_order_release", AcqRel: "std::memory_order_acq_rel",
+};
+function hasAtomic(t: string): boolean { return containsAtomic(t, STRUCT_FIELD_TYPES); }
+// spawn f(args): the fn name + each arg, wrapping by-reference params (Buffer / atomic-containing) in std::ref.
+function spawnCallParts(call: Extract<Expr, { kind: "Call" }>): { fn: string; args: string[] } {
+  const fn = (call.callee as Extract<Expr, { kind: "Ident" }>).name;
+  const params = FN_PARAMS.get(fn) ?? [];
+  const args = call.args.map((a, i) => {
+    const p = params[i];
+    const byRef = p && (bufferElem(p.ty) !== null || hasAtomic(p.ty));
+    const code = emitExpr(a);   // &x / &mut x already lower to the underlying lvalue
+    return byRef ? `std::ref(${code})` : code;
+  });
+  return { fn, args };
+}
 
 // ---- kernel argument binding layout (shared by the MSL emitter and the host launch) ----
 // Params occupy MSL buffer indices 0..P-1 in declaration order (a Buffer<T> is a
@@ -63,6 +86,7 @@ function emitExpr(e: Expr): string {
     case "Float": return e.value;
     case "Str": return cstr(e.value);
     case "Ident": {
+      if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
       const v = VARIANTS.get(e.name);
       if (v && v.payload.length === 0) return `${v.enumName}{ .tag = ${v.index} }`;
       return e.name;
@@ -73,10 +97,18 @@ function emitExpr(e: Expr): string {
       return `${emitExpr(e.obj)}.${e.prop}`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
+    case "SpawnExpr": throw new Error("spawn must be a statement, or `let t: Task = spawn f(...)`");
     case "StructLit": {
       const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
+      const ftypes = STRUCT_FIELD_TYPES.get(e.name) ?? [];
       const byName = new Map(e.fields.map((f) => [f.name, f.value]));
-      const vals = order.map((fn) => { const v = byName.get(fn); return v ? emitExpr(v) : "{}"; });
+      const vals = order.map((fn, i) => {
+        const v = byName.get(fn);
+        if (!v) return "{}";
+        const ae = ftypes[i] ? atomicElem(ftypes[i]) : null;   // an Atomic field is brace-inited in place (non-movable)
+        if (ae !== null && isAtomicNew(v)) return `std::atomic<${cppType(ae)}>{ ${emitExpr((v as Extract<Expr, { kind: "Call" }>).args[0])} }`;
+        return emitExpr(v);
+      });
       return `${e.name}{ ${vals.join(", ")} }`;
     }
     case "Binary": {
@@ -132,6 +164,17 @@ function emitExpr(e: Expr): string {
           return `mz::println(${emitExpr(a)})`;
         }
       }
+      // atomic methods on an Atomic<T> receiver (the checker stamped obj.ty). Never lower to a plain int.
+      if (e.callee.kind === "Member" && e.callee.obj.ty && atomicElem(e.callee.obj.ty) !== null) {
+        const recv = emitExpr(e.callee.obj), m = e.callee.prop;
+        const a = e.args.map(emitExpr);   // order idents emit as std::memory_order_*
+        const T = cppType(atomicElem(e.callee.obj.ty)!);
+        if (m === "load") return `${recv}.load(${a[0]})`;
+        if (m === "store") return `${recv}.store(${a[0]}, ${a[1]})`;
+        if (m === "fetchAdd") return `${recv}.fetch_add(${a[0]}, ${a[1]})`;
+        if (m === "compareExchange") return `([&]{ ${T} _exp = (${T})(${a[0]}); return ${recv}.compare_exchange_strong(_exp, ${a[1]}, ${a[2]}, ${a[3]}); }())`;
+      }
+      if (isAtomicNew(e)) throw new Error("Atomic.new must directly initialize a binding or struct field");
       return `${emitExpr(e.callee)}(${e.args.map(emitExpr).join(", ")})`;
     }
   }
@@ -157,6 +200,14 @@ function emitMatch(s: Extract<Stmt, { kind: "Match" }>, ind: string, ctx: string
 function emitStmt(s: Stmt, ind: string, ctx: string): string {
   switch (s.kind) {
     case "Let":
+      if (isAtomicNew(s.value)) {   // brace direct-init: std::atomic is non-copyable/non-movable
+        const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
+        return `${ind}${cppType(s.declTy!)} ${s.name}{ ${arg} };`;
+      }
+      if (s.value.kind === "SpawnExpr" && s.value.call.kind === "Call") {   // named task -> std::thread
+        const { fn, args } = spawnCallParts(s.value.call);
+        return `${ind}std::thread ${s.name}(${[fn, ...args].join(", ")});`;
+      }
       if (isBufferNew(s.value)) {
         const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
         return `${ind}${cppType(s.declTy!)} ${s.name} = ${cppType(s.declTy!)}(${arg});`;
@@ -183,12 +234,24 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
       return s.value ? `${ind}return ${emitExpr(s.value)};` : `${ind}return;`;
     case "Break": return `${ind}break;`;
     case "Continue": return `${ind}continue;`;
-    case "ExprStmt": return `${ind}${emitExpr(s.expr)};`;
+    case "Scope": {
+      const sv = `_sc${scopeCounter++}`;       // bare spawns inside push into this; all joined at end
+      scopeVarStack.push(sv);
+      const body = s.body.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n");
+      scopeVarStack.pop();
+      return `${ind}{\n${ind}  std::vector<std::thread> ${sv};\n${body}\n${ind}  for (auto& _t : ${sv}) _t.join();\n${ind}}`;
+    }
+    case "ExprStmt":
+      if (s.expr.kind === "SpawnExpr" && s.expr.call.kind === "Call") {   // bare spawn -> scope's thread vector
+        const { fn, args } = spawnCallParts(s.expr.call);
+        return `${ind}${scopeVarStack[scopeVarStack.length - 1]}.emplace_back(${[fn, ...args].join(", ")});`;
+      }
+      return `${ind}${emitExpr(s.expr)};`;
   }
 }
 
 function emitParam(p: Param): string {
-  return bufferElem(p.ty) !== null ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
+  return (bufferElem(p.ty) !== null || hasAtomic(p.ty)) ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
 }
 function emitFn(fn: FnDecl): string {
   const body = fn.body.map((s) => emitStmt(s, "  ", fn.name === "main" ? "main" : (fn.retTy ? "value" : "void"))).join("\n");
@@ -214,7 +277,9 @@ function mslType(t: string): string {
     case "intlit": return "int";
     case "f16": return "half"; case "f32": return "float"; case "f64": return "float"; case "floatlit": return "float";
     case "bool": return "bool";
-    default: return t;   // user struct types map to their own name (must be MSL-compatible)
+    default:
+      if (atomicElem(t) !== null) throw new Error("kernel: Atomic is not supported (GPU atomics are out of scope)");
+      return t;   // user struct types map to their own name (must be MSL-compatible)
   }
 }
 // wrapping/saturating arithmetic collapse to the native operator (GPU ints wrap; saturation TBD)
@@ -238,6 +303,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     }
     case "Str": throw new Error("kernel: strings are not allowed");
     case "Borrow": throw new Error("kernel: '&' borrows are not allowed");
+    case "SpawnExpr": throw new Error("kernel: 'spawn' is not allowed");
     case "Call": throw new Error("kernel: function/variant calls are not allowed (M-stage)");
     case "StructLit": {
       const order = STRUCT_FIELDS.get(e.name) ?? e.fields.map((f) => f.name);
@@ -265,7 +331,7 @@ function emitMslStmt(s: Stmt, ind: string, bufs: Set<string>): string {
     case "Break": return `${ind}break;`;
     case "Continue": return `${ind}continue;`;
     case "ExprStmt": return `${ind}${emitMslExpr(s.expr, bufs)};`;
-    case "Match": case "ForOf": throw new Error(`kernel: '${s.kind}' is not supported`);
+    case "Match": case "ForOf": case "Scope": throw new Error(`kernel: '${s.kind}' is not supported`);
   }
 }
 function emitMslKernel(k: KernelDecl): string {
@@ -296,15 +362,19 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const fns = prog.items.filter((it): it is FnDecl => it.kind === "FnDecl");
 
   STRUCT_FIELDS = new Map();
+  STRUCT_FIELD_TYPES = new Map();
   VARIANTS = new Map();
   KERNELS = new Map();
+  FN_PARAMS = new Map();
   TARGET = target;
   matchCounter = 0;
+  scopeCounter = 0;
   for (const it of types) {
-    if (it.kind === "StructDecl") STRUCT_FIELDS.set(it.name, it.fields.map((f) => f.name));
+    if (it.kind === "StructDecl") { STRUCT_FIELDS.set(it.name, it.fields.map((f) => f.name)); STRUCT_FIELD_TYPES.set(it.name, it.fields.map((f) => f.ty)); }
     else it.variants.forEach((v, idx) => VARIANTS.set(v.name, { enumName: it.name, index: idx, payload: v.payload }));
   }
   for (const k of kernels) KERNELS.set(k.name, k.params);
+  for (const f of fns) FN_PARAMS.set(f.name, f.params);
 
   const typeDecls = types.map(emitTypeDecl).join("\n");
   // Metal: kernels become MSL source strings (compiled at runtime); no C++ kernel fn/proto.
@@ -312,12 +382,17 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const mslDecls = target === "metal"
     ? kernels.map((k) => `static const char* _msl_${k.name} = R"MSL(\n${emitMslKernel(k)}\n)MSL";`).join("\n\n")
     : "";
-  const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + (bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty))).join("")});`).join("\n");
-  const fnProtos = fns.filter((f) => f.name !== "main").map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map((p) => bufferElem(p.ty) !== null ? cppType(p.ty) + "&" : cppType(p.ty)).join(", ")});`).join("\n");
+  const byRefTy = (p: Param) => (bufferElem(p.ty) !== null || hasAtomic(p.ty)) ? cppType(p.ty) + "&" : cppType(p.ty);
+  const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + byRefTy(p)).join("")});`).join("\n");
+  const fnProtos = fns.filter((f) => f.name !== "main").map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map(byRefTy).join(", ")});`).join("\n");
   const protos = [kernelProtos, fnProtos].filter((s) => s).join("\n");
   const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.map(emitFn)].join("\n\n");
+  // Pull in <atomic> / <thread> only when the program actually uses them (the emitted code names them).
+  const allCode = typeDecls + mslDecls + protos + defs;
+  const sysIncludes = (allCode.includes("std::atomic") ? "#include <atomic>\n" : "") +
+                      (allCode.includes("std::thread") ? "#include <thread>\n" : "");
   return `// generated by mozaic (M0)${target === "metal" ? " [Metal/MSL backend]" : ""}
-#include "mozaic_rt.h"
+${sysIncludes}#include "mozaic_rt.h"
 
 ${typeDecls ? typeDecls + "\n\n" : ""}${mslDecls ? mslDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
 `;

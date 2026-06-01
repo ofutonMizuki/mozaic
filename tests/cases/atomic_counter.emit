@@ -1,0 +1,6 @@
+#include <atomic>
+#include <thread>
+std::atomic<uint32_t>
+std::thread
+std::ref(counter)
+.fetch_add(1, std::memory_order_relaxed)

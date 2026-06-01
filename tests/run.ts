@@ -31,6 +31,19 @@ for (const f of cases) {
     }
     continue;
   }
+  // Emit-content assertion: a <name>.emit file lists substrings the generated C++ MUST contain.
+  // Used to prove Atomic lowers to real std::atomic / memory_order (never a plain integer).
+  const emitFile = join(casesDir, name + ".emit");
+  if (existsSync(emitFile)) {
+    const wants = readFileSync(emitFile, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
+    try {
+      const cpp = execFileSync("node", ["--disable-warning=ExperimentalWarning", compiler, "emit", moz], { encoding: "utf8" });
+      const missing = wants.filter((w) => !cpp.includes(w));
+      if (missing.length) { console.log(`FAIL ${name} (emit) missing: ${JSON.stringify(missing)}`); fail++; continue; }
+    } catch (e) {
+      console.log(`FAIL ${name} (emit threw: ${String((e as Error).message).split("\n")[0]})`); fail++; continue;
+    }
+  }
   const input = existsSync(join(casesDir, name + ".in")) ? readFileSync(join(casesDir, name + ".in"), "utf8") : "";
   const expected = existsSync(join(casesDir, name + ".out")) ? readFileSync(join(casesDir, name + ".out"), "utf8") : "";
   try {

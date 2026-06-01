@@ -1,0 +1,21 @@
+// Structured concurrency, named-Task form: `let t: Task = spawn f(...); t.join();`.
+// The &mut borrow is held by the task until join — touching `b` before join is a compile error.
+function fill(b: Buffer<u32>, v: u32) {
+  let i: u32 = 0;
+  while (i < b.len) {
+    b[i] = v;
+    i = i + 1;
+  }
+}
+
+function main() {
+  let n: u32 = 4;
+  let b: Buffer<u32> = Buffer.shared(n);
+  let t: Task = spawn fill(&mut b, 7);
+  t.join();                       // sync point: the &mut borrow returns here
+  let j: u32 = 0;
+  while (j < n) {
+    stdout.println(b[j]);         // 7 7 7 7
+    j = j + 1;
+  }
+}

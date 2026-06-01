@@ -1,7 +1,7 @@
 // Tokenizer.
 export type Tok = { t: string; v: string; pos: number };
 
-const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let", "mut"]);
+const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let", "mut", "scope", "spawn"]);
 
 export function lex(src: string): Tok[] {
   const toks: Tok[] = [];

@@ -1,0 +1,6 @@
+// Negative: Atomic is non-copyable/non-movable; share via &Atomic instead.
+function main() {
+  let a: Atomic<u32> = Atomic.new(0);
+  let b: Atomic<u32> = a;
+  stdout.println(b.load(Relaxed));
+}

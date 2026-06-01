@@ -1,0 +1,6 @@
+// Negative: an Atomic can only be touched via its methods, never used as a plain value.
+function main() {
+  let a: Atomic<u32> = Atomic.new(5);
+  let n: u32 = a + 1;
+  stdout.println(n);
+}

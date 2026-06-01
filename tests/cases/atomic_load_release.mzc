@@ -1,0 +1,6 @@
+// Negative: load may not take a Release/AcqRel ordering.
+function main() {
+  let a: Atomic<u32> = Atomic.new(0);
+  let x: u32 = a.load(Release);
+  stdout.println(x);
+}

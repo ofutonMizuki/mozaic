@@ -1,0 +1,15 @@
+// Atomic<T>: host-layer std::atomic. Single-threaded here — exercises the full API + codegen.
+// Build/run identically (CPU). The orderings are explicit (no implicit SeqCst default).
+function main() {
+  let a: Atomic<u32> = Atomic.new(40);
+  a.store(2, Release);
+  let old: u32 = a.fetchAdd(10, AcqRel);                       // old = 2, value now 12
+  stdout.println(old);                                         // 2
+  stdout.println(a.load(Acquire));                             // 12
+  let ok: bool = a.compareExchange(12, 100, AcqRel, Acquire);  // 12 == 12 -> swap, true
+  stdout.println(ok);                                          // true
+  stdout.println(a.load(Relaxed));                             // 100
+  let no: bool = a.compareExchange(12, 7, AcqRel, Acquire);    // 100 != 12 -> no swap, false
+  stdout.println(no);                                          // false
+  stdout.println(a.load(Relaxed));                             // 100
+}

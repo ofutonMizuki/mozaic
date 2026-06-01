@@ -1,0 +1,7 @@
+// Negative: a named Task must be joined before it goes out of scope.
+function work(n: u32) {
+  stdout.println(n);
+}
+function main() {
+  let t: Task = spawn work(5);
+}

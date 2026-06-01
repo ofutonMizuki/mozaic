@@ -1,0 +1,22 @@
+// The keystone of Atomic: a deterministic result under genuine multi-threaded contention.
+// 4 threads each fetchAdd 100000 times into ONE shared &Atomic<u32>. A plain int race would
+// under-count (lost updates); fetchAdd is read-modify-write atomic, so the total is always 400000.
+function worker(c: Atomic<u32>, iters: u32) {
+  let i: u32 = 0;
+  while (i < iters) {
+    c.fetchAdd(1, Relaxed);    // & shared, yet writable: the one "shared borrow that may write"
+    i = i + 1;
+  }
+}
+
+function main() {
+  let counter: Atomic<u32> = Atomic.new(0);
+  let iters: u32 = 100000;
+  scope {
+    spawn worker(&counter, iters);
+    spawn worker(&counter, iters);
+    spawn worker(&counter, iters);
+    spawn worker(&counter, iters);
+  }                                  // all four join here; the borrow returns
+  stdout.println(counter.load(Relaxed));   // 400000, deterministically
+}

@@ -1,0 +1,21 @@
+// An Atomic<T> as a struct field. The struct is non-copyable; it is shared by &.
+struct Counter {
+  hits: Atomic<u64>;
+}
+
+function bump(c: Counter, iters: u64) {
+  let i: u64 = 0;
+  while (i < iters) {
+    c.hits.fetchAdd(1, Relaxed);
+    i = i + 1;
+  }
+}
+
+function main() {
+  let c: Counter = Counter { hits: Atomic.new(0) };
+  scope {
+    spawn bump(&c, 25000);
+    spawn bump(&c, 25000);
+  }
+  stdout.println(c.hits.load(Relaxed));   // 50000
+}

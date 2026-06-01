@@ -20,6 +20,7 @@ export type Stmt =
   | { kind: "Return"; value: Expr | null }
   | { kind: "Break" }
   | { kind: "Continue" }
+  | { kind: "Scope"; body: Stmt[] }
   | { kind: "ExprStmt"; expr: Expr };
 export type Expr =
   | { kind: "Num"; value: string; ty?: string }
@@ -31,6 +32,7 @@ export type Expr =
   | { kind: "Call"; callee: Expr; args: Expr[]; ty?: string }
   | { kind: "StructLit"; name: string; fields: { name: string; value: Expr }[]; ty?: string }
   | { kind: "Borrow"; mut: boolean; expr: Expr; ty?: string }
+  | { kind: "SpawnExpr"; call: Expr; ty?: string }
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
 
 export type Sig = { params: Param[]; retTy: string | null };
@@ -43,6 +45,19 @@ export function isInt(t: string): boolean { return t === "intlit" || INTS.includ
 export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
 export function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
+export function atomicElem(t: string): string | null { return t.startsWith("Atomic<") && t.endsWith(">") ? t.slice(7, -1) : null; }
+export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T in Atomic<T>
+// Does a type transitively contain an Atomic? (Atomic itself / Buffer of atomic / struct with an atomic field.)
+// structFields maps a struct name -> its field type strings (built by check.ts and emit.ts).
+export function containsAtomic(t: string, structFields: Map<string, string[]>, seen = new Set<string>()): boolean {
+  if (atomicElem(t) !== null) return true;
+  const be = bufferElem(t);
+  if (be !== null) return containsAtomic(be, structFields, seen);
+  if (seen.has(t)) return false;
+  const fields = structFields.get(t);
+  if (fields) { seen.add(t); return fields.some((ft) => containsAtomic(ft, structFields, seen)); }
+  return false;
+}
 export function unifyInt(a: string, b: string): string | null {
   if (!isInt(a) || !isInt(b)) return null;
   if (a === "intlit") return b;
@@ -67,6 +82,8 @@ export function cppType(t: string): string {
     case "Job": return "mz::Job";
     case "Grid": return "mz::Grid";
     default: {
+      const ae = atomicElem(t);
+      if (ae !== null) return `std::atomic<${cppType(ae)}>`;
       const be = bufferElem(t);
       if (be !== null) return `mz::Buffer<${cppType(be)}>`;
       return t;   // user struct/enum types map to their own name
@@ -88,4 +105,8 @@ export function isStdinLines(e: Expr): boolean {
 export function isBufferNew(e: Expr): boolean {
   return e.kind === "Call" && e.callee.kind === "Member" &&
     e.callee.obj.kind === "Ident" && e.callee.obj.name === "Buffer" && e.callee.prop === "shared";
+}
+export function isAtomicNew(e: Expr): boolean {
+  return e.kind === "Call" && e.callee.kind === "Member" &&
+    e.callee.obj.kind === "Ident" && e.callee.obj.name === "Atomic" && e.callee.prop === "new";
 }

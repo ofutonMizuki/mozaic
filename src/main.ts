@@ -32,7 +32,7 @@ function main(): void {
   } catch (e) {
     return fail(String((e as Error).message));
   }
-  const errs = check(prog);
+  const errs = check(prog, metal ? "metal" : "cpu");
   if (errs.length) return fail(errs.map((m) => "error: " + m).join("\n"));
 
   const cpp = emit(prog, metal ? "metal" : "cpu");
@@ -52,6 +52,7 @@ function main(): void {
   const cxx = process.env.MZ_CXX || (platform() === "darwin" ? "clang++" : "g++");
   const flags = ["-std=c++20", "-O2", "-I", runtimeDir];
   if (release) flags.push("-DMZ_RELEASE");
+  if (!metal && platform() !== "darwin") flags.push("-pthread");   // std::thread (spawn) on Linux g++
   if (metal) flags.push("-DMZ_METAL", "-x", "objective-c++", "-fobjc-arc",
                         "-framework", "Metal", "-framework", "Foundation");
   if (process.env.MZ_CXXFLAGS) flags.push(...process.env.MZ_CXXFLAGS.split(/\s+/).filter(Boolean));

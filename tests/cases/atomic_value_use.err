@@ -1,0 +1,1 @@
+Atomic can only be accessed via load/store/fetchAdd/compareExchange

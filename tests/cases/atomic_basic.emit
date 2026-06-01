@@ -1,0 +1,6 @@
+#include <atomic>
+std::atomic<uint32_t>
+.fetch_add(
+compare_exchange_strong
+std::memory_order_release
+std::memory_order_acquire

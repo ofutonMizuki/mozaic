@@ -1,0 +1,5 @@
+// Negative: Atomic<T> requires a word-size integer T (u32/i32/u64/i64).
+function main() {
+  let a: Atomic<f32> = Atomic.new(0.0);
+  stdout.println(1);
+}
