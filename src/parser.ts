@@ -129,6 +129,7 @@ export class Parser {
     if (t === "if") return this.parseIf();
     if (t === "match") return this.parseMatch();
     if (t === "scope") return this.parseScope();
+    if (t === "defer") return this.parseDefer();
     if (t === "let" || t === "const") return this.parseLet();
     if (t === "return") {
       this.next();
@@ -169,6 +170,10 @@ export class Parser {
   parseScope(): Stmt {
     this.eat("scope");
     return { kind: "Scope", body: this.parseBlock() };
+  }
+  parseDefer(): Stmt {   // `defer <stmt>` or `defer { ... }`
+    this.eat("defer");
+    return { kind: "Defer", body: this.at("{") ? this.parseBlock() : [this.parseStmt()] };
   }
   parseFor(): Stmt {
     this.eat("for"); this.eat("(");

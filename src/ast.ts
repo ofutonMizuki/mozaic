@@ -22,6 +22,7 @@ export type Stmt =
   | { kind: "Break" }
   | { kind: "Continue" }
   | { kind: "Scope"; body: Stmt[] }
+  | { kind: "Defer"; body: Stmt[] }          // run `body` at enclosing-scope exit, LIFO
   | { kind: "ExprStmt"; expr: Expr };
 export type Expr =
   | { kind: "Num"; value: string; ty?: string }

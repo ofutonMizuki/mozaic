@@ -18,6 +18,16 @@ using str    = std::u32string;
 // Default add/sub/mul: trap on overflow in debug, wrap in release (-DMZ_RELEASE).
 [[noreturn]] inline void panic(const char* msg) { std::cerr << "mozaic: " << msg << "\n"; std::abort(); }
 
+// `defer body;` -> `auto _d = mz::defer([&]{ body });`. The guard's destructor runs the
+// body at enclosing-scope exit; C++ destroys in reverse construction order, giving LIFO.
+template <class F> struct DeferGuard {
+  F f;
+  DeferGuard(F fn) : f(fn) {}
+  DeferGuard(const DeferGuard&) = delete;
+  ~DeferGuard() { f(); }
+};
+template <class F> DeferGuard<F> defer(F f) { return DeferGuard<F>(f); }
+
 // Monotonic wall-clock in nanoseconds (for `clock.now()` — benchmarking/timing).
 inline uint64_t now_ns() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(

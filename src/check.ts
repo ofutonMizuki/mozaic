@@ -401,6 +401,13 @@ class Checker {
         break;
       }
       case "Break": case "Continue": break;
+      case "Defer": {
+        // checked in the current scope (the body runs at scope exit, but sees names in scope here)
+        this.push();
+        for (const st of s.body) this.checkStmt(st);
+        this.pop();
+        break;
+      }
       case "Scope": {
         const sid = "scope#" + (this.scopeCount++);   // bare spawns inside join here
         this.scopeStack.push(sid);

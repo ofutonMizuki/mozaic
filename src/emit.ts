@@ -10,6 +10,7 @@ let FN_PARAMS = new Map<string, Param[]>();              // fn name -> params (t
 let TARGET: "cpu" | "metal" = "cpu";
 let matchCounter = 0;
 let scopeCounter = 0;
+let deferCounter = 0;
 const scopeVarStack: string[] = [];                      // current scope's std::thread vector name
 
 // Memory orderings lower to std::memory_order_* (SPEC §5). A bare Ordering ident emits the constant.
@@ -258,6 +259,10 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
       scopeVarStack.pop();
       return `${ind}{\n${ind}  std::vector<std::thread> ${sv};\n${body}\n${ind}  for (auto& _t : ${sv}) _t.join();\n${ind}}`;
     }
+    case "Defer": {   // RAII guard: destructor runs body at enclosing C++ scope exit (LIFO, also on return)
+      const body = s.body.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n");
+      return `${ind}auto _def${deferCounter++} = mz::defer([&]{\n${body}\n${ind}});`;
+    }
     case "ExprStmt":
       if (s.expr.kind === "SpawnExpr" && s.expr.call.kind === "Call") {   // bare spawn -> scope's thread vector
         const { fn, args } = spawnCallParts(s.expr.call);
@@ -354,7 +359,7 @@ function emitMslStmt(s: Stmt, ind: string, bufs: Set<string>): string {
     case "Break": return `${ind}break;`;
     case "Continue": return `${ind}continue;`;
     case "ExprStmt": return `${ind}${emitMslExpr(s.expr, bufs)};`;
-    case "Match": case "ForOf": case "Scope": throw new Error(`kernel: '${s.kind}' is not supported`);
+    case "Match": case "ForOf": case "Scope": case "Defer": throw new Error(`kernel: '${s.kind}' is not supported`);
   }
 }
 function emitMslKernel(k: KernelDecl): string {
@@ -405,6 +410,7 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   TARGET = target;
   matchCounter = 0;
   scopeCounter = 0;
+  deferCounter = 0;
   for (const it of types) {
     if (it.kind === "StructDecl") { STRUCT_FIELDS.set(it.name, it.fields.map((f) => f.name)); STRUCT_FIELD_TYPES.set(it.name, it.fields.map((f) => f.ty)); }
     else it.variants.forEach((v, idx) => VARIANTS.set(v.name, { enumName: it.name, index: idx, payload: v.payload }));

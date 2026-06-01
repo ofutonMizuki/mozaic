@@ -1,0 +1,14 @@
+// defer runs at enclosing-scope exit, LIFO, including on early return.
+function f(x: i32) {
+  defer stdout.println("cleanup");
+  if (x > 0) { stdout.println("positive"); return; }
+  stdout.println("nonpositive");
+}
+function main() {
+  stdout.println("a");
+  defer stdout.println("z1");
+  defer stdout.println("z2");
+  stdout.println("b");
+  f(5);
+  f(0);
+}
