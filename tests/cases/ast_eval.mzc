@@ -1,0 +1,23 @@
+// Recursive data via Box<T> (M7 enabler): a self-referential AST + a recursive evaluator.
+// This is exactly the shape a self-hosted parser/checker needs.
+enum Expr {
+  Num(i64),
+  Add(Box<Expr>, Box<Expr>),
+  Mul(Box<Expr>, Box<Expr>),
+}
+function eval(e: &Expr): i64 {
+  match e {
+    Num(n)    => { return n; }
+    Add(l, r) => { return eval(l.get()) +% eval(r.get()); }
+    Mul(l, r) => { return eval(l.get()) *% eval(r.get()); }
+  }
+  return 0;
+}
+function main() {
+  // (2 + 3) * 4 = 20
+  let e: Expr = Mul(Box.new(Add(Box.new(Num(2)), Box.new(Num(3)))), Box.new(Num(4)));
+  stdout.println(eval(&e));     // 20
+  // 7 + 6*5 = 37
+  let f: Expr = Add(Box.new(Num(7)), Box.new(Mul(Box.new(Num(6)), Box.new(Num(5)))));
+  stdout.println(eval(&f));     // 37
+}

@@ -109,6 +109,14 @@ template <class T, int N> Simd<T, N> operator/(const Simd<T, N>& a, const Simd<T
 template <class T, int N> Simd<T, N> operator%(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] % b.lane[i]; return r; }
 
 // ---- concurrency library types (M4) ----
+// Box<T>: an owned heap box. Its whole purpose is to break the size cycle of recursive types
+// (e.g. enum Expr { Add(Box<Expr>, Box<Expr>) }), so a node holds a pointer, not itself. Built
+// with Box.new(v) (T inferred); read via b.get(). Heap-backed so copying a node is shallow.
+template <class T> struct Box {
+  std::shared_ptr<T> p;
+  const T& get() const { return *p; }
+};
+
 // Arc<T>: atomically reference-counted shared ownership. clone() hands out another owning handle
 // (refcount++, thread-safe); get() reads the shared, immutable value. Lower than a borrow: an Arc
 // handle outlives any lexical scope, so it crosses spawn boundaries by value (pass a.clone()).

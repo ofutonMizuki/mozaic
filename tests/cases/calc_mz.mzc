@@ -1,0 +1,100 @@
+// A complete expression compiler/interpreter WRITTEN IN MOZAIC (M7 self-host demonstration):
+// lexer -> recursive-descent parser (building a Box-recursive AST) -> evaluator. Reads an
+// arithmetic expression from stdin and prints its value. Uses Vec, struct methods, &self/&mut self,
+// enums, match, Box<Expr> recursion — the same machinery a self-hosted mozaic compiler needs.
+
+// Token kinds: 0=num 1=+ 2=- 3=* 4=/ 5=( 6=) 7=eof
+struct Token { kind: i32; val: i64; }
+
+enum Expr {
+  Num(i64),
+  Bin(i32, Box<Expr>, Box<Expr>),   // op, left, right
+}
+
+function lex(src: str): Vec<Token> {
+  let toks: Vec<Token> = Vec.new();
+  let i: u32 = 0;
+  let n: u32 = src.len;
+  while (i < n) {
+    let c: char = src[i];
+    if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+      i = i +% 1;
+    } else if (c >= '0' && c <= '9') {
+      let v: i64 = 0;
+      while (i < n && src[i] >= '0' && src[i] <= '9') {
+        v = v *% 10 +% ((src[i] as u32) as i64) -% (('0' as u32) as i64);
+        i = i +% 1;
+      }
+      toks.push(Token { kind: 0, val: v });
+    } else {
+      let k: i32 = 7;
+      if (c == '+') { k = 1; }
+      else if (c == '-') { k = 2; }
+      else if (c == '*') { k = 3; }
+      else if (c == '/') { k = 4; }
+      else if (c == '(') { k = 5; }
+      else if (c == ')') { k = 6; }
+      toks.push(Token { kind: k, val: 0 });
+      i = i +% 1;
+    }
+  }
+  toks.push(Token { kind: 7, val: 0 });   // EOF
+  return toks;
+}
+
+struct Parser {
+  toks: Vec<Token>;
+  pos: u32;
+  function peek(&self): i32 { return self.toks[self.pos].kind; }
+  function cur(&self): i64 { return self.toks[self.pos].val; }
+  function adv(&mut self) { self.pos = self.pos +% 1; }
+  function parseFactor(&mut self): Box<Expr> {
+    let k: i32 = self.peek();
+    if (k == 0) { let v: i64 = self.cur(); self.adv(); return Box.new(Num(v)); }
+    if (k == 5) { self.adv(); let e: Box<Expr> = self.parseExpr(); self.adv(); return e; }   // ( expr )
+    abort("parse error");
+    return Box.new(Num(0));
+  }
+  function parseTerm(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseFactor();
+    while (self.peek() == 3 || self.peek() == 4) {
+      let op: i32 = self.peek();
+      self.adv();
+      let right: Box<Expr> = self.parseFactor();
+      left = Box.new(Bin(op, left, right));
+    }
+    return left;
+  }
+  function parseExpr(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseTerm();
+    while (self.peek() == 1 || self.peek() == 2) {
+      let op: i32 = self.peek();
+      self.adv();
+      let right: Box<Expr> = self.parseTerm();
+      left = Box.new(Bin(op, left, right));
+    }
+    return left;
+  }
+}
+
+function eval(e: &Expr): i64 {
+  match e {
+    Num(n) => { return n; }
+    Bin(op, l, r) => {
+      let a: i64 = eval(l.get());
+      let b: i64 = eval(r.get());
+      if (op == 1) { return a +% b; }
+      if (op == 2) { return a -% b; }
+      if (op == 3) { return a *% b; }
+      return a / b;
+    }
+  }
+  return 0;
+}
+
+function main() {
+  let src: str = stdin.readAll();
+  let p: Parser = Parser { toks: lex(src), pos: 0 };
+  let ast: Box<Expr> = p.parseExpr();
+  stdout.println(eval(ast.get()));
+}

@@ -1,16 +1,16 @@
 // Generic structs: type params lower to C++ class templates; construction infers them from fields.
 struct Pair<A, B> { first: A; second: B; }
-struct Box<T> { val: T; }
-function makeBox<T>(x: T): Box<T> { return Box { val: x }; }
+struct Cell<T> { val: T; }
+function makeBox<T>(x: T): Cell<T> { return Cell { val: x }; }
 function main() {
   let p = Pair { first: 1, second: "hi" };       // Pair<i32, str>
   stdout.println(p.first);                        // 1
   stdout.println(p.second);                       // hi
-  let b: Box<i32> = Box { val: 42 };
+  let b: Cell<i32> = Cell { val: 42 };
   stdout.println(b.val);                          // 42
-  let bs = makeBox("generic");                    // Box<str>
+  let bs = makeBox("generic");                    // Cell<str>
   stdout.println(bs.val);                         // generic
-  let nested = Pair { first: Box { val: 7 }, second: true };   // Pair<Box<i32>, bool>
+  let nested = Pair { first: Cell { val: 7 }, second: true };   // Pair<Cell<i32>, bool>
   stdout.println(nested.first.val);               // 7
   stdout.println(nested.second);                  // true
 }

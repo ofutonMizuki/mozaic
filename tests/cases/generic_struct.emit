@@ -1,4 +1,4 @@
 template <class A, class B> struct Pair { A first; B second; };
-template <class T> struct Box { T val; };
+template <class T> struct Cell { T val; };
 Pair<int32_t, mz::String>{ 1, U"hi"_mz }
-Pair<Box<int32_t>, bool>{ Box<int32_t>{ 7 }, true }
+Pair<Cell<int32_t>, bool>{ Cell<int32_t>{ 7 }, true }

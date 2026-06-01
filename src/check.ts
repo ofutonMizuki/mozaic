@@ -3,7 +3,7 @@ import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo, CTValue } from "
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
-  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem, isMapNew,
+  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem, isMapNew, isBoxNew,
 } from "./ast.ts";
 import { Comptime, CompileError } from "./comptime.ts";
 
@@ -268,6 +268,7 @@ class Checker {
 
   checkProgram(p: Program) {
     for (const it of p.items) if (it.kind === "StructDecl") {
+      if (LIB_GENERICS.includes(it.name)) this.err(`'${it.name}' is a built-in type and cannot be redefined`);
       if (this.structs.has(it.name)) this.err(`duplicate struct '${it.name}'`);
       const fm = new Map<string, string>();
       for (const f of it.fields) fm.set(f.name, f.ty);
@@ -278,6 +279,7 @@ class Checker {
       this.structMethods.set(it.name, mm);
     }
     for (const it of p.items) if (it.kind === "EnumDecl") {
+      if (LIB_GENERICS.includes(it.name)) this.err(`'${it.name}' is a built-in type and cannot be redefined`);
       if (this.enums.has(it.name)) this.err(`duplicate enum '${it.name}'`);
       const vm = new Map<string, string[]>();
       it.variants.forEach((v, idx) => {
@@ -489,7 +491,8 @@ class Checker {
         break;
       }
       case "Match": {
-        const st = this.checkExpr(s.scrut);
+        const st0 = this.checkExpr(s.scrut);
+        const st = refInner(st0) ?? st0;   // match through &Enum / &mut Enum (e.g. a recursive AST via Box.get())
         const variants = this.enums.get(st);
         if (!variants) { this.err(`match on non-enum type ${st}`); for (const arm of s.arms) this.checkBlock(arm.body); break; }
         const covered = new Set<string>();
@@ -804,6 +807,13 @@ class Checker {
           if (e.args.length !== 0) this.err("Map.new takes no arguments (insert entries after)");
           e.ty = "mapnew"; return e.ty;
         }
+        if (isBoxNew(e)) {   // Box.new(v): heap box; T is inferred from v, so it works nested / in payloads
+          if (this.inKernel) this.err("Box is not supported inside a kernel");
+          if (e.args.length !== 1) { this.err("Box.new(v) takes one argument"); e.ty = "Box<i32>"; return e.ty; }
+          let at = this.noConstruct(this.checkExpr(e.args[0]), "Box.new(...)");
+          at = at === "intlit" ? "i32" : at === "floatlit" ? "f64" : at;
+          e.ty = `Box<${at}>`; return e.ty;
+        }
         // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
         if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
           const want = e.callee.name === "grid2" ? 2 : 3;
@@ -968,7 +978,7 @@ class Checker {
             } else { this.err(`unknown Map method '${m}' (use insert / get / has / len)`); e.ty = V; }
             return e.ty;
           }
-          if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel" || lg.base === "Vec")) {
+          if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel" || lg.base === "Vec" || lg.base === "Box")) {
             const inner = lg.args[0], m = e.callee.prop;
             if (lg.base === "Vec") {
               if (m === "push" || m === "pop") {   // mutating: receiver must be a mutable binding or &mut
@@ -983,7 +993,10 @@ class Checker {
               else { this.err(`unknown Vec method '${m}' (use push / pop / len / [i])`); e.ty = inner; }
               return e.ty;
             }
-            if (lg.base === "Arc") {
+            if (lg.base === "Box") {
+              if (m === "get") { if (e.args.length) this.err("Box.get() takes no arguments"); e.ty = `&${inner}`; }
+              else { this.err(`unknown Box method '${m}' (use get)`); e.ty = inner; }
+            } else if (lg.base === "Arc") {
               if (m === "clone") { if (e.args.length) this.err("Arc.clone() takes no arguments"); e.ty = `Arc<${inner}>`; }
               else if (m === "get") { if (e.args.length) this.err("Arc.get() takes no arguments"); e.ty = `&${inner}`; }
               else { this.err(`unknown Arc method '${m}' (use clone / get)`); e.ty = inner; }

@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew, isBoxNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -232,6 +232,11 @@ function emitExpr(e: Expr): string {
       if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
+      }
+      // Box.new(v) -> mz::Box<T>{ make_shared<T>(v) }  (usable nested / in enum payloads)
+      if (isBoxNew(e)) {
+        const inner = genericArgs(e.ty ?? "")!.args[0];
+        return `mz::Box<${cppType(inner)}>{ std::make_shared<${cppType(inner)}>(${emitExpr(e.args[0])}) }`;
       }
       // SIMD vector lane-constructor f32x4(a,b,c,d) -> mz::Simd<float,4>{ {a,b,c,d} }
       if (e.callee.kind === "Ident" && vecParts(e.callee.name) !== null)
