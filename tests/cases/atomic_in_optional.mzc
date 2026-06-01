@@ -1,0 +1,2 @@
+function f(): Atomic<u32>? { return none; }
+function main() { stdout.println("x"); }

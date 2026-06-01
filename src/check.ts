@@ -46,8 +46,10 @@ class Checker {
   badAtomicElem(t: string): string | null {
     const ae = atomicElem(t);
     if (ae !== null && !ATOMIC_INTS.includes(ae)) return `Atomic<${ae}>: T must be one of u32, i32, u64, i64`;
-    const be = bufferElem(t);
-    return be !== null ? this.badAtomicElem(be) : null;
+    const oi = optInner(t); if (oi !== null) return this.badAtomicElem(oi);
+    const be = bufferElem(t); if (be !== null) return this.badAtomicElem(be);
+    const ra = resultArgs(t); if (ra !== null) return this.badAtomicElem(ra[0]) ?? this.badAtomicElem(ra[1]);
+    return null;
   }
   accessBuf(name: string, write: boolean) {
     const b = this.borrows.get(name);
@@ -182,6 +184,12 @@ class Checker {
     }
   }
   err(m: string) { this.errs.push(m); }
+  // Buffer.shared / Atomic.new yield a placeholder type that only directly initializes an annotated
+  // binding (where the element type is known). Nesting it elsewhere has no valid C++ lowering.
+  noConstruct(t: string, where: string): string {
+    if (t === "buffernew" || t === "atomicnew") this.err(`Buffer.shared / Atomic.new cannot be nested in ${where}; bind it to a typed variable first`);
+    return t;
+  }
   typeKnown(t: string): boolean {
     const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
@@ -207,6 +215,7 @@ class Checker {
       if (this.enums.has(it.name)) this.err(`duplicate enum '${it.name}'`);
       const vm = new Map<string, string[]>();
       it.variants.forEach((v, idx) => {
+        if (v.name === "Ok" || v.name === "Err") this.err(`'${v.name}' is reserved for Result; rename this variant`);
         if (this.variants.has(v.name)) this.err(`duplicate variant name '${v.name}'`);
         vm.set(v.name, v.payload);
         this.variants.set(v.name, { enumName: it.name, index: idx, payload: v.payload });
@@ -495,10 +504,10 @@ class Checker {
         else if (!scalarSrc || !okTarget) this.err(`cannot cast ${st} as ${e.toTy} (only numeric / char / bool scalar conversions)`);
         e.ty = e.toTy; return e.ty;
       }
-      case "Some": { e.ty = this.checkExpr(e.expr) + "?"; return e.ty; }
+      case "Some": { e.ty = this.noConstruct(this.checkExpr(e.expr), "some(...)") + "?"; return e.ty; }
       case "None": { e.ty = "none"; return e.ty; }
-      case "Ok": { e.ty = `ok<${this.checkExpr(e.expr)}>`; return e.ty; }    // partial: T known, E from context
-      case "Err": { e.ty = `err<${this.checkExpr(e.expr)}>`; return e.ty; }  // partial: E known, T from context
+      case "Ok": { e.ty = `ok<${this.noConstruct(this.checkExpr(e.expr), "Ok(...)")}>`; return e.ty; }    // partial: T known, E from context
+      case "Err": { e.ty = `err<${this.noConstruct(this.checkExpr(e.expr), "Err(...)")}>`; return e.ty; } // partial: E known, T from context
       case "Try": {
         const it = this.checkExpr(e.expr);
         const oi = optInner(it), ra = resultArgs(it);
@@ -515,9 +524,9 @@ class Checker {
         this.err(`postfix '?' requires an optional or Result (got ${it})`); e.ty = it; return e.ty;
       }
       case "OrElse": {
-        const ot = this.checkExpr(e.opt);
+        const ot = this.noConstruct(this.checkExpr(e.opt), "??");
         const inner = optInner(ot);
-        const at = this.checkExpr(e.alt);
+        const at = this.noConstruct(this.checkExpr(e.alt), "??");
         if (inner === null) { this.err(`'??' left side must be an optional (got ${ot})`); e.ty = ot; return e.ty; }
         if (!this.assignable(at, inner)) this.err(`'??' default type ${at} does not match ${inner}`);
         e.ty = inner; return e.ty;

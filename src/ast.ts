@@ -84,8 +84,9 @@ export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T i
 // structFields maps a struct name -> its field type strings (built by check.ts and emit.ts).
 export function containsAtomic(t: string, structFields: Map<string, string[]>, seen = new Set<string>()): boolean {
   if (atomicElem(t) !== null) return true;
-  const be = bufferElem(t);
-  if (be !== null) return containsAtomic(be, structFields, seen);
+  const oi = optInner(t); if (oi !== null) return containsAtomic(oi, structFields, seen);   // T?  (don't smuggle an Atomic through an optional)
+  const be = bufferElem(t); if (be !== null) return containsAtomic(be, structFields, seen);
+  const ra = resultArgs(t); if (ra !== null) return containsAtomic(ra[0], structFields, seen) || containsAtomic(ra[1], structFields, seen);
   if (seen.has(t)) return false;
   const fields = structFields.get(t);
   if (fields) { seen.add(t); return fields.some((ft) => containsAtomic(ft, structFields, seen)); }

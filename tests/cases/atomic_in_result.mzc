@@ -1,0 +1,5 @@
+function f(): Result<Atomic<u32>, str> {
+  let x: Atomic<u32> = Atomic.new(0);
+  return Ok(x);
+}
+function main() { stdout.println("x"); }

@@ -1,0 +1,3 @@
+function main() {
+  let r: Result<Buffer<f32>, str> = Ok(Buffer.shared(5));
+}
