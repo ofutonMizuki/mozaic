@@ -19,6 +19,11 @@ export class Parser {
     return tk;
   }
   parseType(): string {
+    let t = this.parseTypeCore();
+    while (this.at("?")) { this.next(); t = t + "?"; }   // trailing ? -> optional (binds tighter than &)
+    return t;
+  }
+  parseTypeCore(): string {
     if (this.at("&")) {   // reference type: &T (shared) / &mut T (exclusive)
       this.next();
       let mut = false;
@@ -214,7 +219,12 @@ export class Parser {
     this.eat("}");
     return { kind: "Match", scrut, arms };
   }
-  parseExpr(): Expr { return this.parseComparison(); }
+  parseExpr(): Expr { return this.parseOrElse(); }
+  parseOrElse(): Expr {   // `a ?? b` (unwrap-or) — loosest binary; right side is a comparison
+    let left = this.parseComparison();
+    while (this.at("??")) { this.next(); left = { kind: "OrElse", opt: left, alt: this.parseComparison() }; }
+    return left;
+  }
   parseComparison(): Expr {
     let left = this.parseAdditive();
     while (this.at("==") || this.at("!=") || this.at("<") || this.at("<=") || this.at(">") || this.at(">=")) {
@@ -262,6 +272,7 @@ export class Parser {
     let e = this.parsePrimary();
     for (;;) {
       if (this.at(".")) { this.next(); e = { kind: "Member", obj: e, prop: this.eat("id").v }; }
+      else if (this.at("?")) { this.next(); e = { kind: "Try", expr: e }; }   // postfix ? -> propagate none
       else if (this.at("[")) { this.next(); const index = this.parseExpr(); this.eat("]"); e = { kind: "Index", obj: e, index }; }
       else if (this.at("(")) {
         this.next();
@@ -289,6 +300,8 @@ export class Parser {
     if (tk.t === "str") { this.next(); return { kind: "Str", value: tk.v }; }
     if (tk.t === "char") { this.next(); return { kind: "Char", value: tk.v }; }
     if (tk.t === "true" || tk.t === "false") { this.next(); return { kind: "Bool", value: tk.t === "true" }; }
+    if (tk.t === "none") { this.next(); return { kind: "None" }; }
+    if (tk.t === "some") { this.next(); this.eat("("); const inner = this.parseExpr(); this.eat(")"); return { kind: "Some", expr: inner }; }
     if (tk.t === "id") {
       this.next();
       if (this.at("{") && !this.noStruct) return this.parseStructLit(tk.v);

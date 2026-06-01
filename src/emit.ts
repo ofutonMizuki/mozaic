@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -88,7 +88,15 @@ function emitExpr(e: Expr): string {
     case "Str": return cstr(e.value);
     case "Char": return `(char32_t)${e.value}`;
     case "Bool": return e.value ? "true" : "false";
-    case "Cast": return `(${cppType(e.toTy)})(${emitExpr(e.expr)})`;   // explicit (possibly lossy) conversion
+    case "Cast":
+      return e.opt
+        ? `mz::checked_cast<${cppType(e.toTy)}, ${cppType(e.expr.ty!)}>(${emitExpr(e.expr)})`   // as? -> std::optional
+        : `(${cppType(e.toTy)})(${emitExpr(e.expr)})`;                                          // as  -> explicit cast
+    case "Some": return `{ ${emitExpr(e.expr)} }`;   // braced -> adapts to the target std::optional<T>
+    case "None": return "{}";                        // empty optional (nullopt) via the target type
+    case "OrElse": return `(${emitExpr(e.opt)}).value_or(${emitExpr(e.alt)})`;
+    case "Try":   // GCC/clang statement-expression: unwrap, or early-return none from the enclosing fn
+      return `({ auto _o = (${emitExpr(e.expr)}); if (!_o.has_value()) return {}; _o.value(); })`;
     case "Ident": {
       if (e.name === "self") return "(*this)";   // method receiver -> the C++ instance
       if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
@@ -117,6 +125,12 @@ function emitExpr(e: Expr): string {
       return `${e.name}{ ${vals.join(", ")} }`;
     }
     case "Binary": {
+      // optional presence test: opt == none / opt != none -> has_value()
+      if ((e.op === "==" || e.op === "!=") && (e.left.kind === "None" || e.right.kind === "None")) {
+        const opt = e.left.kind === "None" ? e.right : e.left;
+        const has = `(${emitExpr(opt)}).has_value()`;
+        return e.op === "==" ? `(!${has})` : `(${has})`;
+      }
       const l = emitExpr(e.left), r = emitExpr(e.right);
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
       if (e.op === "!=") return e.left.ty === "str" ? `(!mz::eq(${l}, ${r}))` : `(${l} != ${r})`;
@@ -293,6 +307,7 @@ function emitKernel(k: KernelDecl): string {
 //   - grid.{x,y,z} -> thread_position_in_grid; buf.len -> the buf_len uniform
 //   - Metal scalar type names; no double (f64 maps to float)
 function mslType(t: string): string {
+  if (optInner(t) !== null) throw new Error("kernel: optional types are not allowed");
   switch (t) {
     case "u8": return "uchar"; case "u16": return "ushort"; case "u32": return "uint"; case "u64": return "ulong";
     case "i8": return "char"; case "i16": return "short"; case "i32": return "int"; case "i64": return "long";
@@ -316,9 +331,10 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
     case "Char": throw new Error("kernel: char literals are not allowed");
     case "Bool": return e.value ? "true" : "false";
     case "Cast": {
-      if (!(isInt(e.toTy) || isFloat(e.toTy))) throw new Error("kernel: only numeric casts are allowed");
+      if (e.opt || !(isInt(e.toTy) || isFloat(e.toTy))) throw new Error("kernel: only plain numeric casts are allowed");
       return `(${mslType(e.toTy)})(${emitMslExpr(e.expr, bufs)})`;
     }
+    case "Some": case "None": case "Try": case "OrElse": throw new Error("kernel: optionals are not allowed");
     case "Ident": return e.name;
     case "Member":
       if (e.obj.kind === "Ident" && e.obj.name === "grid") return `_tpig.${e.prop}`;

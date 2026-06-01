@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -183,6 +183,7 @@ class Checker {
   }
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
+    const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle
@@ -228,6 +229,7 @@ class Checker {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
         if (this.hasAtomic(pa.ty)) this.err(`Atomic is not supported inside a kernel (parameter '${pa.name}')`);
         if (refInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a reference (host-data refs are not allowed in kernels)`);
+        if (optInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be optional`);
       }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
@@ -292,7 +294,10 @@ class Checker {
           if (vt === "buffernew") { this.err(`'${s.name}': Buffer.shared needs a type annotation (e.g. : Buffer<f32>)`); declTy = "i32"; }
           else if (vt === "atomicnew") { this.err(`'${s.name}': Atomic.new needs a type annotation (e.g. : Atomic<u64>)`); declTy = "i32"; }
           else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
+          else if (vt === "none") { this.err(`'${s.name}': bare none has no type — annotate it (e.g. : i32?)`); declTy = "i32"; }
           else { declTy = vt === "intlit" ? "i32" : (vt === "floatlit" ? "f64" : vt);
+            if (optInner(declTy) === "intlit") declTy = "i32?";          // some(5) -> i32?
+            else if (optInner(declTy) === "floatlit") declTy = "f64?";   // some(1.5) -> f64?
             if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
@@ -440,6 +445,13 @@ class Checker {
   assignable(vt: string, tt: string): boolean {
     if (vt === "buffernew" && bufferElem(tt) !== null) return true;
     if (vt === "atomicnew" && atomicElem(tt) !== null) return true;
+    // optionals: none fits any T?; U? -> T? iff U -> T; no implicit wrap of a bare value.
+    const to = optInner(tt), vo = optInner(vt);
+    if (to !== null) {
+      if (vt === "none") return true;
+      return vo !== null && this.assignable(vo, to);
+    }
+    if (vt === "none" || vo !== null) return false;   // an optional value needs an optional target
     const tr = refInner(tt), vr = refInner(vt);
     // ref param: &->&, &mut->&mut, and &mut coerces to & (same referent type required).
     if (tr !== null) return vr !== null && tr === vr && (!isMutRef(tt) || isMutRef(vt));
@@ -460,12 +472,33 @@ class Checker {
       case "Cast": {
         const st0 = this.checkExpr(e.expr);
         const st = refInner(st0) ?? st0;
+        if (e.opt) {   // as? — fallible cast, returns an optional (none if it doesn't round-trip)
+          if (!isInt(e.toTy)) this.err("`as?` target must be an integer type (e.g. n as? u8)");
+          else if (!(isInt(st) || isFloat(st))) this.err(`cannot use as? on ${st} (numeric source only)`);
+          e.ty = e.toTy + "?"; return e.ty;
+        }
         const scalarSrc = isInt(st) || isFloat(st) || st === "char" || st === "bool";
         const okTarget = isInt(e.toTy) || isFloat(e.toTy) || e.toTy === "char";
-        if (e.opt) this.err("`as?` (fallible cast) is not supported yet");
-        else if (!this.typeKnown(e.toTy)) this.err(`unknown type '${e.toTy}' in cast`);
+        if (!this.typeKnown(e.toTy)) this.err(`unknown type '${e.toTy}' in cast`);
         else if (!scalarSrc || !okTarget) this.err(`cannot cast ${st} as ${e.toTy} (only numeric / char / bool scalar conversions)`);
         e.ty = e.toTy; return e.ty;
+      }
+      case "Some": { e.ty = this.checkExpr(e.expr) + "?"; return e.ty; }
+      case "None": { e.ty = "none"; return e.ty; }
+      case "Try": {
+        const it = this.checkExpr(e.expr);
+        const inner = optInner(it);
+        if (inner === null) { this.err(`postfix '?' requires an optional (got ${it})`); e.ty = it; return e.ty; }
+        if (optInner(this.curRet) === null) this.err("postfix '?' can only be used in a function that returns an optional");
+        e.ty = inner; return e.ty;
+      }
+      case "OrElse": {
+        const ot = this.checkExpr(e.opt);
+        const inner = optInner(ot);
+        const at = this.checkExpr(e.alt);
+        if (inner === null) { this.err(`'??' left side must be an optional (got ${ot})`); e.ty = ot; return e.ty; }
+        if (!this.assignable(at, inner)) this.err(`'??' default type ${at} does not match ${inner}`);
+        e.ty = inner; return e.ty;
       }
       case "Ident": {
         const vs = this.lookupVar(e.name);
@@ -704,6 +737,11 @@ class Checker {
           return e.ty;
         }
         if (e.op === "==" || e.op === "!=") {
+          // optional presence test: `opt == none` / `opt != none`
+          if (lt === "none" || rt === "none") {
+            if (!(optInner(lt) !== null || optInner(rt) !== null || (lt === "none" && rt === "none"))) this.err(`cannot compare ${lt} and ${rt}`);
+            e.ty = "bool"; return e.ty;
+          }
           if (isInt(lt) && isInt(rt)) { if (unifyInt(lt, rt) === null) this.err(`cannot compare ${lt} and ${rt}`); }
           else if (isFloat(lt) && isFloat(rt)) { if (unifyFloat(lt, rt) === null) this.err(`cannot compare ${lt} and ${rt}`); }
           else if (!((lt === "str" && rt === "str") || (lt === "bool" && rt === "bool") || (lt === "char" && rt === "char"))) this.err(`cannot compare ${lt} and ${rt}`);

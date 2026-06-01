@@ -1,0 +1,29 @@
+// T? optionals: some/none, ?? (unwrap-or), == none, postfix ? (propagate), as? (fallible cast).
+function find(x: i32): i32? {
+  if (x > 0) { return some(x * 2); }
+  return none;
+}
+function chain(x: i32): i32? {
+  let v = find(x)?;            // propagate none on early return
+  return some(v + 100);
+}
+function name(b: bool): str? {
+  if (b) { return some("alice"); }
+  return none;
+}
+function main() {
+  stdout.println(find(5) ?? 0);     // 10
+  stdout.println(find(0) ?? 0);     // 0
+  if (find(0) == none) { stdout.println("none"); }
+  if (find(5) != none) { stdout.println("some"); }
+  stdout.println(chain(5) ?? 0);    // 110
+  stdout.println(chain(0) ?? 0);    // 0 (propagated)
+  let a = 200 as? u8;               // some(200)
+  let b = 300 as? u8;               // none (truncation)
+  stdout.println(a ?? 0);           // 200
+  stdout.println(b ?? 0);           // 0
+  let neg = (0 - 1) as? u8;         // none (sign)
+  stdout.println(neg ?? 9);         // 9
+  stdout.println(name(true) ?? "no-name");    // alice
+  stdout.println(name(false) ?? "no-name");   // no-name
+}

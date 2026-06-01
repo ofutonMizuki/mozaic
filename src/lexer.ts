@@ -1,7 +1,7 @@
 // Tokenizer.
 export type Tok = { t: string; v: string; pos: number };
 
-const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let", "mut", "scope", "spawn", "true", "false", "as", "defer"]);
+const KEYWORDS = new Set(["function", "kernel", "struct", "enum", "match", "for", "while", "of", "if", "else", "return", "break", "continue", "const", "let", "mut", "scope", "spawn", "true", "false", "as", "defer", "some", "none"]);
 
 export function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -69,7 +69,7 @@ export function lex(src: string): Tok[] {
       continue;
     }
     const two = src.slice(i, i + 2);
-    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>" ||
+    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>" || two === "??" ||
         two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
       toks.push({ t: two, v: two, pos: i }); i += 2; continue;
     }

@@ -1,0 +1,4 @@
+std::optional<int32_t>
+.value_or(
+mz::checked_cast<uint8_t, int32_t>
+if (!_o.has_value()) return {};

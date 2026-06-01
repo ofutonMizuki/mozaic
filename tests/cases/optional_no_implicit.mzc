@@ -1,0 +1,5 @@
+// No implicit wrap: a bare value is not an optional (SPEC §0). Must write some(5).
+function main() {
+  let o: i32? = 5;
+  stdout.println(o ?? 0);
+}

@@ -8,6 +8,8 @@
 #include <limits>
 #include <cstdlib>
 #include <chrono>
+#include <optional>
+#include <type_traits>
 
 namespace mz {
 
@@ -73,6 +75,25 @@ template <class T> T wmul(T a, T b) { T r; __builtin_mul_overflow(a, b, &r); ret
 template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r)) return b >= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
+
+// `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
+// (so truncation, sign loss, or a non-integral float all yield none). To is always an integer.
+template <class To, class From>
+std::optional<To> checked_cast(From v) {
+  if constexpr (std::is_floating_point_v<From>) {
+    if (!(v == v)) return std::nullopt;                                   // NaN
+    long double lv = (long double)v;
+    if (lv < (long double)std::numeric_limits<To>::lowest() ||
+        lv > (long double)std::numeric_limits<To>::max()) return std::nullopt;
+    To r = (To)v;
+    if ((From)r != v) return std::nullopt;                                // not an exact integer
+    return r;
+  } else {
+    To r = (To)v;
+    if ((From)r != v) return std::nullopt;                                // magnitude/sign didn't survive
+    return r;
+  }
+}
 
 // ---- device buffers + data-parallel launch ----
 // Two backends, selected at compile time:
