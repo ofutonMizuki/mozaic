@@ -1,6 +1,6 @@
 // Recursive-descent parser: tokens -> AST.
 import type {
-  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, Arm, Stmt, Expr,
+  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Import, Method, Arm, Stmt, Expr,
 } from "./ast.ts";
 import type { Tok } from "./lexer.ts";
 import { lex } from "./lexer.ts";
@@ -53,7 +53,8 @@ export class Parser {
   parseProgram(): Program {
     const items: Item[] = [];
     while (!this.at("eof")) {
-      if (this.at("struct")) items.push(this.parseStruct());
+      if (this.at("import")) items.push(this.parseImport());
+      else if (this.at("struct")) items.push(this.parseStruct());
       else if (this.at("enum")) items.push(this.parseEnum());
       else if (this.at("kernel")) items.push(this.parseKernel());
       else if (this.at("const")) items.push(this.parseConstItem());
@@ -140,6 +141,12 @@ export class Parser {
     while (this.at(",")) { this.next(); ps.push(this.eat("id").v); }
     this.eat(">");
     return ps;
+  }
+  parseImport(): Import {   // `import "relative/path.mzc";` — resolved & merged by the driver
+    this.eat("import");
+    const path = this.eat("str").v;
+    this.eat(";");
+    return { kind: "Import", path };
   }
   parseConstItem(): ConstDecl {   // top-level `const NAME: T = Expr;` — a build-time constant
     this.eat("const");

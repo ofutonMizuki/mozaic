@@ -4,15 +4,40 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname, join, basename } from "node:path";
+import { dirname, join, basename, resolve } from "node:path";
 import { platform } from "node:os";
 import { lex } from "./lexer.ts";
 import { Parser } from "./parser.ts";
 import { check } from "./check.ts";
 import { emit } from "./emit.ts";
-import type { Program } from "./ast.ts";
+import type { Program, Item } from "./ast.ts";
 
 function fail(msg: string): never { console.error(msg); process.exit(1); }
+
+// Resolve `import "path";` items by parsing each referenced file once (dedup by absolute path,
+// relative to the importing file) and merging all non-import items — dependencies first.
+function loadProgram(entry: string): Program {
+  const seen = new Set<string>();
+  const items: Item[] = [];
+  const load = (filePath: string, importedFrom: string | null) => {
+    const abs = resolve(filePath);
+    if (seen.has(abs)) return;
+    seen.add(abs);
+    let src: string;
+    try { src = readFileSync(abs, "utf8"); }
+    catch { return fail(importedFrom ? `cannot import '${filePath}' (from ${importedFrom})` : `cannot read ${filePath}`); }
+    let prog: Program;
+    try { prog = new Parser(lex(src)).parseProgram(); }
+    catch (e) { return fail(`${abs}: ${String((e as Error).message)}`); }
+    const dir = dirname(abs);
+    for (const it of prog.items) {
+      if (it.kind === "Import") load(join(dir, it.path), abs);   // paths are relative to the importing file
+      else items.push(it);
+    }
+  };
+  load(entry, null);
+  return { kind: "Program", items };
+}
 
 function main(): void {
   const args = process.argv.slice(2);
@@ -25,13 +50,7 @@ function main(): void {
     process.exit(2);
   }
   if (metal && platform() !== "darwin") return fail("--gpu/--metal requires macOS (Apple Silicon)");
-  const src = readFileSync(file, "utf8");
-  let prog: Program;
-  try {
-    prog = new Parser(lex(src)).parseProgram();
-  } catch (e) {
-    return fail(String((e as Error).message));
-  }
+  const prog = loadProgram(file);
   const errs = check(prog, metal ? "metal" : "cpu");
   if (errs.length) return fail(errs.map((m) => "error: " + m).join("\n"));
 

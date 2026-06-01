@@ -1,8 +1,9 @@
 // AST node types + shared type-system helpers.
 
 export type Program = { kind: "Program"; items: Item[] };
-export type Item = FnDecl | StructDecl | EnumDecl | KernelDecl | ConstDecl;
+export type Item = FnDecl | StructDecl | EnumDecl | KernelDecl | ConstDecl | Import;
 export type ConstDecl = { kind: "ConstDecl"; name: string; ty: string; value: Expr; cval?: CTValue };
+export type Import = { kind: "Import"; path: string };   // `import "path";` — resolved by the driver
 export type Param = { name: string; ty: string };
 export type Field = { name: string; ty: string };
 export type Variant = { name: string; payload: string[] };

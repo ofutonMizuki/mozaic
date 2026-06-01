@@ -1,0 +1,10 @@
+// Multi-file: import resolves & merges other files (deduped on diamond imports).
+import "modules/mathmod.mzc";
+import "modules/strutil.mzc";    // also imports mathmod -> included once
+function main() {
+  let p: Point = addPts(Point { x: 1, y: 2 }, Point { x: 10, y: 20 });
+  stdout.println(p.x);        // 11
+  stdout.println(p.y);        // 22
+  stdout.println(square(7));  // 49
+  stdout.println(cube(3));    // 27
+}

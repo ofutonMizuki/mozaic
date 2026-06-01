@@ -1,0 +1,4 @@
+// An importable module (no main): a struct + helper functions.
+struct Point { x: i32; y: i32; }
+function addPts(a: Point, b: Point): Point { return Point { x: a.x +% b.x, y: a.y +% b.y }; }
+function square(n: i32): i32 { return n *% n; }

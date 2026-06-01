@@ -1,0 +1,2 @@
+import "mathmod.mzc";   // diamond: strutil also pulls in mathmod (must be deduped)
+function cube(n: i32): i32 { return square(n) *% n; }
