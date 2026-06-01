@@ -196,7 +196,8 @@ function ratioSum(xs: &[]i32, d: i32): Result<i32, MathError> {
   - **所有権/ムーブ**:再束縛(`let q = p` / `p = q`)で**ムーブ + use-after-move 検査**。`Copy` = スカラ/`bool`、それ以外(`str`/`Buffer<T>`/`struct`/ペイロード付き `enum`/`Atomic`)はムーブ。`Atomic` はムーブ不可。
   - **一級参照 `&T`/`&mut T`**:関数引数・メソッド受け手(`&self`/`&mut self`)で使える。自動デリファレンス。`&mut` は `let` 可変束縛のみ。共有参照越し / 不変束縛へのフィールド代入は不可。
   - **別名規則**:1 つの呼び出しの引数で、ある変数を `&mut` と他(`&`/`&mut`)に同時借用するのは不可(`&` 複数は可)。デバイス/タスクの borrow=sync(launch/spawn が `await`/`join` まで借用保持)が文をまたぐ借用を担う。
-  - 後続:格納可能な参照ローカル(`let r = &x`)とその文跨ぎ別名、生存期間/escape 検査(`return &local` 拒否)、NLL・明示 lifetime は §8 TBD。
+  - **生存期間/escape**:参照を返す関数(`: &T`)は、**引数由来の参照のみ返せる**(`return &local` は dangling になるため拒否、単一引数 provenance)。格納可能な参照ローカル `let r = &x` も可(引数由来かを追跡)。レキシカル領域推論で、明示 lifetime 注釈は不要。
+  - 後続(§8 TBD):格納参照の文跨ぎ別名(借用中の変更/ムーブ禁止)・NLL(最終使用での解放)・disjoint-field 借用・明示 lifetime 注釈・多引数 lifetime 関係。
 
 ### 並行性(スレッド)— 初めから一級
 

@@ -1,0 +1,8 @@
+// Negative: returning a ref local that points at a local also escapes.
+struct Box { v: i32; }
+function bad(): &Box {
+  let local: Box = Box { v: 1 };
+  let r: &Box = &local;
+  return r;
+}
+function main() { stdout.println(1); }

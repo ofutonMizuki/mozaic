@@ -1,0 +1,7 @@
+// Negative: returning a reference to a local would dangle.
+struct Box { v: i32; }
+function bad(): &Box {
+  let local: Box = Box { v: 1 };
+  return &local;
+}
+function main() { stdout.println(1); }

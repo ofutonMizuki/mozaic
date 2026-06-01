@@ -1,0 +1,8 @@
+// Positive: returning a reference derived from a parameter is safe (caller owns the referent).
+struct Box { v: i32; }
+function pick(b: &Box): &Box { return b; }
+function main() {
+  let b: Box = Box { v: 42 };
+  let r: &Box = pick(&b);
+  stdout.println(r.v);   // 42 (auto-deref)
+}

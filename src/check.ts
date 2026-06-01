@@ -11,7 +11,7 @@ import {
 type Borrow = { mut: boolean; job: string };
 // Per-binding state for ownership/move tracking. `moved` = ownership transferred out (later use is an
 // error); `loopDepth` = the loop nesting at definition (moving an outer binding inside a loop is unsound).
-type VarState = { ty: string; moved: boolean; loopDepth: number; mutable: boolean };
+type VarState = { ty: string; moved: boolean; loopDepth: number; mutable: boolean; paramRooted?: boolean };
 
 // Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
 const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
@@ -30,6 +30,7 @@ class Checker {
   suppressBufRead: string | null = null;  // the lvalue buffer of the current Assign (write, not read)
   suppressMovedCheck: string | null = null;  // the Assign target ident (assigning TO it is not a use)
   loopDepth = 0;                           // loop nesting depth (for the move-in-loop soundness guard)
+  curParams = new Set<string>();           // current fn/method parameter names (incl. 'self') — for escape
   inKernel = false;                        // checking a kernel body? (Atomic is banned there)
   tasks = new Map<string, { joined: boolean }>();  // named spawn Tasks -> joined yet? (per function)
   scopeStack: string[] = [];               // active scope ids (bare spawns join at scope end)
@@ -146,6 +147,22 @@ class Checker {
     if (src.loopDepth < this.loopDepth) this.err(`cannot move '${e.name}' inside a loop (it is declared outside the loop)`);
     else src.moved = true;
   }
+  // Root identifier of an lvalue path (walk through .field / [idx]); null if not ident-rooted.
+  rootIdent(e: Expr): string | null {
+    let c: Expr = e;
+    while (c.kind === "Member" || c.kind === "Index") c = c.obj;
+    return c.kind === "Ident" ? c.name : null;
+  }
+  // Does this borrow / reference value originate from a parameter (so its referent outlives the call,
+  // making it safe to return)? A param-rooted ref local counts; a local-rooted one does not.
+  fromParam(e: Expr): boolean {
+    if (e.kind === "Borrow") return this.fromParam(e.expr);
+    const root = this.rootIdent(e);
+    if (root === null) return false;
+    if (this.curParams.has(root)) return true;
+    const vs = this.lookupVar(root);
+    return !!(vs && refInner(vs.ty) !== null && vs.paramRooted);
+  }
   // Aliasing within a single call's argument list: a variable borrowed &mut may not be borrowed again
   // (& or &mut) in the same call. Multiple shared (&) borrows of one variable are fine. (launch/spawn
   // enforce their own version via registerBorrows against the in-flight borrow set.)
@@ -232,6 +249,7 @@ class Checker {
       this.borrows = new Map();
       this.tasks = new Map();
       this.inKernel = it.kind === "KernelDecl";
+      this.curParams = new Set(it.params.map((pa) => pa.name));
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
       for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
@@ -247,6 +265,7 @@ class Checker {
       this.borrows = new Map();
       this.tasks = new Map();
       this.define("self", (m.recv === "&mut self" ? "&mut " : "&") + it.name, m.recv === "&mut self");
+      this.curParams = new Set(["self", ...m.params.map((pa) => pa.name)]);
       for (const pa of m.params) {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}' of '${it.name}.${m.name}'`);
         this.define(pa.name, pa.ty);
@@ -300,6 +319,8 @@ class Checker {
           this.registerSpawnBorrows(s.value.call, s.name);
         }
         this.moveIfBinding(s.value);   // `let q = p` (p non-Copy) moves p; later use of p is an error
+        // a ref local records whether its referent is parameter-rooted (so escape on return is decidable)
+        if (refInner(declTy) !== null) { const vs = this.lookupVar(s.name); if (vs) vs.paramRooted = this.fromParam(s.value); }
         break;
       }
       case "Assign": {
@@ -370,7 +391,13 @@ class Checker {
       case "Return": {
         if (this.curRet === "unit") { if (s.value) this.err("cannot return a value from a function with no return type"); }
         else if (!s.value) this.err(`must return a ${this.curRet}`);
-        else { const vt = this.checkExpr(s.value); if (!this.assignable(vt, this.curRet)) this.err(`return type mismatch: ${vt} vs ${this.curRet}`); }
+        else {
+          const vt = this.checkExpr(s.value);
+          if (!this.assignable(vt, this.curRet)) this.err(`return type mismatch: ${vt} vs ${this.curRet}`);
+          // escape: a returned reference must originate from a parameter (its referent outlives the call).
+          if (refInner(this.curRet) !== null && !this.fromParam(s.value))
+            this.err(`returns a reference to a local (it would dangle); a returned reference must come from a parameter`);
+        }
         break;
       }
       case "Break": case "Continue": break;
