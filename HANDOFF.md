@@ -9,7 +9,12 @@ GPU/Metal バックエンド(UMA ゼロコピー + 借用=同期)が動作。以
 `Result<T,E>`(`Ok`/`Err`/後置 `?`/`isOk`/`isErr`/`unwrap`/`unwrapErr`) / 固定長配列 `[T;N]`・スライス `[]T`(`slice(arr)`) /
 文字列 `.len`(コードポイント数)/`+`/`[i]`→`char`・`format(x)`・テンプレート `` `…${e}…` ``。
 ゴールデン **66/66**。2 回の敵対的レビュー(workflow)で健全性/コード生成バグ計 11 件を修正済み。
-残: M3 以降(comptime/総称型/SIMD、並行性の完成、借用完全形、モジュール/stdlib、セルフホスト)。詳細は [ROADMAP.md](ROADMAP.md)。
+残: M3 以降(comptime/SIMD、並行性の完成、借用完全形、モジュール/stdlib、セルフホスト)。詳細は [ROADMAP.md](ROADMAP.md)。
+
+## M3 抽象化(branch `m3-abstraction`、`m2-language-core` の上に積む、main 未マージ)
+✅ **ユーザ総称型**: generic 関数 `function id<T>(x: T): T`(呼び出しで型推論、C++ テンプレートへ)+ generic struct
+`struct Pair<A, B> {…}`(構築時にフィールド値から型引数を推論、C++ クラステンプレートへ)。ゴールデン **70/70**。
+残: 総称 struct の**メソッド**(コンテナ実装に必須)、`comptime`、SIMD ベクタ `f32x4`、`i128`/`u128`/`f16`。
 
 ## TL;DR(2026-06-01 時点で動くもの)
 - `node src/main.ts run examples/addk_async.mzc --gpu` → Apple Silicon GPU(Metal)で `10 11 12 13`。CPU と完全一致。
