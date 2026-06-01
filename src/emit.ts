@@ -177,6 +177,7 @@ function emitExpr(e: Expr): string {
       // MutexGuard.val -> the guarded value through the held lock (*guard.p)
       if (e.prop === "val" && genericArgs(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "")?.base === "MutexGuard") return `(*(${emitExpr(e.obj)}).p)`;
       return `${emitExpr(e.obj)}.${e.prop}`;
+    case "Unary": return `(!${emitExpr(e.expr)})`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
     case "SpawnExpr": throw new Error("spawn must be a statement, or `let t: Task = spawn f(...)`");
@@ -258,6 +259,7 @@ function emitExpr(e: Expr): string {
         if (vecParts(recv) !== null && m === "splat") return `${cppType(recv)}::splat(${emitExpr(e.args[0])})`;
         if (recv === "clock" && m === "now") return `mz::now_ns()`;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
+        if (recv === "stdin" && m === "readAll") return `mz::read_all_stdin()`;
         if (recv === "stdout" && m === "println") {
           const a = e.args[0];
           const at = a.ty ?? "unit";
@@ -468,6 +470,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
       if (e.obj.kind === "Ident" && bufs.has(e.obj.name) && e.prop === "len") return `${e.obj.name}_len`;
       return `${emitMslExpr(e.obj, bufs)}.${e.prop}`;
     case "Index": return `${emitMslExpr(e.obj, bufs)}[${emitMslExpr(e.index, bufs)}]`;
+    case "Unary": return `(!${emitMslExpr(e.expr, bufs)})`;
     case "Binary": {
       const l = emitMslExpr(e.left, bufs), r = emitMslExpr(e.right, bufs);
       return `(${l} ${MSL_OP[e.op] ?? e.op} ${r})`;

@@ -1,0 +1,9 @@
+ID let
+ID x
+OP =
+INT 42
+OP +
+ID foo_bar
+OP *
+INT 7
+OP ;

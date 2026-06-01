@@ -1,0 +1,5 @@
+function main() {
+  let n: i32 = 5;
+  let b: bool = n && true;    // error: && requires bool operands
+  stdout.println(b);
+}

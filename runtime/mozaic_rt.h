@@ -355,6 +355,13 @@ inline std::string encodeUtf8(const std::u32string& s) {
   return out;
 }
 
+// Read ALL of stdin as one owned String (UTF-8 -> UTF-32). For stdin-driven tools
+// (e.g. `mozaic build < src.mzc`) and the self-host bootstrap, which scan whole sources.
+inline String read_all_stdin() {
+  std::ostringstream ss;
+  ss << std::cin.rdbuf();
+  return decodeUtf8(ss.str());
+}
 inline std::vector<String> stdin_lines() {
   std::vector<String> lines;
   std::string line;

@@ -48,6 +48,7 @@ export type Expr =
   | { kind: "Borrow"; mut: boolean; expr: Expr; ty?: string }
   | { kind: "SpawnExpr"; call: Expr; ty?: string }
   | { kind: "Comptime"; expr: Expr; ty?: string; cval?: CTValue }   // comptime e — fold to a constant at build time
+  | { kind: "Unary"; op: string; expr: Expr; ty?: string }          // prefix !x (logical not)
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
 
 // A compile-time constant value produced by the comptime evaluator (see comptime.ts).

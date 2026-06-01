@@ -907,6 +907,7 @@ class Checker {
             e.ty = "u64"; return e.ty;
           }
           if (recv === "stdin" && m === "lines") { e.ty = "str-iter"; return e.ty; }
+          if (recv === "stdin" && m === "readAll") { if (e.args.length) this.err("stdin.readAll() takes no arguments"); e.ty = "str"; return e.ty; }
           if (recv === "stdout" && m === "println") {
             const at = e.args.length === 1 ? this.checkExpr(e.args[0]) : "unit";
             if (!(at === "str" || at === "bool" || at === "char" || isInt(at) || isFloat(at))) this.err(`stdout.println: cannot print ${at}`);
@@ -1017,6 +1018,11 @@ class Checker {
         e.ty = ret ? `Task<${ret}>` : "Task";   // a value-returning fn yields Task<R>; join() gives R back
         return e.ty;
       }
+      case "Unary": {   // prefix !x — logical not
+        const it = this.checkExpr(e.expr);
+        if (it !== "bool") this.err(`'!' requires a bool operand (got ${it})`);
+        e.ty = "bool"; return e.ty;
+      }
       case "Binary": {
         const lt = this.checkExpr(e.left), rt = this.checkExpr(e.right);
         if (this.hasAtomic(lt) || this.hasAtomic(rt)) { this.err(`Atomic can only be accessed via load/store/fetchAdd/compareExchange (not used as a value)`); e.ty = "i32"; return e.ty; }
@@ -1028,6 +1034,10 @@ class Checker {
           else if (lt !== rt) this.err(`vector op '${e.op}' requires matching vector types (got ${lt}, ${rt}); no implicit broadcast`);
           else if (e.op === "%" && lv && !isInt(lv.scalar)) this.err(`'%' on a float vector ${lt} is not allowed`);
           e.ty = lv !== null ? lt : rt; return e.ty;
+        }
+        if (e.op === "&&" || e.op === "||") {   // logical: both operands bool, result bool
+          if (lt !== "bool" || rt !== "bool") this.err(`'${e.op}' requires bool operands (got ${lt}, ${rt})`);
+          e.ty = "bool"; return e.ty;
         }
         if (e.op === "+" && lt === "str" && rt === "str") { e.ty = "str"; return e.ty; }   // string concatenation
         if (ARITH_OPS.includes(e.op)) {

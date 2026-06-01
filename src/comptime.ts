@@ -101,6 +101,7 @@ export class Comptime {
         throw new CompileError(`comptime: cannot read .${e.prop}`);
       }
       case "Cast": return this.cast(this.eval(e.expr, env), e.toTy, e.opt);
+      case "Unary": { const v = this.eval(e.expr, env); if (v.k !== "bool") throw new CompileError("comptime: '!' needs a bool"); return { k: "bool", v: !v.v }; }
       case "Binary": return this.binary(e, env);
       case "Call": return this.call(e, env);
       default: throw new CompileError(`comptime: '${e.kind}' is not allowed in a compile-time expression`);

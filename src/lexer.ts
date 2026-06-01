@@ -94,10 +94,11 @@ export function lex(src: string): Tok[] {
     }
     const two = src.slice(i, i + 2);
     if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "=>" || two === "??" ||
+        two === "&&" || two === "||" ||
         two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
       toks.push({ t: two, v: two, pos: i }); i += 2; continue;
     }
-    if ("(){}[];:,.=+-*/%<>&?".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
+    if ("(){}[];:,.=+-*/%<>&?!".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
   toks.push({ t: "eof", v: "", pos: n });

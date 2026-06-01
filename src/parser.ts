@@ -232,7 +232,7 @@ export class Parser {
     this.eat(")");
     const then = this.parseBlock();
     let els: Stmt[] | null = null;
-    if (this.at("else")) { this.next(); els = this.parseBlock(); }
+    if (this.at("else")) { this.next(); els = this.at("if") ? [this.parseIf()] : this.parseBlock(); }   // `else if` chains
     return { kind: "If", cond, then, els };
   }
   parseMatch(): Stmt {
@@ -257,9 +257,19 @@ export class Parser {
     return { kind: "Match", scrut, arms };
   }
   parseExpr(): Expr { return this.parseOrElse(); }
-  parseOrElse(): Expr {   // `a ?? b` (unwrap-or) — loosest binary; right side is a comparison
+  parseOrElse(): Expr {   // `a ?? b` (unwrap-or) — loosest binary
+    let left = this.parseLogicalOr();
+    while (this.at("??")) { this.next(); left = { kind: "OrElse", opt: left, alt: this.parseLogicalOr() }; }
+    return left;
+  }
+  parseLogicalOr(): Expr {
+    let left = this.parseLogicalAnd();
+    while (this.at("||")) { this.next(); left = { kind: "Binary", op: "||", left, right: this.parseLogicalAnd() }; }
+    return left;
+  }
+  parseLogicalAnd(): Expr {
     let left = this.parseComparison();
-    while (this.at("??")) { this.next(); left = { kind: "OrElse", opt: left, alt: this.parseComparison() }; }
+    while (this.at("&&")) { this.next(); left = { kind: "Binary", op: "&&", left, right: this.parseComparison() }; }
     return left;
   }
   parseComparison(): Expr {
@@ -304,6 +314,7 @@ export class Parser {
       return { kind: "Borrow", mut, expr: this.parseUnary() };
     }
     if (this.at("comptime")) { this.next(); return { kind: "Comptime", expr: this.parseUnary() }; }
+    if (this.at("!")) { this.next(); return { kind: "Unary", op: "!", expr: this.parseUnary() }; }
     return this.parsePostfix();
   }
   parsePostfix(): Expr {

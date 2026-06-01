@@ -1,0 +1,14 @@
+// Logical operators && || ! (SPEC §4): bool-only, short-circuiting, comptime-foldable.
+function main() {
+  let a: bool = true;
+  let b: bool = false;
+  stdout.println(a && b);     // false
+  stdout.println(a || b);     // true
+  stdout.println(!b);         // true
+  stdout.println(a && !b);    // true
+  // short-circuit: with x == 0 the (10 / x) on the right is never evaluated (no div-by-zero trap)
+  let x: i32 = 0;
+  if (x != 0 && (10 / x) > 1) { stdout.println(111); } else { stdout.println(0); }   // 0
+  let c: bool = comptime (true || false) && !false;   // folds the left, then true && true
+  stdout.println(c);          // true
+}
