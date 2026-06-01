@@ -1,0 +1,9 @@
+// Negative: the SAME field path cannot be &mut-borrowed twice in one call.
+struct Inner { v: i32; }
+struct Outer { a: Inner; b: Inner; }
+function setBoth(x: &mut Inner, y: &mut Inner) { x.v = 1; y.v = 2; }
+function main() {
+  let o: Outer = Outer { a: Inner { v: 0 }, b: Inner { v: 0 } };
+  setBoth(&mut o.a, &mut o.a);   // error: o.a borrowed &mut twice
+  stdout.println(o.a.v);
+}

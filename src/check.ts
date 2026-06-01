@@ -175,21 +175,34 @@ class Checker {
     const vs = this.lookupVar(root);
     return !!(vs && (refInner(vs.ty) !== null || sliceElem(vs.ty) !== null) && vs.paramRooted);
   }
-  // Aliasing within a single call's argument list: a variable borrowed &mut may not be borrowed again
-  // (& or &mut) in the same call. Multiple shared (&) borrows of one variable are fine. (launch/spawn
-  // enforce their own version via registerBorrows against the in-flight borrow set.)
+  // Access path of an lvalue, for disjoint-borrow reasoning: `p` / `p.x` / `p.x.y`. An index uses
+  // a `.[]` marker (indices aren't compared statically, so any two index borrows of the same array
+  // conservatively conflict). null if not a simple ident-rooted path.
+  borrowPath(e: Expr): string | null {
+    if (e.kind === "Ident") return e.name;
+    if (e.kind === "Member") { const b = this.borrowPath(e.obj); return b === null ? null : `${b}.${e.prop}`; }
+    if (e.kind === "Index") { const b = this.borrowPath(e.obj); return b === null ? null : `${b}.[]`; }
+    return null;
+  }
+  // Two paths overlap iff equal or one is a prefix of the other (`p` vs `p.x`; `p.x` vs `p.x.y`).
+  // Disjoint fields (`p.x` vs `p.y`) do NOT overlap, so they may be borrowed &mut simultaneously.
+  pathsOverlap(a: string, b: string): boolean { return a === b || a.startsWith(b + ".") || b.startsWith(a + "."); }
+  // Aliasing within a single call's argument list: a path borrowed &mut may not be borrowed again
+  // (& or &mut) over an OVERLAPPING path in the same call. Multiple shared (&) borrows are fine, and
+  // disjoint fields are independent (M5 disjoint-field borrows). launch/spawn enforce their own version.
   checkArgAliasing(args: Expr[], where: string) {
-    const mut = new Set<string>(), shared = new Set<string>();
+    const muts: string[] = [], shareds: string[] = [];
     for (const a of args) {
-      if (a.kind !== "Borrow" || a.expr.kind !== "Ident") continue;
-      const root = a.expr.name;
+      if (a.kind !== "Borrow") continue;
+      const p = this.borrowPath(a.expr);
+      if (p === null) continue;
       if (a.mut) {
-        if (mut.has(root)) this.err(`'${root}' is borrowed as &mut more than once in ${where}`);
-        else if (shared.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
-        mut.add(root);
+        if (muts.some((m) => this.pathsOverlap(p, m))) this.err(`'${p}' is borrowed as &mut more than once in ${where}`);
+        else if (shareds.some((s) => this.pathsOverlap(p, s))) this.err(`'${p}' is borrowed both & and &mut in ${where}`);
+        muts.push(p);
       } else {
-        if (mut.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
-        shared.add(root);
+        if (muts.some((m) => this.pathsOverlap(p, m))) this.err(`'${p}' is borrowed both & and &mut in ${where}`);
+        shareds.push(p);
       }
     }
   }

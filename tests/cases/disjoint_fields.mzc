@@ -1,0 +1,10 @@
+// M5 disjoint-field borrows: &mut v.a and &mut v.b are independent (no false alias error).
+struct Inner { v: i32; }
+struct Outer { a: Inner; b: Inner; }
+function setBoth(x: &mut Inner, y: &mut Inner) { x.v = 1; y.v = 2; }
+function main() {
+  let o: Outer = Outer { a: Inner { v: 0 }, b: Inner { v: 0 } };
+  setBoth(&mut o.a, &mut o.b);   // disjoint fields -> OK
+  stdout.println(o.a.v);         // 1
+  stdout.println(o.b.v);         // 2
+}
