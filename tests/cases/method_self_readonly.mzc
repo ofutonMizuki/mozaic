@@ -1,0 +1,11 @@
+// Negative: a &self method may not mutate self.
+struct Vec2 {
+  x: i32;
+  y: i32;
+  function bad(&self) { self.x = 0; }
+}
+function main() {
+  let v: Vec2 = Vec2 { x: 1, y: 2 };
+  v.bad();
+  stdout.println(v.x);
+}

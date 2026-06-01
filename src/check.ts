@@ -1,5 +1,5 @@
 // Semantic analysis: name resolution + strict type checking.
-import type { Program, Stmt, Expr, Param, Sig, VarInfo } from "./ast.ts";
+import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
@@ -22,6 +22,7 @@ class Checker {
   fns = new Map<string, Sig>();
   kernels = new Map<string, Param[]>();
   structs = new Map<string, Map<string, string>>();
+  structMethods = new Map<string, Map<string, Method>>();   // struct name -> method name -> Method
   enums = new Map<string, Map<string, string[]>>();
   variants = new Map<string, VarInfo>();
   curRet = "unit";
@@ -161,6 +162,9 @@ class Checker {
       const fm = new Map<string, string>();
       for (const f of it.fields) fm.set(f.name, f.ty);
       this.structs.set(it.name, fm);
+      const mm = new Map<string, Method>();
+      for (const m of it.methods) { if (mm.has(m.name)) this.err(`duplicate method '${it.name}.${m.name}'`); mm.set(m.name, m); }
+      this.structMethods.set(it.name, mm);
     }
     for (const it of p.items) if (it.kind === "EnumDecl") {
       if (this.enums.has(it.name)) this.err(`duplicate enum '${it.name}'`);
@@ -215,6 +219,22 @@ class Checker {
       for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
       for (const [name, t] of this.tasks) if (!t.joined) this.err(`'${name}' is a Task that was never joined; join it before it goes out of scope`);
       this.inKernel = false;
+      this.pop();
+    }
+    // struct method bodies: bind `self` (typed by the receiver form) + params, then check.
+    for (const it of p.items) if (it.kind === "StructDecl") for (const m of it.methods) {
+      if (m.recv === "self") { this.err(`'${it.name}.${m.name}': by-value 'self' receiver is not supported yet (use &self / &mut self)`); continue; }
+      this.push();
+      this.curRet = m.retTy ?? "unit";
+      this.borrows = new Map();
+      this.tasks = new Map();
+      this.define("self", (m.recv === "&mut self" ? "&mut " : "&") + it.name, m.recv === "&mut self");
+      for (const pa of m.params) {
+        if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}' of '${it.name}.${m.name}'`);
+        this.define(pa.name, pa.ty);
+      }
+      if (m.retTy && !this.typeKnown(m.retTy)) this.err(`unknown return type '${m.retTy}' for '${it.name}.${m.name}'`);
+      for (const s of m.body) this.checkStmt(s);
       this.pop();
     }
   }
@@ -541,7 +561,8 @@ class Checker {
             e.ty = "unit"; return e.ty;
           }
         }
-        // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), and task.join().
+        // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), task.join(),
+        // and user struct methods (recv.method(args), auto-deref through &T).
         if (e.callee.kind === "Member") {
           const recvTy = this.checkExpr(e.callee.obj);
           const ae = atomicElem(recvTy);
@@ -552,6 +573,23 @@ class Checker {
           if (recvTy === "Task" && e.callee.prop === "join") {
             if (e.args.length) this.err("join() takes no arguments");
             e.ty = "unit"; return e.ty;
+          }
+          const baseTy = refInner(recvTy) ?? recvTy;
+          const methods = this.structMethods.get(baseTy);
+          if (methods) {
+            const m = methods.get(e.callee.prop);
+            if (!m) { this.err(`no method '${e.callee.prop}' on ${baseTy}`); e.ty = "i32"; return e.ty; }
+            if (m.recv === "&mut self" && e.callee.obj.kind === "Ident") {   // mutating method needs a mutable/&mut receiver
+              const ov = this.lookupVar(e.callee.obj.name);
+              if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`'${e.callee.prop}' needs &mut self but '${e.callee.obj.name}' is a shared reference`); }
+              else if (ov && !ov.mutable) this.err(`'${e.callee.prop}' needs &mut self but '${e.callee.obj.name}' is immutable (use 'let')`);
+            }
+            if (e.args.length !== m.params.length) this.err(`method '${e.callee.prop}' expects ${m.params.length} arg(s), got ${e.args.length}`);
+            for (let k = 0; k < e.args.length; k++) {
+              const at = this.checkExpr(e.args[k]); const p = m.params[k];
+              if (p && !this.assignable(at, p.ty)) this.err(`method '${e.callee.prop}' arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
+            }
+            e.ty = m.retTy ?? "unit"; return e.ty;
           }
         }
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;

@@ -1,0 +1,13 @@
+// Struct methods: &self (read-only) and &mut self (mutating), called on a local.
+struct Vec2 {
+  x: i32;
+  y: i32;
+  function len2(&self): i32 { return self.x * self.x + self.y * self.y; }
+  function scale(&mut self, k: i32) { self.x = self.x * k; self.y = self.y * k; }
+}
+function main() {
+  let v: Vec2 = Vec2 { x: 3, y: 4 };
+  stdout.println(v.len2());     // 25
+  v.scale(2);
+  stdout.println(v.len2());     // 100
+}
