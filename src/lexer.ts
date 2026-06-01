@@ -39,6 +39,7 @@ export function lex(src: string): Tok[] {
       let brace = 0;   // 0 = literal region; >0 = inside ${ ... } (balanced braces)
       while (i < n) {
         const d = src[i];
+        if (brace === 0 && d === "\\") { raw += d + (src[i + 1] ?? ""); i += 2; continue; }   // keep escapes raw so \` / \${ don't terminate/interpolate
         if (brace === 0 && d === "`") { i++; break; }                       // end of template
         if (brace === 0 && d === "$" && src[i + 1] === "{") { brace = 1; raw += "${"; i += 2; continue; }
         if (brace > 0) {

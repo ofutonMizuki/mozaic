@@ -47,6 +47,8 @@ class Checker {
     const ae = atomicElem(t);
     if (ae !== null && !ATOMIC_INTS.includes(ae)) return `Atomic<${ae}>: T must be one of u32, i32, u64, i64`;
     const oi = optInner(t); if (oi !== null) return this.badAtomicElem(oi);
+    const se = sliceElem(t); if (se !== null) return this.badAtomicElem(se);
+    const ap = arrayParts(t); if (ap !== null) return this.badAtomicElem(ap[0]);
     const be = bufferElem(t); if (be !== null) return this.badAtomicElem(be);
     const ra = resultArgs(t); if (ra !== null) return this.badAtomicElem(ra[0]) ?? this.badAtomicElem(ra[1]);
     return null;
@@ -163,7 +165,7 @@ class Checker {
     if (root === null) return false;
     if (this.curParams.has(root)) return true;
     const vs = this.lookupVar(root);
-    return !!(vs && refInner(vs.ty) !== null && vs.paramRooted);
+    return !!(vs && (refInner(vs.ty) !== null || sliceElem(vs.ty) !== null) && vs.paramRooted);
   }
   // Aliasing within a single call's argument list: a variable borrowed &mut may not be borrowed again
   // (& or &mut) in the same call. Multiple shared (&) borrows of one variable are fine. (launch/spawn
@@ -245,6 +247,7 @@ class Checker {
         if (refInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a reference (host-data refs are not allowed in kernels)`);
         if (optInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be optional`);
         if (resultArgs(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a Result`);
+        if (sliceElem(pa.ty) !== null || arrayParts(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be an array/slice (use Buffer<T>)`);
       }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
@@ -342,8 +345,8 @@ class Checker {
           this.registerSpawnBorrows(s.value.call, s.name);
         }
         this.moveIfBinding(s.value);   // `let q = p` (p non-Copy) moves p; later use of p is an error
-        // a ref local records whether its referent is parameter-rooted (so escape on return is decidable)
-        if (refInner(declTy) !== null) { const vs = this.lookupVar(s.name); if (vs) vs.paramRooted = this.fromParam(s.value); }
+        // a ref/slice local records whether its referent is parameter-rooted (so escape on return is decidable)
+        if (refInner(declTy) !== null || sliceElem(declTy) !== null) { const vs = this.lookupVar(s.name); if (vs) vs.paramRooted = this.fromParam(s.value); }
         break;
       }
       case "Assign": {
@@ -417,9 +420,10 @@ class Checker {
         else {
           const vt = this.checkExpr(s.value);
           if (!this.assignable(vt, this.curRet)) this.err(`return type mismatch: ${vt} vs ${this.curRet}`);
-          // escape: a returned reference must originate from a parameter (its referent outlives the call).
-          if (refInner(this.curRet) !== null && !this.fromParam(s.value))
-            this.err(`returns a reference to a local (it would dangle); a returned reference must come from a parameter`);
+          // escape: a returned reference/slice must originate from a parameter (its referent outlives the call).
+          // slice(localArray) views a stack array; returning it dangles exactly like return &local.
+          if ((refInner(this.curRet) !== null || sliceElem(this.curRet) !== null) && !this.fromParam(s.value))
+            this.err(`returns a reference/slice to local data (it would dangle); it must come from a parameter`);
         }
         break;
       }

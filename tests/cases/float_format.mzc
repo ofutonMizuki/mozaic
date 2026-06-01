@@ -1,0 +1,7 @@
+function main() {
+  let x = 3.0;
+  stdout.println(`x=${x}`);    // x=3
+  stdout.println(x);           // 3
+  let y = 3.5;
+  stdout.println(`y=${y}`);    // y=3.5
+}

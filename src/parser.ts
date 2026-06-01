@@ -352,6 +352,7 @@ export class Parser {
     let cur = "";
     let i = 0;
     while (i < raw.length) {
+      if (raw[i] === "\\") { cur += raw[i] + (raw[i + 1] ?? ""); i += 2; continue; }   // \${ / \` are literal, not interpolation
       if (raw[i] === "$" && raw[i + 1] === "{") {
         strings.push(this.unescapeTmpl(cur)); cur = "";
         let brace = 1, j = i + 2, src = "";

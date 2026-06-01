@@ -11,6 +11,7 @@
 #include <optional>
 #include <type_traits>
 #include <array>
+#include <sstream>
 
 namespace mz {
 
@@ -317,7 +318,7 @@ inline String format(char32_t c)            { return String(1, c); }
 inline String format(bool b)                { return decodeUtf8(b ? "true" : "false"); }
 inline String format(long long v)           { return decodeUtf8(std::to_string(v)); }
 inline String format(unsigned long long v)  { return decodeUtf8(std::to_string(v)); }
-inline String format(double v)              { return decodeUtf8(std::to_string(v)); }
+inline String format(double v)              { std::ostringstream os; os << v; return decodeUtf8(os.str()); }   // match println(double)
 
 // abort / assert. panic_msg takes an mz::String (needs encodeUtf8, defined above).
 // assert_ is always checked (a correctness contract, unlike the debug-only overflow traps).

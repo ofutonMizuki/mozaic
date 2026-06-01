@@ -1,0 +1,2 @@
+kernel k(a: [i32; 3]) { }
+function main() { }

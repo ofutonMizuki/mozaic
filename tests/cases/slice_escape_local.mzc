@@ -1,0 +1,5 @@
+function bad(): []i32 {
+  let a: [i32; 3] = [1, 2, 3];
+  return slice(a);              // a dies at return -> dangling slice
+}
+function main() { let s = bad(); stdout.println(s[0]); }

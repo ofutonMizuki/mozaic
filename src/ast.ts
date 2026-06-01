@@ -99,6 +99,8 @@ export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T i
 export function containsAtomic(t: string, structFields: Map<string, string[]>, seen = new Set<string>()): boolean {
   if (atomicElem(t) !== null) return true;
   const oi = optInner(t); if (oi !== null) return containsAtomic(oi, structFields, seen);   // T?  (don't smuggle an Atomic through an optional)
+  const se = sliceElem(t); if (se !== null) return containsAtomic(se, structFields, seen);   // []T
+  const ap = arrayParts(t); if (ap !== null) return containsAtomic(ap[0], structFields, seen);   // [T;N]
   const be = bufferElem(t); if (be !== null) return containsAtomic(be, structFields, seen);
   const ra = resultArgs(t); if (ra !== null) return containsAtomic(ra[0], structFields, seen) || containsAtomic(ra[1], structFields, seen);
   if (seen.has(t)) return false;

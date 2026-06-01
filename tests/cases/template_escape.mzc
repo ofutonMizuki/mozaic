@@ -1,0 +1,6 @@
+function main() {
+  let x = 5;
+  stdout.println(`\${x}`);     // literal ${x}
+  stdout.println(`a\`b`);      // a`b
+  stdout.println(`v=${x}`);    // v=5 (real interpolation still works)
+}

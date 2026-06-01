@@ -106,7 +106,7 @@ function emitExpr(e: Expr): string {
     case "None": return "{}";                        // empty optional (nullopt) via the target type
     case "Ok":  return `{ true, ${emitExpr(e.expr)} }`;       // mz::Result aggregate: {ok, val, err=default}
     case "Err": return `{ false, {}, ${emitExpr(e.expr)} }`;  // {ok=false, val=default, err}
-    case "Array": return `{ ${e.elems.map(emitExpr).join(", ")} }`;   // braced -> adapts to std::array<T,N>
+    case "Array": return `{{ ${e.elems.map(emitExpr).join(", ")} }}`;   // double brace: std::array wraps a C-array (works flat AND nested)
     case "Template": {   // `a${e}b` -> (U"a"_mz + format(e) + U"b"_mz) : mz::String
       const parts = [cstr(e.strings[0])];
       for (let k = 0; k < e.exprs.length; k++) { parts.push(formatArg(e.exprs[k])); parts.push(cstr(e.strings[k + 1])); }

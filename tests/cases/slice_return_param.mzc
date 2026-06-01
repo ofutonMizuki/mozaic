@@ -1,0 +1,6 @@
+function echo2(s: []i32): []i32 { return s; }   // returning a slice parameter is safe
+function main() {
+  let a: [i32; 3] = [10, 20, 30];
+  let t = echo2(slice(a));
+  stdout.println(t[1]);   // 20
+}

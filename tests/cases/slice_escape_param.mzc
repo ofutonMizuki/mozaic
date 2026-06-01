@@ -1,0 +1,4 @@
+function bad(arr: [i32; 3]): []i32 {
+  return slice(arr);            // param array is a by-value copy -> dangles
+}
+function main() { stdout.println("x"); }
