@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
-import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, VarInfo } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, bufferElem, atomicElem, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
+import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, VarInfo } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -86,6 +86,7 @@ function emitExpr(e: Expr): string {
     case "Float": return e.value;
     case "Str": return cstr(e.value);
     case "Ident": {
+      if (e.name === "self") return "(*this)";   // method receiver -> the C++ instance
       if (e.name in ORDER_CPP) return ORDER_CPP[e.name];
       const v = VARIANTS.get(e.name);
       if (v && v.payload.length === 0) return `${v.enumName}{ .tag = ${v.index} }`;
@@ -197,6 +198,14 @@ function emitMatch(s: Extract<Stmt, { kind: "Match" }>, ind: string, ctx: string
   return out;
 }
 
+// A non-Copy binding read as an RHS is a MOVE (the checker proved the source is not used afterward):
+// emit std::move so we transfer the vector/string/struct rather than silently deep-copy. Variant idents
+// and Copy values pass through unchanged.
+function moveRhs(e: Expr): string {
+  const code = emitExpr(e);
+  return (e.kind === "Ident" && !VARIANTS.has(e.name) && !isCopy(e.ty ?? "")) ? `std::move(${code})` : code;
+}
+
 function emitStmt(s: Stmt, ind: string, ctx: string): string {
   switch (s.kind) {
     case "Let":
@@ -212,8 +221,8 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
         const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
         return `${ind}${cppType(s.declTy!)} ${s.name} = ${cppType(s.declTy!)}(${arg});`;
       }
-      return `${ind}${cppType(s.declTy!)} ${s.name} = ${emitExpr(s.value)};`;
-    case "Assign": return `${ind}${emitExpr(s.target)} = ${emitExpr(s.value)};`;
+      return `${ind}${cppType(s.declTy!)} ${s.name} = ${moveRhs(s.value)};`;
+    case "Assign": return `${ind}${emitExpr(s.target)} = ${moveRhs(s.value)};`;
     case "While": {
       const body = s.body.map((st) => emitStmt(st, ind + "  ", ctx)).join("\n");
       return `${ind}while (${emitExpr(s.cond)}) {\n${body}\n${ind}}`;
@@ -349,11 +358,24 @@ function emitMslKernel(k: KernelDecl): string {
   const indent = "\n                 ";
   return `#include <metal_stdlib>\nusing namespace metal;\nkernel void ${k.name}(${sig.join("," + indent)}) {\n${body}\n}`;
 }
+function methodSig(m: Method): string {   // return-type name(params) [const]  — &self -> const member
+  return `${m.retTy ? cppType(m.retTy) : "void"} ${m.name}(${m.params.map(emitParam).join(", ")})${m.recv === "&self" ? " const" : ""}`;
+}
 function emitTypeDecl(it: StructDecl | EnumDecl): string {
-  if (it.kind === "StructDecl") return `struct ${it.name} { ${it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ")} };`;
+  if (it.kind === "StructDecl") {
+    const fields = it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ");
+    const decls = it.methods.map((m) => `${methodSig(m)};`).join(" ");   // declarations; bodies emitted out-of-line
+    return `struct ${it.name} { ${[fields, decls].filter((s) => s).join(" ")} };`;
+  }
   const fields: string[] = ["int tag;"];
   for (const v of it.variants) v.payload.forEach((pt, i) => fields.push(`${cppType(pt)} ${v.name}_${i};`));
   return `struct ${it.name} { ${fields.join(" ")} };`;
+}
+// Out-of-line method body: `ret Struct::method(params) const { ... }`. Emitted AFTER fn prototypes so
+// a method body may call free functions; `self` lowers to (*this).
+function emitMethodDef(structName: string, m: Method): string {
+  const body = m.body.map((s) => emitStmt(s, "  ", m.retTy ? "value" : "void")).join("\n");
+  return `${m.retTy ? cppType(m.retTy) : "void"} ${structName}::${m.name}(${m.params.map(emitParam).join(", ")})${m.recv === "&self" ? " const" : ""} {\n${body}\n}`;
 }
 
 export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
@@ -386,14 +408,17 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + byRefTy(p)).join("")});`).join("\n");
   const fnProtos = fns.filter((f) => f.name !== "main").map((f) => `${f.retTy ? cppType(f.retTy) : "void"} ${f.name}(${f.params.map(byRefTy).join(", ")});`).join("\n");
   const protos = [kernelProtos, fnProtos].filter((s) => s).join("\n");
+  // Struct method bodies, out-of-line, AFTER prototypes so a method may call free functions.
+  const methodDefs = types.flatMap((it) => it.kind === "StructDecl" ? it.methods.map((m) => emitMethodDef(it.name, m)) : []).join("\n\n");
   const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.map(emitFn)].join("\n\n");
   // Pull in <atomic> / <thread> only when the program actually uses them (the emitted code names them).
-  const allCode = typeDecls + mslDecls + protos + defs;
+  const allCode = typeDecls + mslDecls + protos + methodDefs + defs;
   const sysIncludes = (allCode.includes("std::atomic") ? "#include <atomic>\n" : "") +
-                      (allCode.includes("std::thread") ? "#include <thread>\n" : "");
+                      (allCode.includes("std::thread") ? "#include <thread>\n" : "") +
+                      (allCode.includes("std::move") ? "#include <utility>\n" : "");
   return `// generated by mozaic (M0)${target === "metal" ? " [Metal/MSL backend]" : ""}
 ${sysIncludes}#include "mozaic_rt.h"
 
-${typeDecls ? typeDecls + "\n\n" : ""}${mslDecls ? mslDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${defs}
+${typeDecls ? typeDecls + "\n\n" : ""}${mslDecls ? mslDecls + "\n\n" : ""}${protos ? protos + "\n\n" : ""}${methodDefs ? methodDefs + "\n\n" : ""}${defs}
 `;
 }

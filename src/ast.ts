@@ -5,13 +5,14 @@ export type Item = FnDecl | StructDecl | EnumDecl | KernelDecl;
 export type Param = { name: string; ty: string };
 export type Field = { name: string; ty: string };
 export type Variant = { name: string; payload: string[] };
-export type StructDecl = { kind: "StructDecl"; name: string; fields: Field[] };
+export type Method = { name: string; recv: "self" | "&self" | "&mut self"; params: Param[]; retTy: string | null; body: Stmt[] };
+export type StructDecl = { kind: "StructDecl"; name: string; fields: Field[]; methods: Method[] };
 export type EnumDecl = { kind: "EnumDecl"; name: string; variants: Variant[] };
 export type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[] };
 export type KernelDecl = { kind: "KernelDecl"; name: string; params: Param[]; body: Stmt[] };
 export type Arm = { variant: string; bindings: string[]; body: Stmt[] };
 export type Stmt =
-  | { kind: "Let"; name: string; annot: string | null; value: Expr; declTy?: string }
+  | { kind: "Let"; name: string; annot: string | null; value: Expr; declTy?: string; isConst?: boolean }
   | { kind: "Assign"; target: Expr; value: Expr }
   | { kind: "While"; cond: Expr; body: Stmt[] }
   | { kind: "ForOf"; binder: string; iter: Expr; body: Stmt[] }
@@ -44,6 +45,13 @@ export const FLOATS = ["f32", "f64"];
 export function isInt(t: string): boolean { return t === "intlit" || INTS.includes(t); }
 export function isFloat(t: string): boolean { return t === "floatlit" || FLOATS.includes(t); }
 export function isUnsigned(t: string): boolean { return t !== "intlit" && t.startsWith("u"); }
+// Copy types are duplicated freely on assign/pass; everything else is move-only (single owner).
+// Non-Copy: str/String, Buffer<T>, structs, enums-with-payload, Atomic<...>.
+export function isCopy(t: string): boolean { return isInt(t) || isFloat(t) || t === "bool"; }
+// References are encoded as a string prefix: `&T` (shared) / `&mut T` (exclusive).
+export function isRef(t: string): boolean { return t.startsWith("&"); }
+export function isMutRef(t: string): boolean { return t.startsWith("&mut "); }
+export function refInner(t: string): string | null { return t.startsWith("&mut ") ? t.slice(5) : (t.startsWith("&") ? t.slice(1) : null); }
 export function bufferElem(t: string): string | null { return t.startsWith("Buffer<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export function atomicElem(t: string): string | null { return t.startsWith("Atomic<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T in Atomic<T>
@@ -71,6 +79,8 @@ export function unifyFloat(a: string, b: string): string | null {
   return a === b ? a : null;
 }
 export function cppType(t: string): string {
+  const ri = refInner(t);
+  if (ri !== null) return isMutRef(t) ? `${cppType(ri)}&` : `const ${cppType(ri)}&`;   // &T -> const T& / &mut T -> T&
   switch (t) {
     case "i8": return "int8_t"; case "i16": return "int16_t"; case "i32": return "int32_t"; case "i64": return "int64_t";
     case "u8": return "uint8_t"; case "u16": return "uint16_t"; case "u32": return "uint32_t"; case "u64": return "uint64_t";

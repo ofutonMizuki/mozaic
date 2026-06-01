@@ -1,0 +1,3 @@
+int32_t Vec2::len2() const
+void Vec2::scale(int32_t k)
+(*this).x

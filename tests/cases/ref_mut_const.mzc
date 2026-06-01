@@ -1,0 +1,8 @@
+// Negative: &mut requires a mutable (let) binding.
+struct Point { x: i32; y: i32; }
+function bump(p: &mut Point) { p.x = p.x + 1; }
+function main() {
+  const c: Point = Point { x: 1, y: 2 };
+  bump(&mut c);
+  stdout.println(c.x);
+}

@@ -1,0 +1,8 @@
+// Shared reference parameter + auto-deref; the borrowed value is not moved.
+struct Point { x: i32; y: i32; }
+function dist2(p: &Point): i32 { return p.x * p.x + p.y * p.y; }
+function main() {
+  let p: Point = Point { x: 3, y: 4 };
+  stdout.println(dist2(&p));   // 25
+  stdout.println(p.x);         // 3
+}

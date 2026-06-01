@@ -1,0 +1,9 @@
+// &mut reference parameter: the callee mutates the caller's value in place.
+struct Counter { n: i32; }
+function bump(c: &mut Counter) { c.n = c.n + 1; }
+function main() {
+  let c: Counter = Counter { n: 10 };
+  bump(&mut c);
+  bump(&mut c);
+  stdout.println(c.n);   // 12
+}

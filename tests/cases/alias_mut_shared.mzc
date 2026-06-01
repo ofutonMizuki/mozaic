@@ -1,0 +1,8 @@
+// Negative: a variable cannot be &mut and & borrowed in the same call.
+struct Point { x: i32; y: i32; }
+function addTo(dst: &mut Point, src: &Point) { dst.x = dst.x + src.x; }
+function main() {
+  let p: Point = Point { x: 1, y: 2 };
+  addTo(&mut p, &p);
+  stdout.println(p.x);
+}

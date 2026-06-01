@@ -1,6 +1,6 @@
 // Recursive-descent parser: tokens -> AST.
 import type {
-  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, Arm, Stmt, Expr,
+  Program, Item, Param, Field, Variant, StructDecl, EnumDecl, FnDecl, KernelDecl, Method, Arm, Stmt, Expr,
 } from "./ast.ts";
 import type { Tok } from "./lexer.ts";
 
@@ -19,6 +19,12 @@ export class Parser {
     return tk;
   }
   parseType(): string {
+    if (this.at("&")) {   // reference type: &T (shared) / &mut T (exclusive)
+      this.next();
+      let mut = false;
+      if (this.at("mut")) { this.next(); mut = true; }
+      return (mut ? "&mut " : "&") + this.parseType();
+    }
     const name = this.eat("id").v;
     if (this.at("<")) { this.next(); const inner = this.parseType(); this.eat(">"); return `${name}<${inner}>`; }
     return name;
@@ -38,7 +44,9 @@ export class Parser {
     const name = this.eat("id").v;
     this.eat("{");
     const fields: Field[] = [];
+    const methods: Method[] = [];
     while (!this.at("}")) {
+      if (this.at("function")) { methods.push(this.parseMethod()); continue; }
       const fname = this.eat("id").v;
       this.eat(":");
       const ty = this.parseType();
@@ -46,7 +54,21 @@ export class Parser {
       fields.push({ name: fname, ty });
     }
     this.eat("}");
-    return { kind: "StructDecl", name, fields };
+    return { kind: "StructDecl", name, fields, methods };
+  }
+  parseMethod(): Method {
+    this.eat("function");
+    const name = this.eat("id").v;
+    this.eat("(");
+    let recv: "self" | "&self" | "&mut self" = "self";
+    if (this.at("&")) { this.next(); if (this.at("mut")) { this.next(); recv = "&mut self"; } else recv = "&self"; }
+    if (this.eat("id").v !== "self") throw new Error("parse error: method receiver must be self / &self / &mut self");
+    const params: Param[] = [];
+    while (this.at(",")) { this.next(); params.push(this.parseParam()); }
+    this.eat(")");
+    let retTy: string | null = null;
+    if (this.at(":")) { this.next(); retTy = this.parseType(); }
+    return { name, recv, params, retTy, body: this.parseBlock() };
   }
   parseEnum(): EnumDecl {
     this.eat("enum");
@@ -122,21 +144,21 @@ export class Parser {
       this.next();
       const value = this.parseExpr();
       this.eat(";");
-      if (e.kind !== "Ident" && e.kind !== "Index") throw new Error("parse error: invalid assignment target");
+      if (e.kind !== "Ident" && e.kind !== "Index" && e.kind !== "Member") throw new Error("parse error: invalid assignment target");
       return { kind: "Assign", target: e, value };
     }
     this.eat(";");
     return { kind: "ExprStmt", expr: e };
   }
   parseLet(): Stmt {
-    this.next();
+    const isConst = this.next().t === "const";
     const name = this.eat("id").v;
     let annot: string | null = null;
     if (this.at(":")) { this.next(); annot = this.parseType(); }
     this.eat("=");
     const value = this.parseExpr();
     this.eat(";");
-    return { kind: "Let", name, annot, value };
+    return { kind: "Let", name, annot, value, isConst };
   }
   parseWhile(): Stmt {
     this.eat("while"); this.eat("(");

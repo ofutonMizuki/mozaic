@@ -1,0 +1,11 @@
+// Negative: a &mut self method may not be called on an immutable (const) receiver.
+struct Vec2 {
+  x: i32;
+  y: i32;
+  function scale(&mut self, k: i32) { self.x = self.x * k; self.y = self.y * k; }
+}
+function main() {
+  const v: Vec2 = Vec2 { x: 3, y: 4 };
+  v.scale(2);
+  stdout.println(v.x);
+}

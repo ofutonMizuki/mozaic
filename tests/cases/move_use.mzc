@@ -1,0 +1,8 @@
+// Negative: a non-Copy struct is moved on rebind; using the source afterward is an error.
+struct Point { x: i32; y: i32; }
+function main() {
+  let p: Point = Point { x: 3, y: 4 };
+  let q: Point = p;        // moves p
+  stdout.println(p.x);     // use-after-move
+  stdout.println(q.x);
+}

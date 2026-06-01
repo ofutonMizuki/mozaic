@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
-import type { Program, Stmt, Expr, Param, Sig, VarInfo } from "./ast.ts";
+import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -9,21 +9,28 @@ import {
 // job.await) cannot be touched by the host. & = shared (CPU reads still OK), &mut = exclusive.
 // The same machinery backs spawn/scope/join: a task holds its &/&mut args until it joins.
 type Borrow = { mut: boolean; job: string };
+// Per-binding state for ownership/move tracking. `moved` = ownership transferred out (later use is an
+// error); `loopDepth` = the loop nesting at definition (moving an outer binding inside a loop is unsound).
+type VarState = { ty: string; moved: boolean; loopDepth: number; mutable: boolean; paramRooted?: boolean };
 
 // Memory orderings (SPEC §5; SeqCst intentionally omitted). Atomic ops take a LITERAL one.
 const ORDERINGS = new Set(["Relaxed", "Acquire", "Release", "AcqRel"]);
 
 class Checker {
   errs: string[] = [];
-  scopes: Map<string, string>[] = [];
+  scopes: Map<string, VarState>[] = [];
   fns = new Map<string, Sig>();
   kernels = new Map<string, Param[]>();
   structs = new Map<string, Map<string, string>>();
+  structMethods = new Map<string, Map<string, Method>>();   // struct name -> method name -> Method
   enums = new Map<string, Map<string, string[]>>();
   variants = new Map<string, VarInfo>();
   curRet = "unit";
   borrows = new Map<string, Borrow>();   // buffer/atomic name -> in-flight borrow (per function)
   suppressBufRead: string | null = null;  // the lvalue buffer of the current Assign (write, not read)
+  suppressMovedCheck: string | null = null;  // the Assign target ident (assigning TO it is not a use)
+  loopDepth = 0;                           // loop nesting depth (for the move-in-loop soundness guard)
+  curParams = new Set<string>();           // current fn/method parameter names (incl. 'self') — for escape
   inKernel = false;                        // checking a kernel body? (Atomic is banned there)
   tasks = new Map<string, { joined: boolean }>();  // named spawn Tasks -> joined yet? (per function)
   scopeStack: string[] = [];               // active scope ids (bare spawns join at scope end)
@@ -124,13 +131,59 @@ class Checker {
   }
   push() { this.scopes.push(new Map()); }
   pop() { this.scopes.pop(); }
-  define(n: string, t: string) { this.scopes[this.scopes.length - 1].set(n, t); }
-  lookup(n: string): string | null {
-    for (let i = this.scopes.length - 1; i >= 0; i--) { const t = this.scopes[i].get(n); if (t) return t; }
+  define(n: string, t: string, mutable = true) { this.scopes[this.scopes.length - 1].set(n, { ty: t, moved: false, loopDepth: this.loopDepth, mutable }); }
+  lookup(n: string): string | null { const v = this.lookupVar(n); return v ? v.ty : null; }
+  lookupVar(n: string): VarState | null {
+    for (let i = this.scopes.length - 1; i >= 0; i--) { const v = this.scopes[i].get(n); if (v) return v; }
     return null;
+  }
+  // If `e` reads a non-Copy, non-atomic binding, it MOVES it (later use is an error). Copy values are
+  // never moved; Atomic is handled separately (immovable). Moving an outer binding inside a loop is
+  // unsound (re-move across iterations), so reject it.
+  moveIfBinding(e: Expr) {
+    if (e.kind !== "Ident") return;
+    const src = this.lookupVar(e.name);
+    if (!src || isCopy(src.ty) || this.hasAtomic(src.ty)) return;
+    if (src.loopDepth < this.loopDepth) this.err(`cannot move '${e.name}' inside a loop (it is declared outside the loop)`);
+    else src.moved = true;
+  }
+  // Root identifier of an lvalue path (walk through .field / [idx]); null if not ident-rooted.
+  rootIdent(e: Expr): string | null {
+    let c: Expr = e;
+    while (c.kind === "Member" || c.kind === "Index") c = c.obj;
+    return c.kind === "Ident" ? c.name : null;
+  }
+  // Does this borrow / reference value originate from a parameter (so its referent outlives the call,
+  // making it safe to return)? A param-rooted ref local counts; a local-rooted one does not.
+  fromParam(e: Expr): boolean {
+    if (e.kind === "Borrow") return this.fromParam(e.expr);
+    const root = this.rootIdent(e);
+    if (root === null) return false;
+    if (this.curParams.has(root)) return true;
+    const vs = this.lookupVar(root);
+    return !!(vs && refInner(vs.ty) !== null && vs.paramRooted);
+  }
+  // Aliasing within a single call's argument list: a variable borrowed &mut may not be borrowed again
+  // (& or &mut) in the same call. Multiple shared (&) borrows of one variable are fine. (launch/spawn
+  // enforce their own version via registerBorrows against the in-flight borrow set.)
+  checkArgAliasing(args: Expr[], where: string) {
+    const mut = new Set<string>(), shared = new Set<string>();
+    for (const a of args) {
+      if (a.kind !== "Borrow" || a.expr.kind !== "Ident") continue;
+      const root = a.expr.name;
+      if (a.mut) {
+        if (mut.has(root)) this.err(`'${root}' is borrowed as &mut more than once in ${where}`);
+        else if (shared.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
+        mut.add(root);
+      } else {
+        if (mut.has(root)) this.err(`'${root}' is borrowed both & and &mut in ${where}`);
+        shared.add(root);
+      }
+    }
   }
   err(m: string) { this.errs.push(m); }
   typeKnown(t: string): boolean {
+    const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
@@ -144,6 +197,9 @@ class Checker {
       const fm = new Map<string, string>();
       for (const f of it.fields) fm.set(f.name, f.ty);
       this.structs.set(it.name, fm);
+      const mm = new Map<string, Method>();
+      for (const m of it.methods) { if (mm.has(m.name)) this.err(`duplicate method '${it.name}.${m.name}'`); mm.set(m.name, m); }
+      this.structMethods.set(it.name, mm);
     }
     for (const it of p.items) if (it.kind === "EnumDecl") {
       if (this.enums.has(it.name)) this.err(`duplicate enum '${it.name}'`);
@@ -171,6 +227,7 @@ class Checker {
       for (const pa of it.params) {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for kernel param '${pa.name}'`);
         if (this.hasAtomic(pa.ty)) this.err(`Atomic is not supported inside a kernel (parameter '${pa.name}')`);
+        if (refInner(pa.ty) !== null) this.err(`kernel parameter '${pa.name}' cannot be a reference (host-data refs are not allowed in kernels)`);
       }
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
@@ -192,11 +249,29 @@ class Checker {
       this.borrows = new Map();
       this.tasks = new Map();
       this.inKernel = it.kind === "KernelDecl";
+      this.curParams = new Set(it.params.map((pa) => pa.name));
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
       for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
       for (const [name, t] of this.tasks) if (!t.joined) this.err(`'${name}' is a Task that was never joined; join it before it goes out of scope`);
       this.inKernel = false;
+      this.pop();
+    }
+    // struct method bodies: bind `self` (typed by the receiver form) + params, then check.
+    for (const it of p.items) if (it.kind === "StructDecl") for (const m of it.methods) {
+      if (m.recv === "self") { this.err(`'${it.name}.${m.name}': by-value 'self' receiver is not supported yet (use &self / &mut self)`); continue; }
+      this.push();
+      this.curRet = m.retTy ?? "unit";
+      this.borrows = new Map();
+      this.tasks = new Map();
+      this.define("self", (m.recv === "&mut self" ? "&mut " : "&") + it.name, m.recv === "&mut self");
+      this.curParams = new Set(["self", ...m.params.map((pa) => pa.name)]);
+      for (const pa of m.params) {
+        if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}' of '${it.name}.${m.name}'`);
+        this.define(pa.name, pa.ty);
+      }
+      if (m.retTy && !this.typeKnown(m.retTy)) this.err(`unknown return type '${m.retTy}' for '${it.name}.${m.name}'`);
+      for (const s of m.body) this.checkStmt(s);
       this.pop();
     }
   }
@@ -221,7 +296,7 @@ class Checker {
             if (declTy === "str-iter" || declTy === "unit" || declTy === "unknown") { this.err(`cannot bind '${s.name}' to ${vt}`); declTy = "i32"; } }
         }
         s.declTy = declTy;
-        this.define(s.name, declTy);
+        this.define(s.name, declTy, !s.isConst);
         // Atomic<T>: validate the initial value against T.
         const ael = atomicElem(declTy);
         if (ael !== null && isAtomicNew(s.value)) {
@@ -243,6 +318,9 @@ class Checker {
           this.tasks.set(s.name, { joined: false });
           this.registerSpawnBorrows(s.value.call, s.name);
         }
+        this.moveIfBinding(s.value);   // `let q = p` (p non-Copy) moves p; later use of p is an error
+        // a ref local records whether its referent is parameter-rooted (so escape on return is decidable)
+        if (refInner(declTy) !== null) { const vs = this.lookupVar(s.name); if (vs) vs.paramRooted = this.fromParam(s.value); }
         break;
       }
       case "Assign": {
@@ -250,16 +328,28 @@ class Checker {
           this.accessBuf(s.target.obj.name, true);     // writing through the buffer
           this.suppressBufRead = s.target.obj.name;     // ...so don't also flag it as a read
         }
+        if (s.target.kind === "Ident") this.suppressMovedCheck = s.target.name;  // assigning TO x is not a use of x
         const tt = this.checkExpr(s.target);
         this.suppressBufRead = null;
+        this.suppressMovedCheck = null;
         if (this.hasAtomic(tt)) { this.err(`cannot assign to an Atomic; use .store(value, order)`); break; }
+        // field-assignment mutability: through a shared `&` ref, or via a const/immutable root, is illegal.
+        if (s.target.kind === "Member" && s.target.obj.kind === "Ident") {
+          const ov = this.lookupVar(s.target.obj.name);
+          if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`cannot assign to a field through a shared reference '${s.target.obj.name}' (need &mut)`); }
+          else if (ov && !ov.mutable) this.err(`cannot assign to a field of immutable '${s.target.obj.name}' (use 'let')`);
+        }
         const vt = this.checkExpr(s.value);
         if (!this.assignable(vt, tt)) this.err(`type mismatch: cannot assign ${vt} to ${tt}`);
+        this.moveIfBinding(s.value);   // RHS binding moves...
+        if (s.target.kind === "Ident") { const tv = this.lookupVar(s.target.name); if (tv) tv.moved = false; }  // ...the assignment revives the target
         break;
       }
       case "While": {
         if (this.checkExpr(s.cond) !== "bool") this.err("`while` condition must be bool");
+        this.loopDepth++;
         this.checkBlock(s.body);
+        this.loopDepth--;
         break;
       }
       case "If": {
@@ -292,14 +382,22 @@ class Checker {
         if (!isStdinLines(s.iter)) this.err("M0: only `stdin.lines()` is iterable");
         this.push();
         this.define(s.binder, "str");
+        this.loopDepth++;
         for (const st of s.body) this.checkStmt(st);
+        this.loopDepth--;
         this.pop();
         break;
       }
       case "Return": {
         if (this.curRet === "unit") { if (s.value) this.err("cannot return a value from a function with no return type"); }
         else if (!s.value) this.err(`must return a ${this.curRet}`);
-        else { const vt = this.checkExpr(s.value); if (!this.assignable(vt, this.curRet)) this.err(`return type mismatch: ${vt} vs ${this.curRet}`); }
+        else {
+          const vt = this.checkExpr(s.value);
+          if (!this.assignable(vt, this.curRet)) this.err(`return type mismatch: ${vt} vs ${this.curRet}`);
+          // escape: a returned reference must originate from a parameter (its referent outlives the call).
+          if (refInner(this.curRet) !== null && !this.fromParam(s.value))
+            this.err(`returns a reference to a local (it would dangle); a returned reference must come from a parameter`);
+        }
         break;
       }
       case "Break": case "Continue": break;
@@ -335,6 +433,12 @@ class Checker {
   assignable(vt: string, tt: string): boolean {
     if (vt === "buffernew" && bufferElem(tt) !== null) return true;
     if (vt === "atomicnew" && atomicElem(tt) !== null) return true;
+    const tr = refInner(tt), vr = refInner(vt);
+    // ref param: &->&, &mut->&mut, and &mut coerces to & (same referent type required).
+    if (tr !== null) return vr !== null && tr === vr && (!isMutRef(tt) || isMutRef(vt));
+    // a borrow (&Buf / &Atomic / &atomic-struct) is usable where the plain value type is expected
+    // — this is exactly the launch/spawn argument case (their params are plain Buffer/Atomic/struct).
+    if (vr !== null) return vr === tt && (bufferElem(tt) !== null || this.hasAtomic(tt));
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
     return vt === tt;
@@ -345,8 +449,11 @@ class Checker {
       case "Float": e.ty = "floatlit"; return e.ty;
       case "Str": e.ty = "str"; return e.ty;
       case "Ident": {
-        const t = this.lookup(e.name);
-        if (t) { e.ty = t; return t; }
+        const vs = this.lookupVar(e.name);
+        if (vs) {
+          if (vs.moved && this.suppressMovedCheck !== e.name) this.err(`use of moved value '${e.name}'`);
+          e.ty = vs.ty; return vs.ty;
+        }
         if (ORDERINGS.has(e.name)) { e.ty = "Ordering"; return e.ty; }
         const v = this.variants.get(e.name);
         if (v && v.payload.length === 0) { e.ty = v.enumName; return e.ty; }
@@ -355,7 +462,8 @@ class Checker {
       case "Member": {
         if (e.obj.kind === "Ident" && e.obj.name === "grid" && (e.prop === "x" || e.prop === "y" || e.prop === "z")) { e.ty = "u32"; return e.ty; }
         if (e.obj.kind === "Ident" && e.obj.name === "Device" && (e.prop === "gpu" || e.prop === "cpu")) { e.ty = "Device"; return e.ty; }
-        const ot = this.checkExpr(e.obj);
+        const ot0 = this.checkExpr(e.obj);
+        const ot = refInner(ot0) ?? ot0;   // auto-deref &T for field/len access
         if (bufferElem(ot) !== null && e.prop === "len") {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
@@ -369,7 +477,8 @@ class Checker {
         e.ty = "unknown"; return e.ty;
       }
       case "Index": {
-        const ot = this.checkExpr(e.obj);
+        const ot0 = this.checkExpr(e.obj);
+        const ot = refInner(ot0) ?? ot0;   // auto-deref &Buffer<T>
         const be = bufferElem(ot);
         if (be === null) { this.err(`cannot index ${ot}`); e.ty = "i32"; return e.ty; }
         if (e.obj.kind === "Ident" && this.suppressBufRead !== e.obj.name) this.accessBuf(e.obj.name, false);
@@ -470,6 +579,7 @@ class Checker {
               const p = sig.params[k];
               if (p && !this.assignable(at, p.ty)) this.err(`arg ${k + 1} of '${e.callee.name}': cannot pass ${at} as ${p.ty}`);
             }
+            this.checkArgAliasing(e.args, `call to '${e.callee.name}'`);
             e.ty = sig.retTy ?? "unit";
             return e.ty;
           }
@@ -497,7 +607,8 @@ class Checker {
             e.ty = "unit"; return e.ty;
           }
         }
-        // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), and task.join().
+        // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), task.join(),
+        // and user struct methods (recv.method(args), auto-deref through &T).
         if (e.callee.kind === "Member") {
           const recvTy = this.checkExpr(e.callee.obj);
           const ae = atomicElem(recvTy);
@@ -509,13 +620,35 @@ class Checker {
             if (e.args.length) this.err("join() takes no arguments");
             e.ty = "unit"; return e.ty;
           }
+          const baseTy = refInner(recvTy) ?? recvTy;
+          const methods = this.structMethods.get(baseTy);
+          if (methods) {
+            const m = methods.get(e.callee.prop);
+            if (!m) { this.err(`no method '${e.callee.prop}' on ${baseTy}`); e.ty = "i32"; return e.ty; }
+            if (m.recv === "&mut self" && e.callee.obj.kind === "Ident") {   // mutating method needs a mutable/&mut receiver
+              const ov = this.lookupVar(e.callee.obj.name);
+              if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`'${e.callee.prop}' needs &mut self but '${e.callee.obj.name}' is a shared reference`); }
+              else if (ov && !ov.mutable) this.err(`'${e.callee.prop}' needs &mut self but '${e.callee.obj.name}' is immutable (use 'let')`);
+            }
+            if (e.args.length !== m.params.length) this.err(`method '${e.callee.prop}' expects ${m.params.length} arg(s), got ${e.args.length}`);
+            for (let k = 0; k < e.args.length; k++) {
+              const at = this.checkExpr(e.args[k]); const p = m.params[k];
+              if (p && !this.assignable(at, p.ty)) this.err(`method '${e.callee.prop}' arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
+            }
+            this.checkArgAliasing(e.args, `call to '${e.callee.prop}'`);
+            e.ty = m.retTy ?? "unit"; return e.ty;
+          }
         }
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;
       }
       case "Borrow": {
-        const it = this.checkExpr(e.expr);
-        if (bufferElem(it) === null && !this.hasAtomic(it)) this.err(`'&' borrow is only for Buffer or Atomic arguments (got ${it})`);
-        e.ty = it; return e.ty;
+        const it = this.checkExpr(e.expr);   // &x : &T  /  &mut x : &mut T  (validity checked at the use site)
+        if (e.mut && e.expr.kind === "Ident") {
+          const vs = this.lookupVar(e.expr.name);
+          if (vs && !vs.mutable) this.err(`cannot take '&mut ${e.expr.name}': it is a const binding (use 'let')`);
+        }
+        e.ty = (e.mut ? "&mut " : "&") + it;
+        return e.ty;
       }
       case "SpawnExpr": {
         if (this.inKernel) this.err("spawn is not allowed inside a kernel");
