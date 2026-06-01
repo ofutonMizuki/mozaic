@@ -1,0 +1,43 @@
+// Memory-bound kernel, COMPILED BY MOZAIC. out = a*k + b (3 f32 mem ops, 2 flops/elem).
+//   node src/main.ts run bench/vadd.mzc          # CPU backend
+//   node src/main.ts run bench/vadd.mzc --gpu     # Metal backend (UMA shared buffers)
+// Output: line 1 = nanoseconds per launch, line 2 = checksum.
+kernel vadd(a: Buffer<f32>, b: Buffer<f32>, out: Buffer<f32>, n: u32, k: f32) {
+  let gid: u32 = grid.x;
+  if (gid < n) {
+    out[gid] = a[gid] * k + b[gid];
+  }
+}
+
+function main() {
+  let n: u32 = 16777216;     // 16M elements — past cache, real memory traffic
+  let reps: u64 = 30;
+
+  let a: Buffer<f32> = Buffer.shared(n);
+  let b: Buffer<f32> = Buffer.shared(n);
+  let out: Buffer<f32> = Buffer.shared(n);
+  let i: u32 = 0;
+  while (i < n) {
+    a[i] = 1.0;
+    b[i] = 2.0;
+    i = i + 1;
+  }
+
+  let dev: Device = Device.gpu;
+  let jw: Job = dev.launch(vadd, n, &a, &b, &mut out, n, 1.5);   // warmup
+  jw.await();
+
+  let sink: f32 = 0.0;
+  let t0: u64 = clock.now();
+  let r: u64 = 0;
+  while (r < reps) {
+    a[0] = a[0] + 1.0;               // perturb each rep
+    let job: Job = dev.launch(vadd, n, &a, &b, &mut out, n, 1.5);
+    job.await();
+    sink = sink + out[0];
+    r = r + 1;
+  }
+  let t1: u64 = clock.now();
+  stdout.println((t1 - t0) / reps);  // ns per launch
+  stdout.println(sink);
+}
