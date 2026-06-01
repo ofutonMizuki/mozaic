@@ -1,20 +1,21 @@
-# HANDOFF — GPU/Metal バックエンド(**M1 完了** / 次フェーズへ)
+# HANDOFF — GPU/Metal + Atomic/並行(**M1 完了**、`Atomic<T>`・spawn/scope/join 実装済み / 次フェーズへ)
 
 最終更新: 2026-06-01(Apple Silicon M4 実機)。**G0〜G4 は実装・検証済み**。目玉だった
 **GPU/Metal バックエンド(UMA ゼロコピー + 借用=同期)が動作**。以下は到達点と、次に着手する候補。
 
 ## TL;DR(2026-06-01 時点で動くもの)
 - `node src/main.ts run examples/addk_async.mzc --gpu` → Apple Silicon GPU(Metal)で `10 11 12 13`。CPU と完全一致。
-- ブランチ `gpu-metal-backend`(main 未マージ)。ゴールデン **11/11**(`node tests/run.ts`、`addk_async` 正例 + `borrow_err` 負例を含む)。
+- GPU/Metal バックエンドは **main にマージ済み**(branch `gpu-metal-backend` 由来)。本フェーズの **`Atomic<T>` + spawn/scope/join** は branch `atomic-and-spawn`(+ ドキュメント整理 `docs-cpp-target` / `docs-stale-fixes`)にあり main 未マージ。ゴールデン **24/24**(`node tests/run.ts`、Atomic/spawn の正例5 + 負例6 を含む)。
 - **採用した実装方針**:metal-cpp は使わず **Objective‑C++ + システム Metal.framework**(`clang++ -x objective-c++ -fobjc-arc -framework Metal -framework Foundation -DMZ_METAL`)。外部 DL 不要で Xcode のみで完結。MSL は `newLibraryWithSource` で実行時コンパイル。
 - **借用=同期(キーストーン)達成**:`dev.launch(k, grid, &in, &mut out, …) -> Job` / `job.await()`。`await` 前に借用中バッファへ CPU が触ると **コンパイルエラー**([src/check.ts](src/check.ts) の `borrows` 追跡)。`&`=共有(CPU 並走読み可)/ `&mut`=排他。
 - **UMA ゼロコピー実証**:生成 `.mm` に host↔device の `memcpy` ゼロ。`buf.contents` 直接読み書き = GPU と同一メモリ。
+- **`Atomic<T>` + 最小 structured concurrency 達成**:`Atomic.new` / `load`/`store`/`fetchAdd`/`compareExchange`(`Ordering`=Relaxed/Acquire/Release/AcqRel、SeqCst なし、明示必須)。`std::atomic<T>` へ降ろし、`&Atomic<T>` は「`&` 共有でも書ける」唯一の例外(`Sync`)。`scope { spawn f(…); }`(終端で全 join)/ `let t: Task = spawn …; t.join()`(`std::thread`、join は void)。カーネル内 Atomic と `--gpu` の `Buffer<Atomic>` はコンパイルエラー。詳細は SPEC §5。
 
 ## 次フェーズ候補(未着手)
 - **ランタイム Device 選択**:現状 `Device.gpu`/`Device.cpu` は値だが、実行バックエンドは `--gpu` フラグ(コンパイル時)が支配。SPEC §6 の `Device.gpu.first() ?? Device.cpu` 相当の実行時ディスパッチは未実装。
 - **MSL 数値の精緻化**:飽和演算 `+|`/`-|`/`*|` は今ネイティブ(=ラップ)に潰している。`f64` は Metal 非対応で `float` にマップ。カーネル内 overflow セマンティクスの確定。
 - **2D/3D グリッド**:**実装済み**(`grid2(w,h)`/`grid3(w,h,d)`、CPU=入れ子ループ / GPU=`dispatchThreads` を多次元化。例 [examples/matadd.mzc](examples/matadd.mzc))。残り:ワークグループ機能 `local.{x,y,z}`/`barrier()`/`shared [T;N]` は未実装。
-- **タスク並列**(SPEC §5):`scope { spawn … }` / `Task.join()`。借用追跡の枠組みは流用可能。
+- **タスク並列**(SPEC §5):**最小実装済み**(`scope`/`spawn`/`Task.join`、`std::thread`、借用追跡を流用)。残り:**結果返し `join`**(現状 void)、`Mutex<T>`/`Channel<T>`/`Arc<T>`、`Atomic` の `SeqCst`、ワークグループ機能 `local.{x,y,z}`/`barrier()`/`shared [T;N]`。
 - 言語内 `T?`/`Result`・`as`/`as?`・総称型・完全な借用チェッカ(SPEC §8 TBD)。
 
 ---

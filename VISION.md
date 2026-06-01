@@ -138,7 +138,7 @@ const SIN: [f32; 256] = comptime computeSinTable();  // 実行時コスト 0
 
 | ターゲット | ホスト層 | カーネル層 | 状態 |
 |---|---|---|---|
-| **C++ / Metal**(最初) | C++ + `metal-cpp` | MSL、`MTLStorageModeShared` | 着手 |
+| **C++ / Metal**(最初) | C++ + Objective‑C++(システム Metal.framework、metal-cpp 不要) | MSL、`MTLStorageModeShared` | **M1 完了** |
 | WASM | wasm + threads/SIMD | WebGPU (WGSL) | 後 |
 | JS | JS + ArrayBuffer | WebGPU (WGSL) | 後(デバッグ/移植) |
 | (将来) CUDA / SYCL | C++ | PTX / SPIR-V | 後 |

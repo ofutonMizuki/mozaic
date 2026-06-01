@@ -264,14 +264,14 @@ function main() {
 ```typescript
 const dev: Device = Device.gpu.first() ?? Device.cpu;
 
-kernel scale(input: &Buffer<f32>, output: &mut Buffer<f32>, k: f32) {
-  const i: u32 = grid.x;
+kernel scale(input: Buffer<f32>, output: Buffer<f32>, k: f32) {
+  let i: u32 = grid.x;
   if (i < output.len) { output[i] = input[i] * k; }
 }
 
-let input  = Buffer.shared<f32>(N);
-let output = Buffer.shared<f32>(N);
-const job  = dev.launch(scale, { grid: N }, &input, &mut output, 2.0);
+let input:  Buffer<f32> = Buffer.shared(N);
+let output: Buffer<f32> = Buffer.shared(N);
+const job = dev.launch(scale, N, &input, &mut output, 2.0);   // grid は整数 / grid2(w,h) / grid3(w,h,d)
 job.await();          // 借用返却。UMA=フェンスのみ / discrete=コピーバック
 ```
 
