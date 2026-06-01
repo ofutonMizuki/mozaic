@@ -1,0 +1,9 @@
+// assert (always checked) + abort (with/without message). Passing path here.
+function main() {
+  assert(1 < 2);
+  assert(true, "always true");
+  const big: i32 = 5;
+  if (big < 0) { abort("negative!"); }
+  if (big > 100) { abort(); }
+  stdout.println("ok");
+}

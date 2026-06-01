@@ -1,0 +1,12 @@
+// str literals are now owned mz::String values: storable, returnable, comparable.
+function pick(b: bool): str {
+  if (b) { return "yes"; }
+  return "no";
+}
+function main() {
+  const s: str = "hello";
+  stdout.println(s);
+  stdout.println(pick(true));
+  stdout.println(pick(false));
+  if (s == "hello") { stdout.println("match"); }
+}

@@ -582,6 +582,17 @@ class Checker {
           if (e.args.length) this.err("await takes no arguments");
           e.ty = "unit"; return e.ty;
         }
+        if (e.callee.kind === "Ident" && e.callee.name === "abort") {
+          if (e.args.length > 1) this.err("abort takes an optional message: abort() or abort(msg)");
+          if (e.args.length === 1 && this.checkExpr(e.args[0]) !== "str") this.err("abort message must be a str");
+          e.ty = "unit"; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "assert") {
+          if (e.args.length < 1 || e.args.length > 2) this.err("assert takes (cond) or (cond, msg)");
+          if (e.args.length >= 1 && this.checkExpr(e.args[0]) !== "bool") this.err("assert condition must be bool");
+          if (e.args.length === 2 && this.checkExpr(e.args[1]) !== "str") this.err("assert message must be a str");
+          e.ty = "unit"; return e.ty;
+        }
         if (e.callee.kind === "Ident") {
           const sig = this.fns.get(e.callee.name);
           if (sig) {

@@ -68,7 +68,7 @@ function metalBindLines(kn: string, grid: Expr, kargs: Expr[]): string[] {
 }
 
 function cstr(s: string): string {
-  let out = '"';
+  let out = 'U"';   // char32_t string literal -> constructs an mz::String (std::u32string)
   for (const ch of s) {
     if (ch === "\\") out += "\\\\";
     else if (ch === '"') out += '\\"';
@@ -77,7 +77,7 @@ function cstr(s: string): string {
     else if (ch === "\r") out += "\\r";
     else out += ch;
   }
-  return out + '"';
+  return out + '"_mz';   // _mz UDL -> mz::String prvalue (avoids const char32_t* -> bool surprises)
 }
 
 function emitExpr(e: Expr): string {
@@ -147,6 +147,10 @@ function emitExpr(e: Expr): string {
         const d = e.args.map((a) => `(uint32_t)(${emitExpr(a)})`);
         return `mz::Grid{ ${d.join(", ")}${e.callee.name === "grid2" ? ", 1" : ""} }`;
       }
+      if (e.callee.kind === "Ident" && e.callee.name === "abort")
+        return e.args.length === 1 ? `mz::panic_msg(${emitExpr(e.args[0])})` : `mz::panic("aborted")`;
+      if (e.callee.kind === "Ident" && e.callee.name === "assert")
+        return `mz::assert_(${e.args.map(emitExpr).join(", ")})`;
       if (e.callee.kind === "Ident") {
         const name = e.callee.name;
         const v = VARIANTS.get(name);

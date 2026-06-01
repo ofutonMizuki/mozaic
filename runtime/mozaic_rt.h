@@ -254,4 +254,14 @@ inline void println(bool v)                  { std::cout << (v ? "true" : "false
 inline bool eq(const String& a, const char* b) { return a == decodeUtf8(std::string(b)); }
 inline bool eq(const String& a, const String& b) { return a == b; }
 
+// abort / assert. panic_msg takes an mz::String (needs encodeUtf8, defined above).
+// assert_ is always checked (a correctness contract, unlike the debug-only overflow traps).
+[[noreturn]] inline void panic_msg(const String& m) { std::cerr << "mozaic: " << encodeUtf8(m) << "\n"; std::abort(); }
+inline void assert_(bool c)                  { if (!c) panic("assertion failed"); }
+inline void assert_(bool c, const String& m) { if (!c) panic_msg(m); }
+
 } // namespace mz
+
+// String literals lower to `U"..."_mz`, yielding an owned mz::String prvalue. (A bare U"..."
+// is a const char32_t*, which would prefer the println(bool)/pointer conversions — this avoids that.)
+inline mz::String operator""_mz(const char32_t* s, std::size_t n) { return mz::String(s, n); }

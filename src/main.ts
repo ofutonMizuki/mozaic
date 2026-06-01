@@ -64,7 +64,7 @@ function main(): void {
   }
   if (cmd === "build") { console.error(`built ${binPath}${metal ? " [Metal]" : ""}`); return; }
   const r = spawnSync(binPath, [], { stdio: "inherit" });
-  process.exit(r.status ?? 0);
+  process.exit(r.status ?? (r.signal ? 1 : 0));   // a signal-killed child (e.g. abort()) is a failure, not 0
 }
 
 main();

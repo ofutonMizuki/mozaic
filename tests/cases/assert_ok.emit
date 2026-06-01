@@ -1,0 +1,3 @@
+mz::assert_((1 < 2))
+mz::panic_msg(U"negative!"_mz)
+mz::panic("aborted")
