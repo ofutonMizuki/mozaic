@@ -139,8 +139,9 @@ export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T i
 // Concurrency library generics. Mutex/Channel are Sync (shared by &T across threads, like Atomic).
 // Arc is owned-but-shareable (passed by value via .clone(); NOT a Sync &-shared type).
 export const SYNC_BASES = ["Mutex", "Channel"];
-export const LIB_GENERICS = ["Arc", "Mutex", "Channel", "MutexGuard", "Vec"];   // built-in generic type constructors
+export const LIB_GENERICS = ["Arc", "Mutex", "Channel", "MutexGuard", "Vec", "Map"];   // built-in generic type constructors
 export function isVecNew(e: Expr): boolean { return e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && e.callee.obj.name === "Vec" && e.callee.prop === "new"; }
+export function isMapNew(e: Expr): boolean { return e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && e.callee.obj.name === "Map" && e.callee.prop === "new"; }
 export function dynVecElem(t: string): string | null { const g = genericArgs(t); return g !== null && g.base === "Vec" ? g.args[0] : null; }
 // A type shared by &T across threads (Sync): Mutex / Channel (and refs to them). Used alongside
 // hasAtomic for spawn by-ref params, multi-`&` borrows, non-Copy, and borrow->value coercion.

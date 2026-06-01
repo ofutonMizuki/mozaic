@@ -1,0 +1,10 @@
+// File I/O (M6): writeFile / readFile.
+function main() {
+  let path: str = "/tmp/mozaic_fileio_test.txt";
+  let ok: bool = writeFile(path, "hello\nfile io\n");
+  stdout.println(ok);                                    // true
+  let content: str = readFile(path) ?? "FAIL";
+  stdout.println(content.len);                           // 14
+  let missing: str = readFile("/tmp/no_such_mozaic_file_xyz") ?? "missing";
+  stdout.println(missing);                               // missing
+}

@@ -16,6 +16,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <unordered_map>
+#include <fstream>
 
 namespace mz {
 
@@ -149,6 +151,16 @@ template <class T> struct Vec {
   uint32_t len() const { return (uint32_t)data.size(); }
   T& operator[](uint32_t i) { return data[i]; }
   const T& operator[](uint32_t i) const { return data[i]; }
+};
+
+// Map<K, V>: a hash map (std::unordered_map). insert / get():V? / has / .len. Move-only at the
+// language level; pass &mut Map<K,V> to mutate in a callee. K must be hashable (str, ints, char).
+template <class K, class V> struct Map {
+  std::unordered_map<K, V> m;
+  void insert(const K& k, const V& v) { m[k] = v; }
+  std::optional<V> get(const K& k) const { auto it = m.find(k); if (it == m.end()) return std::nullopt; return it->second; }
+  bool has(const K& k) const { return m.find(k) != m.end(); }
+  uint32_t len() const { return (uint32_t)m.size(); }
 };
 
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
@@ -353,6 +365,21 @@ inline std::string encodeUtf8(const std::u32string& s) {
     }
   }
   return out;
+}
+
+// ---- file I/O (M6) ---- (defined after encode/decodeUtf8, which they use)
+// readFile(path): the whole file as a String (none on error). writeFile(path, content): ok?
+inline std::optional<String> read_file(const String& path) {
+  std::ifstream f(encodeUtf8(path), std::ios::binary);
+  if (!f) return std::nullopt;
+  std::ostringstream ss; ss << f.rdbuf();
+  return decodeUtf8(ss.str());
+}
+inline bool write_file(const String& path, const String& content) {
+  std::ofstream f(encodeUtf8(path), std::ios::binary);
+  if (!f) return false;
+  f << encodeUtf8(content);
+  return (bool)f;
 }
 
 // Read ALL of stdin as one owned String (UTF-8 -> UTF-32). For stdin-driven tools

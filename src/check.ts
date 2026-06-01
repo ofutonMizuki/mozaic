@@ -3,7 +3,7 @@ import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo, CTValue } from "
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
-  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem,
+  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem, isMapNew,
 } from "./ast.ts";
 import { Comptime, CompileError } from "./comptime.ts";
 
@@ -230,7 +230,8 @@ class Checker {
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle (void result)
     { const g = genericArgs(t); if (g !== null && g.base === "Task") return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Task<R>: a result-returning task
-    { const g = genericArgs(t); if (g !== null && LIB_GENERICS.includes(g.base)) return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Arc/Mutex/Channel/MutexGuard<T>
+    { const g = genericArgs(t); if (g !== null && g.base === "Map") return g.args.length === 2 && g.args.every((a) => this.typeKnown(a)); }   // Map<K,V>
+    { const g = genericArgs(t); if (g !== null && LIB_GENERICS.includes(g.base)) return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Arc/Mutex/Channel/MutexGuard/Vec<T>
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
     const se = sliceElem(t); if (se !== null) return this.typeKnown(se);
     const ap = arrayParts(t); if (ap !== null) return this.typeKnown(ap[0]) && /^\d+$/.test(ap[1]);
@@ -391,6 +392,7 @@ class Checker {
           else if (vt === "mutexnew") { this.err(`'${s.name}': Mutex.new needs a type annotation (e.g. : Mutex<i64>)`); declTy = "i32"; }
           else if (vt === "channelnew") { this.err(`'${s.name}': Channel.new needs a type annotation (e.g. : Channel<i32>)`); declTy = "i32"; }
           else if (vt === "vecnew") { this.err(`'${s.name}': Vec.new needs a type annotation (e.g. : Vec<i32>)`); declTy = "i32"; }
+          else if (vt === "mapnew") { this.err(`'${s.name}': Map.new needs a type annotation (e.g. : Map<str, i32>)`); declTy = "i32"; }
           else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
           else if (vt === "none") { this.err(`'${s.name}': bare none has no type — annotate it (e.g. : i32?)`); declTy = "i32"; }
           else if (vt.startsWith("ok<") || vt.startsWith("err<")) { this.err(`'${s.name}': Ok/Err need a Result type annotation (e.g. : Result<i32, str>)`); declTy = "i32"; }
@@ -555,6 +557,7 @@ class Checker {
     if (vt === "mutexnew") return genericArgs(tt)?.base === "Mutex";
     if (vt === "channelnew") return genericArgs(tt)?.base === "Channel";
     if (vt === "vecnew") return genericArgs(tt)?.base === "Vec";
+    if (vt === "mapnew") return genericArgs(tt)?.base === "Map";
     // optionals: none fits any T?; U? -> T? iff U -> T; no implicit wrap of a bare value.
     const to = optInner(tt), vo = optInner(vt);
     if (to !== null) {
@@ -681,7 +684,7 @@ class Checker {
           if (e.obj.kind === "Ident") this.accessBuf(e.obj.name, false);
           e.ty = "u32"; return e.ty;
         }
-        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null || dynVecElem(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null || dynVecElem(ot) !== null || genericArgs(ot)?.base === "Map") && e.prop === "len") { e.ty = "u32"; return e.ty; }
         const lg = genericArgs(ot);   // MutexGuard<T>.val : the guarded T (an lvalue, read+write under the lock)
         if (lg !== null && lg.base === "MutexGuard") {
           if (e.prop !== "val") this.err(`MutexGuard exposes only '.val' (got '${e.prop}')`);
@@ -783,6 +786,11 @@ class Checker {
           if (e.args.length !== 0) this.err("Vec.new takes no arguments (push elements after)");
           e.ty = "vecnew"; return e.ty;
         }
+        if (isMapNew(e)) {   // Map.new(): hash map (needs a typed binding for K,V)
+          if (this.inKernel) this.err("Map is not supported inside a kernel");
+          if (e.args.length !== 0) this.err("Map.new takes no arguments (insert entries after)");
+          e.ty = "mapnew"; return e.ty;
+        }
         // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
         if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
           const want = e.callee.name === "grid2" ? 2 : 3;
@@ -843,6 +851,14 @@ class Checker {
           const ap = arrayParts(at);
           if (ap === null) { this.err(`slice(...) expects a fixed array (got ${at})`); e.ty = "[]i32"; return e.ty; }
           e.ty = "[]" + ap[0]; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "readFile") {   // readFile(path: str): str?
+          if (e.args.length !== 1 || this.checkExpr(e.args[0]) !== "str") this.err("readFile(path) takes one str argument");
+          e.ty = "str?"; return e.ty;
+        }
+        if (e.callee.kind === "Ident" && e.callee.name === "writeFile") {   // writeFile(path: str, content: str): bool
+          if (e.args.length !== 2 || this.checkExpr(e.args[0]) !== "str" || this.checkExpr(e.args[1]) !== "str") this.err("writeFile(path, content) takes two str arguments");
+          e.ty = "bool"; return e.ty;
         }
         if (e.callee.kind === "Ident" && e.callee.name === "abort") {
           if (e.args.length > 1) this.err("abort takes an optional message: abort() or abort(msg)");
@@ -924,8 +940,21 @@ class Checker {
             if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
             return this.checkAtomicMethod(e, ae);
           }
-          // concurrency/collection library methods (Arc / Mutex / Channel / Vec), through &T too
+          // concurrency/collection library methods (Arc / Mutex / Channel / Vec / Map), through &T too
           const lg = genericArgs(refInner(recvTy) ?? recvTy);
+          if (lg !== null && lg.base === "Map") {
+            const K = lg.args[0], V = lg.args[1], m = e.callee.prop;
+            if (m === "insert" || m === "get" || m === "has") {
+              if (m === "insert" && e.callee.obj.kind === "Ident") {   // mutating: receiver must be mutable / &mut
+                const ov = this.lookupVar(e.callee.obj.name);
+                if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`Map.insert needs a mutable Map but '${e.callee.obj.name}' is a shared reference`); }
+                else if (ov && !ov.mutable) this.err(`Map.insert needs a mutable Map but '${e.callee.obj.name}' is immutable (use 'let')`);
+              }
+              if (m === "insert") { if (e.args.length !== 2) this.err("Map.insert(k, v) takes two arguments"); else { const kt = this.checkExpr(e.args[0]); const vt2 = this.checkExpr(e.args[1]); if (!this.assignable(kt, K)) this.err(`Map.insert: key ${kt} is not ${K}`); if (!this.assignable(vt2, V)) this.err(`Map.insert: value ${vt2} is not ${V}`); } e.ty = "unit"; }
+              else { if (e.args.length !== 1) this.err(`Map.${m}(k) takes one argument`); else { const kt = this.checkExpr(e.args[0]); if (!this.assignable(kt, K)) this.err(`Map.${m}: key ${kt} is not ${K}`); } e.ty = m === "get" ? `${V}?` : "bool"; }
+            } else { this.err(`unknown Map method '${m}' (use insert / get / has / len)`); e.ty = V; }
+            return e.ty;
+          }
           if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel" || lg.base === "Vec")) {
             const inner = lg.args[0], m = e.callee.prop;
             if (lg.base === "Vec") {

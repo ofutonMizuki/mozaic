@@ -1,0 +1,18 @@
+// Map<K,V>: hash map. insert / get():V? / has / .len; &mut Map to mutate in a callee.
+function bump(words: &mut Map<str, i32>, w: str) {
+  let cur: i32 = words.get(w) ?? 0;
+  words.insert(w, cur +% 1);
+}
+function main() {
+  let m: Map<str, i32> = Map.new();
+  bump(&mut m, "a");
+  bump(&mut m, "b");
+  bump(&mut m, "a");
+  bump(&mut m, "a");
+  stdout.println(m.get("a") ?? 0);   // 3
+  stdout.println(m.get("b") ?? 0);   // 1
+  stdout.println(m.get("z") ?? 0);   // 0 (absent -> none -> default)
+  stdout.println(m.has("a"));        // true
+  stdout.println(m.has("z"));        // false
+  stdout.println(m.len);             // 2
+}

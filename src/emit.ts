@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -172,7 +172,7 @@ function emitExpr(e: Expr): string {
         const ot = refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "";
         if (arrayParts(ot) !== null || ot === "str") return `(uint32_t)(${emitExpr(e.obj)}).size()`;
         const vp = vecParts(ot); if (vp !== null) return `(uint32_t)${vp.lanes}`;   // lane count (comptime constant)
-        if (dynVecElem(ot) !== null) return `(${emitExpr(e.obj)}).len()`;            // Vec<T>.len -> .len()
+        if (dynVecElem(ot) !== null || genericArgs(ot)?.base === "Map") return `(${emitExpr(e.obj)}).len()`;   // Vec<T>/Map<K,V> .len -> .len()
       }
       // MutexGuard.val -> the guarded value through the held lock (*guard.p)
       if (e.prop === "val" && genericArgs(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "")?.base === "MutexGuard") return `(*(${emitExpr(e.obj)}).p)`;
@@ -236,6 +236,8 @@ function emitExpr(e: Expr): string {
       // SIMD vector lane-constructor f32x4(a,b,c,d) -> mz::Simd<float,4>{ {a,b,c,d} }
       if (e.callee.kind === "Ident" && vecParts(e.callee.name) !== null)
         return `${cppType(e.callee.name)}{ { ${e.args.map(emitExpr).join(", ")} } }`;
+      if (e.callee.kind === "Ident" && e.callee.name === "readFile") return `mz::read_file(${emitExpr(e.args[0])})`;
+      if (e.callee.kind === "Ident" && e.callee.name === "writeFile") return `mz::write_file(${emitExpr(e.args[0])}, ${emitExpr(e.args[1])})`;
       if (e.callee.kind === "Ident" && e.callee.name === "format") return formatArg(e.args[0]);
       if (e.callee.kind === "Ident" && e.callee.name === "slice") {   // slice(arr) -> mz::Slice{ ptr, len }
         const elem = sliceElem(e.ty ?? "[]i32")!;
@@ -357,7 +359,7 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
         const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
         return `${ind}${cppType(s.declTy!)} ${s.name}; ${s.name}.val = ${arg};`;
       }
-      if (isChannelNew(s.value) || isVecNew(s.value)) return `${ind}${cppType(s.declTy!)} ${s.name};`;   // default-construct empty
+      if (isChannelNew(s.value) || isVecNew(s.value) || isMapNew(s.value)) return `${ind}${cppType(s.declTy!)} ${s.name};`;   // default-construct empty
       return `${ind}${cppType(s.declTy!)} ${s.name} = ${moveRhs(s.value)};`;
     case "Assign": return `${ind}${emitExpr(s.target)} = ${moveRhs(s.value)};`;
     case "While": {
