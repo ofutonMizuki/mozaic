@@ -1,5 +1,0 @@
-struct Wrap<T> {
-  val: T;
-  function get(&self): T { return self.val; }
-}
-function main() { stdout.println("x"); }

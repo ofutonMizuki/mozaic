@@ -1,0 +1,8 @@
+struct Box<T> {
+  val: T;
+  function set(&mut self, v: T) { self.val = v; }
+}
+function main() {
+  const b: Box<i32> = Box { val: 1 };
+  b.set(2);                       // const receiver -> rejected
+}

@@ -249,7 +249,6 @@ class Checker {
       for (const f of it.fields) fm.set(f.name, f.ty);
       this.structs.set(it.name, fm);
       this.structTypeParams.set(it.name, it.typeParams ?? []);
-      if (it.typeParams && it.typeParams.length && it.methods.length) this.err(`methods on generic struct '${it.name}' are not supported yet`);
       const mm = new Map<string, Method>();
       for (const m of it.methods) { if (mm.has(m.name)) this.err(`duplicate method '${it.name}.${m.name}'`); mm.set(m.name, m); }
       this.structMethods.set(it.name, mm);
@@ -325,10 +324,12 @@ class Checker {
     for (const it of p.items) if (it.kind === "StructDecl") for (const m of it.methods) {
       if (m.recv === "self") { this.err(`'${it.name}.${m.name}': by-value 'self' receiver is not supported yet (use &self / &mut self)`); continue; }
       this.push();
+      this.curTypeParams = new Set(it.typeParams ?? []);   // method bodies see the struct's type params
+      const selfTy = it.typeParams && it.typeParams.length ? `${it.name}<${it.typeParams.join(", ")}>` : it.name;
       this.curRet = m.retTy ?? "unit";
       this.borrows = new Map();
       this.tasks = new Map();
-      this.define("self", (m.recv === "&mut self" ? "&mut " : "&") + it.name, m.recv === "&mut self");
+      this.define("self", (m.recv === "&mut self" ? "&mut " : "&") + selfTy, m.recv === "&mut self");
       this.curParams = new Set(["self", ...m.params.map((pa) => pa.name)]);
       for (const pa of m.params) {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}' of '${it.name}.${m.name}'`);
@@ -336,6 +337,7 @@ class Checker {
       }
       if (m.retTy && !this.typeKnown(m.retTy)) this.err(`unknown return type '${m.retTy}' for '${it.name}.${m.name}'`);
       for (const s of m.body) this.checkStmt(s);
+      this.curTypeParams = new Set();
       this.pop();
     }
   }
@@ -842,10 +844,15 @@ class Checker {
             }
           }
           const baseTy = refInner(recvTy) ?? recvTy;
-          const methods = this.structMethods.get(baseTy);
+          const bg = genericArgs(baseTy);
+          const structName = bg !== null && this.structs.has(bg.base) ? bg.base : baseTy;
+          const methods = this.structMethods.get(structName);
           if (methods) {
             const m = methods.get(e.callee.prop);
             if (!m) { this.err(`no method '${e.callee.prop}' on ${baseTy}`); e.ty = "i32"; return e.ty; }
+            // substitute the struct's type params (bound by the receiver's instance args) into the method signature
+            const subst = new Map<string, string>();
+            if (bg !== null) (this.structTypeParams.get(bg.base) ?? []).forEach((tp, i) => subst.set(tp, bg.args[i] ?? tp));
             if (m.recv === "&mut self" && e.callee.obj.kind === "Ident") {   // mutating method needs a mutable/&mut receiver
               const ov = this.lookupVar(e.callee.obj.name);
               if (ov && refInner(ov.ty) !== null) { if (!isMutRef(ov.ty)) this.err(`'${e.callee.prop}' needs &mut self but '${e.callee.obj.name}' is a shared reference`); }
@@ -854,10 +861,10 @@ class Checker {
             if (e.args.length !== m.params.length) this.err(`method '${e.callee.prop}' expects ${m.params.length} arg(s), got ${e.args.length}`);
             for (let k = 0; k < e.args.length; k++) {
               const at = this.checkExpr(e.args[k]); const p = m.params[k];
-              if (p && !this.assignable(at, p.ty)) this.err(`method '${e.callee.prop}' arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
+              if (p) { const want = substituteType(p.ty, subst); if (!this.assignable(at, want)) this.err(`method '${e.callee.prop}' arg ${k + 1}: cannot pass ${at} as ${want}`); }
             }
             this.checkArgAliasing(e.args, `call to '${e.callee.prop}'`);
-            e.ty = m.retTy ?? "unit"; return e.ty;
+            e.ty = substituteType(m.retTy ?? "unit", subst); return e.ty;
           }
         }
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;

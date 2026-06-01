@@ -445,10 +445,10 @@ function methodSig(m: Method): string {   // return-type name(params) [const]  â
 function emitTypeDecl(it: StructDecl | EnumDecl): string {
   if (it.kind === "StructDecl") {
     const fields = it.fields.map((f) => `${cppType(f.ty)} ${f.name};`).join(" ");
-    if (it.typeParams && it.typeParams.length) {   // generic struct -> class template (no methods yet)
-      return `template <${it.typeParams.map((t) => `class ${t}`).join(", ")}> struct ${it.name} { ${fields} };`;
-    }
     const decls = it.methods.map((m) => `${methodSig(m)};`).join(" ");   // declarations; bodies emitted out-of-line
+    if (it.typeParams && it.typeParams.length) {   // generic struct -> class template (methods as out-of-line template members)
+      return `template <${it.typeParams.map((t) => `class ${t}`).join(", ")}> struct ${it.name} { ${[fields, decls].filter((s) => s).join(" ")} };`;
+    }
     return `struct ${it.name} { ${[fields, decls].filter((s) => s).join(" ")} };`;
   }
   const fields: string[] = ["int tag;"];
@@ -457,9 +457,15 @@ function emitTypeDecl(it: StructDecl | EnumDecl): string {
 }
 // Out-of-line method body: `ret Struct::method(params) const { ... }`. Emitted AFTER fn prototypes so
 // a method body may call free functions; `self` lowers to (*this).
-function emitMethodDef(structName: string, m: Method): string {
+function emitMethodDef(structName: string, m: Method, typeParams: string[] = []): string {
   const body = m.body.map((s) => emitStmt(s, "  ", m.retTy ? "value" : "void")).join("\n");
-  return `${m.retTy ? cppType(m.retTy) : "void"} ${structName}::${m.name}(${m.params.map(emitParam).join(", ")})${m.recv === "&self" ? " const" : ""} {\n${body}\n}`;
+  const ret = m.retTy ? cppType(m.retTy) : "void";
+  const cv = m.recv === "&self" ? " const" : "";
+  const sig = `(${m.params.map(emitParam).join(", ")})${cv}`;
+  if (typeParams.length) {   // out-of-line template member: template <class T> ret Name<T>::m(...) { ... }
+    return `template <${typeParams.map((t) => `class ${t}`).join(", ")}>\n${ret} ${structName}<${typeParams.join(", ")}>::${m.name}${sig} {\n${body}\n}`;
+  }
+  return `${ret} ${structName}::${m.name}${sig} {\n${body}\n}`;
 }
 
 export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
@@ -497,7 +503,7 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const protos = [kernelProtos, fnProtos].filter((s) => s).join("\n");
   const genericDefs = fns.filter(isGeneric).map(emitFn).join("\n\n");   // after protos (can call non-generic fns), before methods/defs
   // Struct method bodies, out-of-line, AFTER prototypes so a method may call free functions.
-  const methodDefs = types.flatMap((it) => it.kind === "StructDecl" ? it.methods.map((m) => emitMethodDef(it.name, m)) : []).join("\n\n");
+  const methodDefs = types.flatMap((it) => it.kind === "StructDecl" ? it.methods.map((m) => emitMethodDef(it.name, m, it.typeParams ?? [])) : []).join("\n\n");
   const defs = [...(target === "metal" ? [] : kernels.map(emitKernel)), ...fns.filter((f) => !isGeneric(f)).map(emitFn)].join("\n\n");
   // Pull in <atomic> / <thread> only when the program actually uses them (the emitted code names them).
   const allCode = typeDecls + mslDecls + protos + genericDefs + methodDefs + defs;

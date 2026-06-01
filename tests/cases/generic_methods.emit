@@ -1,0 +1,3 @@
+template <class T> struct Box { T val; T get() const; void set(T v); };
+T Box<T>::get() const
+void Box<T>::set(T v)

@@ -1,0 +1,16 @@
+// Methods on generic structs (the container keystone): &self readers, &mut self mutators.
+struct Box<T> {
+  val: T;
+  function get(&self): T { return self.val; }
+  function set(&mut self, v: T) { self.val = v; }
+}
+function main() {
+  let b: Box<i32> = Box { val: 10 };
+  stdout.println(b.get());        // 10
+  b.set(99);
+  stdout.println(b.get());        // 99
+  let bs: Box<str> = Box { val: "hi" };
+  stdout.println(bs.get());       // hi
+  bs.set("bye");
+  stdout.println(bs.get());       // bye
+}
