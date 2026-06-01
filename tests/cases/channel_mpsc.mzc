@@ -1,0 +1,15 @@
+// Channel<T>: a blocking queue. A producer thread sends 0..99; main receives 100 and sums them.
+function producer(c: Channel<i32>, n: i32) {
+  let i: i32 = 0;
+  while (i < n) { c.send(i); i = i +% 1; }
+}
+function main() {
+  let c: Channel<i32> = Channel.new();
+  let n: i32 = 100;
+  let t: Task = spawn producer(&c, n);
+  let sum: i64 = 0;
+  let k: i32 = 0;
+  while (k < n) { sum = sum +% (c.recv() as i64); k = k +% 1; }
+  t.join();
+  stdout.println(sum);         // 4950
+}

@@ -1,0 +1,20 @@
+// Mutex<T>: a lock-guarded value. Two threads each increment 50000x; the lock makes the
+// read-modify-write of g.val atomic, so the total is deterministically 100000.
+function worker(m: Mutex<i64>, iters: u32) {
+  let i: u32 = 0;
+  while (i < iters) {
+    let g = m.lock();
+    g.val = g.val +% 1;       // critical section: read+write under the held lock
+    i = i +% 1;
+  }                            // g drops here -> unlock
+}
+function main() {
+  let m: Mutex<i64> = Mutex.new(0);
+  let iters: u32 = 50000;
+  scope {
+    spawn worker(&m, iters);
+    spawn worker(&m, iters);
+  }
+  let g = m.lock();
+  stdout.println(g.val);       // 100000
+}

@@ -134,6 +134,20 @@ export function resultArgs(t: string): [string, string] | null {
 }
 export function atomicElem(t: string): string | null { return t.startsWith("Atomic<") && t.endsWith(">") ? t.slice(7, -1) : null; }
 export const ATOMIC_INTS = ["u32", "i32", "u64", "i64"];   // the only legal T in Atomic<T>
+// Concurrency library generics. Mutex/Channel are Sync (shared by &T across threads, like Atomic).
+// Arc is owned-but-shareable (passed by value via .clone(); NOT a Sync &-shared type).
+export const SYNC_BASES = ["Mutex", "Channel"];
+export const LIB_GENERICS = ["Arc", "Mutex", "Channel", "MutexGuard"];   // built-in generic type constructors
+// A type shared by &T across threads (Sync): Mutex / Channel (and refs to them). Used alongside
+// hasAtomic for spawn by-ref params, multi-`&` borrows, non-Copy, and borrow->value coercion.
+export function isSyncShared(t: string): boolean {
+  const ri = refInner(t); if (ri !== null) return isSyncShared(ri);
+  const g = genericArgs(t); return g !== null && SYNC_BASES.includes(g.base);
+}
+export function libBase(t: string): string | null { const g = genericArgs(t); return g !== null && LIB_GENERICS.includes(g.base) ? g.base : null; }
+export function isArcNew(e: Expr): boolean { return e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && e.callee.obj.name === "Arc" && e.callee.prop === "new"; }
+export function isMutexNew(e: Expr): boolean { return e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && e.callee.obj.name === "Mutex" && e.callee.prop === "new"; }
+export function isChannelNew(e: Expr): boolean { return e.kind === "Call" && e.callee.kind === "Member" && e.callee.obj.kind === "Ident" && e.callee.obj.name === "Channel" && e.callee.prop === "new"; }
 // Does a type transitively contain an Atomic? (Atomic itself / Buffer of atomic / struct with an atomic field.)
 // structFields maps a struct name -> its field type strings (built by check.ts and emit.ts).
 export function containsAtomic(t: string, structFields: Map<string, string[]>, seen = new Set<string>()): boolean {
@@ -206,7 +220,7 @@ export function cppType(t: string): string {
       const ra = resultArgs(t);
       if (ra !== null) return `mz::Result<${cppType(ra[0])}, ${cppType(ra[1])}>`;
       const g = genericArgs(t);   // a generic struct instance Name<args> -> Name<cppArgs...>
-      if (g !== null) return `${g.base}<${g.args.map(cppType).join(", ")}>`;
+      if (g !== null) return `${LIB_GENERICS.includes(g.base) ? "mz::" + g.base : g.base}<${g.args.map(cppType).join(", ")}>`;
       return t;   // user struct/enum types (and bare type params) map to their own name
     }
   }

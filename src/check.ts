@@ -3,6 +3,7 @@ import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo, CTValue } from "
 import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
+  isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS,
 } from "./ast.ts";
 import { Comptime, CompileError } from "./comptime.ts";
 
@@ -90,7 +91,7 @@ class Checker {
       const a = call.args[k], p = sig.params[k];
       const at = this.checkExpr(a);
       if (!p) continue;
-      const byRef = bufferElem(p.ty) !== null || this.hasAtomic(p.ty);
+      const byRef = bufferElem(p.ty) !== null || this.hasAtomic(p.ty) || isSyncShared(p.ty);
       if (byRef) {
         if (a.kind !== "Borrow" || a.expr.kind !== "Ident") this.err(`spawn arg ${k + 1}: '${p.name}' must be borrowed (&${p.name} or &mut ${p.name})`);
       } else if (a.kind === "Borrow") this.err(`spawn arg ${k + 1}: scalar '${p.name}' must not be borrowed`);
@@ -105,7 +106,7 @@ class Checker {
     if (!sig) return;
     call.args.forEach((a, k) => {
       const p = sig.params[k];
-      if (!p || (bufferElem(p.ty) === null && !this.hasAtomic(p.ty))) return;
+      if (!p || (bufferElem(p.ty) === null && !this.hasAtomic(p.ty) && !isSyncShared(p.ty))) return;
       if (a.kind !== "Borrow" || a.expr.kind !== "Ident") return;
       const name = a.expr.name;
       const existing = this.borrows.get(name);
@@ -229,6 +230,7 @@ class Checker {
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
     if (t === "Task") return true;                    // spawn handle (void result)
     { const g = genericArgs(t); if (g !== null && g.base === "Task") return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Task<R>: a result-returning task
+    { const g = genericArgs(t); if (g !== null && LIB_GENERICS.includes(g.base)) return g.args.length === 1 && this.typeKnown(g.args[0]); }   // Arc/Mutex/Channel/MutexGuard<T>
     if (atomicElem(t) !== null) return true;          // element legality -> badAtomicElem (better msg)
     const se = sliceElem(t); if (se !== null) return this.typeKnown(se);
     const ap = arrayParts(t); if (ap !== null) return this.typeKnown(ap[0]) && /^\d+$/.test(ap[1]);
@@ -385,6 +387,9 @@ class Checker {
         } else {
           if (vt === "buffernew") { this.err(`'${s.name}': Buffer.shared needs a type annotation (e.g. : Buffer<f32>)`); declTy = "i32"; }
           else if (vt === "atomicnew") { this.err(`'${s.name}': Atomic.new needs a type annotation (e.g. : Atomic<u64>)`); declTy = "i32"; }
+          else if (vt === "arcnew") { this.err(`'${s.name}': Arc.new needs a type annotation (e.g. : Arc<i32>)`); declTy = "i32"; }
+          else if (vt === "mutexnew") { this.err(`'${s.name}': Mutex.new needs a type annotation (e.g. : Mutex<i64>)`); declTy = "i32"; }
+          else if (vt === "channelnew") { this.err(`'${s.name}': Channel.new needs a type annotation (e.g. : Channel<i32>)`); declTy = "i32"; }
           else if (vt === "Ordering") { this.err(`Ordering is not a storable value; pass a literal Ordering only to atomic operations`); declTy = "i32"; }
           else if (vt === "none") { this.err(`'${s.name}': bare none has no type — annotate it (e.g. : i32?)`); declTy = "i32"; }
           else if (vt.startsWith("ok<") || vt.startsWith("err<")) { this.err(`'${s.name}': Ok/Err need a Result type annotation (e.g. : Result<i32, str>)`); declTy = "i32"; }
@@ -403,12 +408,21 @@ class Checker {
           const arg = (s.value as Extract<Expr, { kind: "Call" }>).args[0];
           if (arg && !this.assignable(arg.ty ?? "unit", ael)) this.err(`Atomic.new: cannot init Atomic<${ael}> with ${arg.ty}`);
         }
+        // Arc<T>.new(v) / Mutex<T>.new(v): validate v against T; forbid Atomic inside (use Mutex/&Atomic instead).
+        const lb = libBase(declTy);
+        if ((lb === "Arc" || lb === "Mutex") && genericArgs(declTy)) {
+          const inner = genericArgs(declTy)!.args[0];
+          if (this.hasAtomic(inner)) this.err(`${lb}<${inner}>: an Atomic inside ${lb} is not supported (share the Atomic directly via &Atomic, or guard a plain value with Mutex)`);
+          const ctor = lb === "Arc" ? isArcNew(s.value) : isMutexNew(s.value);
+          if (ctor) { const arg = (s.value as Extract<Expr, { kind: "Call" }>).args[0]; if (arg && !this.assignable(arg.ty ?? "unit", inner)) this.err(`${lb}.new: cannot init ${lb}<${inner}> with ${arg.ty}`); }
+        }
         // Buffer<Atomic<...>> is CPU-only (the Metal buffer is raw bytes; std::atomic can't alias it).
         if (this.target === "metal" && bufferElem(declTy) !== null && this.hasAtomic(declTy))
           this.err(`Buffer<Atomic<...>> is not supported on the GPU/Metal target (Atomic is host-only)`);
-        // atomic-containing values are non-copyable/non-movable: only fresh construction or & sharing.
-        if (this.hasAtomic(declTy) && !isAtomicNew(s.value) && !isBufferNew(s.value) && s.value.kind !== "StructLit")
-          this.err(`'${s.name}': atomic-containing values cannot be copied or moved (construct in place, or share via &Atomic)`);
+        // Atomic-containing AND Mutex/Channel values are non-copyable/non-movable (in-place only):
+        // only fresh construction or & sharing. (Arc is movable, so it is excluded here.)
+        if ((this.hasAtomic(declTy) || isSyncShared(declTy)) && !isAtomicNew(s.value) && !isMutexNew(s.value) && !isChannelNew(s.value) && !isBufferNew(s.value) && s.value.kind !== "StructLit")
+          this.err(`'${s.name}': this value cannot be copied or moved (construct it in place, or share it across threads via &)`);
         // `let job = dev.launch(...)` borrows its buffer args until job.await()
         if (declTy === "Job" && s.value.kind === "Call" &&
             s.value.callee.kind === "Member" && s.value.callee.prop === "launch")
@@ -536,6 +550,9 @@ class Checker {
   assignable(vt: string, tt: string): boolean {
     if (vt === "buffernew" && bufferElem(tt) !== null) return true;
     if (vt === "atomicnew" && atomicElem(tt) !== null) return true;
+    if (vt === "arcnew") return genericArgs(tt)?.base === "Arc";
+    if (vt === "mutexnew") return genericArgs(tt)?.base === "Mutex";
+    if (vt === "channelnew") return genericArgs(tt)?.base === "Channel";
     // optionals: none fits any T?; U? -> T? iff U -> T; no implicit wrap of a bare value.
     const to = optInner(tt), vo = optInner(vt);
     if (to !== null) {
@@ -561,7 +578,7 @@ class Checker {
     if (tr !== null) return vr !== null && tr === vr && (!isMutRef(tt) || isMutRef(vt));
     // a borrow (&Buf / &Atomic / &atomic-struct) is usable where the plain value type is expected
     // — this is exactly the launch/spawn argument case (their params are plain Buffer/Atomic/struct).
-    if (vr !== null) return vr === tt && (bufferElem(tt) !== null || this.hasAtomic(tt));
+    if (vr !== null) return vr === tt && (bufferElem(tt) !== null || this.hasAtomic(tt) || isSyncShared(tt));
     if (isInt(vt) && isInt(tt)) return unifyInt(vt, tt) !== null;
     if (isFloat(vt) && isFloat(tt)) return unifyFloat(vt, tt) !== null;
     // generic struct instance: same base + element-wise assignable args (e.g. Pair<intlit,str> -> Pair<i32,str>)
@@ -663,6 +680,11 @@ class Checker {
           e.ty = "u32"; return e.ty;
         }
         if ((sliceElem(ot) !== null || arrayParts(ot) !== null || ot === "str" || vecParts(ot) !== null) && e.prop === "len") { e.ty = "u32"; return e.ty; }
+        const lg = genericArgs(ot);   // MutexGuard<T>.val : the guarded T (an lvalue, read+write under the lock)
+        if (lg !== null && lg.base === "MutexGuard") {
+          if (e.prop !== "val") this.err(`MutexGuard exposes only '.val' (got '${e.prop}')`);
+          e.ty = lg.args[0]; return e.ty;
+        }
         const si = this.structFields(ot);
         if (si) {
           const ft = si.fields.get(e.prop);
@@ -739,6 +761,20 @@ class Checker {
           if (e.args.length === 1) this.checkExpr(e.args[0]);
           else this.err("Atomic.new takes one argument (the initial value)");
           e.ty = "atomicnew"; return e.ty;
+        }
+        if (isArcNew(e)) {   // Arc.new(v): shared owning handle (needs a typed binding for T)
+          if (e.args.length === 1) this.checkExpr(e.args[0]); else this.err("Arc.new takes one argument (the value)");
+          e.ty = "arcnew"; return e.ty;
+        }
+        if (isMutexNew(e)) {
+          if (this.inKernel) this.err("Mutex is not supported inside a kernel");
+          if (e.args.length === 1) this.checkExpr(e.args[0]); else this.err("Mutex.new takes one argument (the initial value)");
+          e.ty = "mutexnew"; return e.ty;
+        }
+        if (isChannelNew(e)) {
+          if (this.inKernel) this.err("Channel is not supported inside a kernel");
+          if (e.args.length !== 0) this.err("Channel.new takes no arguments");
+          e.ty = "channelnew"; return e.ty;
         }
         // grid2(w,h) / grid3(w,h,d): build a multi-dimensional launch grid
         if (e.callee.kind === "Ident" && (e.callee.name === "grid2" || e.callee.name === "grid3")) {
@@ -874,10 +910,28 @@ class Checker {
         // and user struct methods (recv.method(args), auto-deref through &T).
         if (e.callee.kind === "Member") {
           const recvTy = this.checkExpr(e.callee.obj);
-          const ae = atomicElem(recvTy);
+          const ae = atomicElem(refInner(recvTy) ?? recvTy);   // also dispatch through &Atomic<T>
           if (ae !== null) {
             if (this.inKernel) this.err("Atomic is not supported inside a kernel (GPU atomics are out of scope)");
             return this.checkAtomicMethod(e, ae);
+          }
+          // concurrency library methods (Arc / Mutex / Channel), through &T too
+          const lg = genericArgs(refInner(recvTy) ?? recvTy);
+          if (lg !== null && (lg.base === "Arc" || lg.base === "Mutex" || lg.base === "Channel")) {
+            const inner = lg.args[0], m = e.callee.prop;
+            if (lg.base === "Arc") {
+              if (m === "clone") { if (e.args.length) this.err("Arc.clone() takes no arguments"); e.ty = `Arc<${inner}>`; }
+              else if (m === "get") { if (e.args.length) this.err("Arc.get() takes no arguments"); e.ty = `&${inner}`; }
+              else { this.err(`unknown Arc method '${m}' (use clone / get)`); e.ty = inner; }
+            } else if (lg.base === "Mutex") {
+              if (m === "lock") { if (e.args.length) this.err("Mutex.lock() takes no arguments"); e.ty = `MutexGuard<${inner}>`; }
+              else { this.err(`unknown Mutex method '${m}' (use lock)`); e.ty = inner; }
+            } else {   // Channel
+              if (m === "send") { if (e.args.length !== 1) this.err("Channel.send(v) takes one argument"); else { const at = this.checkExpr(e.args[0]); if (!this.assignable(at, inner)) this.err(`Channel.send: cannot send ${at} as ${inner}`); } e.ty = "unit"; }
+              else if (m === "recv") { if (e.args.length) this.err("Channel.recv() takes no arguments"); e.ty = inner; }
+              else { this.err(`unknown Channel method '${m}' (use send / recv)`); e.ty = inner; }
+            }
+            return e.ty;
           }
           const tg = genericArgs(recvTy);
           if ((recvTy === "Task" || tg?.base === "Task") && e.callee.prop === "join") {

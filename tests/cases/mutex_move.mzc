@@ -1,0 +1,6 @@
+function main() {
+  let m: Mutex<i64> = Mutex.new(0);
+  let m2: Mutex<i64> = m;     // error: cannot be copied or moved
+  let g = m2.lock();
+  stdout.println(g.val);
+}

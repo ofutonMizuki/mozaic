@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -20,13 +20,16 @@ const ORDER_CPP: Record<string, string> = {
   SeqCst: "std::memory_order_seq_cst",
 };
 function hasAtomic(t: string): boolean { return containsAtomic(t, STRUCT_FIELD_TYPES); }
+// A parameter passed by C++ reference: device buffers, Atomic-containing types, and the Sync
+// library types (Mutex/Channel) — all shared, never copied across a call/spawn.
+function isByRef(t: string): boolean { return bufferElem(t) !== null || hasAtomic(t) || isSyncShared(t); }
 // spawn f(args): the fn name + each arg, wrapping by-reference params (Buffer / atomic-containing) in std::ref.
 function spawnCallParts(call: Extract<Expr, { kind: "Call" }>): { fn: string; args: string[] } {
   const fn = (call.callee as Extract<Expr, { kind: "Ident" }>).name;
   const params = FN_PARAMS.get(fn) ?? [];
   const args = call.args.map((a, i) => {
     const p = params[i];
-    const byRef = p && (bufferElem(p.ty) !== null || hasAtomic(p.ty));
+    const byRef = p && isByRef(p.ty);
     const code = emitExpr(a);   // &x / &mut x already lower to the underlying lvalue
     return byRef ? `std::ref(${code})` : code;
   });
@@ -170,6 +173,8 @@ function emitExpr(e: Expr): string {
         if (arrayParts(ot) !== null || ot === "str") return `(uint32_t)(${emitExpr(e.obj)}).size()`;
         const vp = vecParts(ot); if (vp !== null) return `(uint32_t)${vp.lanes}`;   // lane count (comptime constant)
       }
+      // MutexGuard.val -> the guarded value through the held lock (*guard.p)
+      if (e.prop === "val" && genericArgs(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "")?.base === "MutexGuard") return `(*(${emitExpr(e.obj)}).p)`;
       return `${emitExpr(e.obj)}.${e.prop}`;
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
@@ -334,6 +339,16 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
         const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
         return `${ind}${cppType(s.declTy!)} ${s.name} = ${cppType(s.declTy!)}(${arg});`;
       }
+      if (isArcNew(s.value)) {   // Arc.new(v) -> mz::Arc<T>{ make_shared<T>(v) }
+        const inner = genericArgs(s.declTy!)!.args[0];
+        const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
+        return `${ind}${cppType(s.declTy!)} ${s.name} = ${cppType(s.declTy!)}{ std::make_shared<${cppType(inner)}>(${arg}) };`;
+      }
+      if (isMutexNew(s.value)) {   // Mutex/Channel are non-movable: default-construct in place, then set val
+        const arg = emitExpr((s.value as Extract<Expr, { kind: "Call" }>).args[0]);
+        return `${ind}${cppType(s.declTy!)} ${s.name}; ${s.name}.val = ${arg};`;
+      }
+      if (isChannelNew(s.value)) return `${ind}${cppType(s.declTy!)} ${s.name};`;
       return `${ind}${cppType(s.declTy!)} ${s.name} = ${moveRhs(s.value)};`;
     case "Assign": return `${ind}${emitExpr(s.target)} = ${moveRhs(s.value)};`;
     case "While": {
@@ -377,7 +392,7 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
 }
 
 function emitParam(p: Param): string {
-  return (bufferElem(p.ty) !== null || hasAtomic(p.ty)) ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
+  return isByRef(p.ty) ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
 }
 function emitFn(fn: FnDecl): string {
   const body = fn.body.map((s) => emitStmt(s, "  ", fn.name === "main" ? "main" : (fn.retTy ? "value" : "void"))).join("\n");
@@ -570,7 +585,7 @@ export function emit(prog: Program, target: "cpu" | "metal" = "cpu"): string {
   const mslDecls = target === "metal"
     ? kernels.map((k) => `static const char* _msl_${k.name} = R"MSL(\n${emitMslKernel(k)}\n)MSL";`).join("\n\n")
     : "";
-  const byRefTy = (p: Param) => (bufferElem(p.ty) !== null || hasAtomic(p.ty)) ? cppType(p.ty) + "&" : cppType(p.ty);
+  const byRefTy = (p: Param) => isByRef(p.ty) ? cppType(p.ty) + "&" : cppType(p.ty);
   const kernelProtos = target === "metal" ? "" : kernels.map((k) => `void ${k.name}(uint32_t, uint32_t, uint32_t${k.params.map((p) => ", " + byRefTy(p)).join("")});`).join("\n");
   const isGeneric = (f: FnDecl) => !!(f.typeParams && f.typeParams.length);
   // Generic fns are C++ templates: no separate prototype, and emitted (fully) before any caller.

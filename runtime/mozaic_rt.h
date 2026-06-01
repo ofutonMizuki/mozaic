@@ -12,6 +12,10 @@
 #include <type_traits>
 #include <array>
 #include <sstream>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 
 namespace mz {
 
@@ -101,6 +105,39 @@ template <class T, int N> Vec<T, N> operator-(const Vec<T, N>& a, const Vec<T, N
 template <class T, int N> Vec<T, N> operator*(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] * b.lane[i]; return r; }
 template <class T, int N> Vec<T, N> operator/(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] / b.lane[i]; return r; }
 template <class T, int N> Vec<T, N> operator%(const Vec<T, N>& a, const Vec<T, N>& b) { Vec<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] % b.lane[i]; return r; }
+
+// ---- concurrency library types (M4) ----
+// Arc<T>: atomically reference-counted shared ownership. clone() hands out another owning handle
+// (refcount++, thread-safe); get() reads the shared, immutable value. Lower than a borrow: an Arc
+// handle outlives any lexical scope, so it crosses spawn boundaries by value (pass a.clone()).
+template <class T> struct Arc {
+  std::shared_ptr<T> p;
+  Arc<T> clone() const { return Arc<T>{ p }; }
+  const T& get() const { return *p; }
+};
+
+// Mutex<T>: a value guarded by a lock. lock() returns a MutexGuard whose `.val` is the guarded T
+// (read & write under the held lock); the guard releases at scope exit (RAII). Shared by &Mutex<T>.
+// std::mutex is non-movable, so a Mutex is constructed in place (like Atomic) and never copied/moved.
+template <class T> struct MutexGuard {
+  std::unique_lock<std::mutex> lk;
+  T* p;
+};
+template <class T> struct Mutex {
+  std::mutex m;
+  T val{};
+  MutexGuard<T> lock() { return MutexGuard<T>{ std::unique_lock<std::mutex>(m), &val }; }
+};
+
+// Channel<T>: a blocking MPSC queue. send(v) enqueues; recv() blocks until an item is available.
+// Shared by &Channel<T> (Sync) across threads.
+template <class T> struct Channel {
+  std::mutex m;
+  std::condition_variable cv;
+  std::queue<T> q;
+  void send(const T& v) { { std::lock_guard<std::mutex> lk(m); q.push(v); } cv.notify_one(); }
+  T recv() { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return !q.empty(); }); T v = std::move(q.front()); q.pop(); return v; }
+};
 
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly
 // (so truncation, sign loss, or a non-integral float all yield none). To is always an integer.

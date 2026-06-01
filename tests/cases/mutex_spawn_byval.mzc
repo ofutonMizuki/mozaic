@@ -1,0 +1,7 @@
+function worker(m: Mutex<i64>) { let g = m.lock(); g.val = g.val +% 1; }
+function main() {
+  let m: Mutex<i64> = Mutex.new(0);
+  scope { spawn worker(m); }   // error: must be borrowed (&m)
+  let g = m.lock();
+  stdout.println(g.val);
+}

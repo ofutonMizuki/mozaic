@@ -1,0 +1,16 @@
+// Arc<T>: shared immutable ownership that crosses spawn by value (each thread gets a cloned handle).
+function sumRange(data: Arc<[i32; 8]>, from: u32, to: u32): i64 {
+  let s: i64 = 0;
+  let i: u32 = from;
+  while (i < to) { s = s +% (data.get()[i] as i64); i = i +% 1; }
+  return s;
+}
+function main() {
+  let table: [i32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+  let shared: Arc<[i32; 8]> = Arc.new(table);
+  let t1: Task<i64> = spawn sumRange(shared.clone(), 0, 4);   // 100
+  let t2: Task<i64> = spawn sumRange(shared.clone(), 4, 8);   // 260
+  let total: i64 = t1.join() +% t2.join();
+  stdout.println(total);              // 360
+  stdout.println(shared.get()[0]);    // 10 (Arc still valid here)
+}
