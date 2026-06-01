@@ -1,0 +1,10 @@
+// Generic functions: type params lower to C++ templates; call-site type inference.
+function id<T>(x: T): T { return x; }
+function firstOf<T>(s: []T): T { return s[0]; }
+function main() {
+  stdout.println(id(42));        // 42  (T = i32)
+  stdout.println(id("hi"));      // hi  (T = str)
+  stdout.println(id(true));      // true (T = bool)
+  let arr: [i32; 3] = [10, 20, 30];
+  stdout.println(firstOf(slice(arr)));   // 10 (T inferred from []i32)
+}

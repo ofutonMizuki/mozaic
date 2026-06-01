@@ -1,0 +1,3 @@
+template <class T>
+T id(T x)
+T firstOf(mz::Slice<T> s)

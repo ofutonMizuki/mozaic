@@ -8,7 +8,7 @@ export type Variant = { name: string; payload: string[] };
 export type Method = { name: string; recv: "self" | "&self" | "&mut self"; params: Param[]; retTy: string | null; body: Stmt[] };
 export type StructDecl = { kind: "StructDecl"; name: string; fields: Field[]; methods: Method[] };
 export type EnumDecl = { kind: "EnumDecl"; name: string; variants: Variant[] };
-export type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[] };
+export type FnDecl = { kind: "FnDecl"; name: string; params: Param[]; retTy: string | null; body: Stmt[]; typeParams?: string[] };
 export type KernelDecl = { kind: "KernelDecl"; name: string; params: Param[]; body: Stmt[] };
 export type Arm = { variant: string; bindings: string[]; body: Stmt[] };
 export type Stmt =
@@ -48,7 +48,7 @@ export type Expr =
   | { kind: "SpawnExpr"; call: Expr; ty?: string }
   | { kind: "Binary"; op: string; left: Expr; right: Expr; ty?: string };
 
-export type Sig = { params: Param[]; retTy: string | null };
+export type Sig = { params: Param[]; retTy: string | null; typeParams?: string[] };
 export type VarInfo = { enumName: string; index: number; payload: string[] };
 
 // ---------- type-system helpers ----------
@@ -107,6 +107,19 @@ export function containsAtomic(t: string, structFields: Map<string, string[]>, s
   const fields = structFields.get(t);
   if (fields) { seen.add(t); return fields.some((ft) => containsAtomic(ft, structFields, seen)); }
   return false;
+}
+// Replace generic type-param names (per `b`) everywhere they appear inside a type encoding.
+export function substituteType(t: string, b: Map<string, string>): string {
+  if (b.has(t)) return b.get(t)!;
+  if (t.startsWith("&mut ")) return "&mut " + substituteType(t.slice(5), b);
+  if (t.startsWith("&")) return "&" + substituteType(t.slice(1), b);
+  const oi = optInner(t); if (oi !== null) return substituteType(oi, b) + "?";
+  const se = sliceElem(t); if (se !== null) return "[]" + substituteType(se, b);
+  const ap = arrayParts(t); if (ap !== null) return `[${substituteType(ap[0], b)};${ap[1]}]`;
+  const be = bufferElem(t); if (be !== null) return `Buffer<${substituteType(be, b)}>`;
+  const ae = atomicElem(t); if (ae !== null) return `Atomic<${substituteType(ae, b)}>`;
+  const ra = resultArgs(t); if (ra !== null) return `Result<${substituteType(ra[0], b)}, ${substituteType(ra[1], b)}>`;
+  return t;
 }
 export function unifyInt(a: string, b: string): string | null {
   if (!isInt(a) || !isInt(b)) return null;

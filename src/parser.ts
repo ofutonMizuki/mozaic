@@ -125,10 +125,19 @@ export class Parser {
   parseFn(): FnDecl {
     this.eat("function");
     const name = this.eat("id").v;
+    const typeParams = this.parseTypeParams();
     const params = this.parseParams();
     let retTy: string | null = null;
     if (this.at(":")) { this.next(); retTy = this.parseType(); }
-    return { kind: "FnDecl", name, params, retTy, body: this.parseBlock() };
+    return { kind: "FnDecl", name, params, retTy, body: this.parseBlock(), typeParams };
+  }
+  parseTypeParams(): string[] {   // <T, U, ...> after a fn/struct name (empty if none)
+    if (!this.at("<")) return [];
+    this.next();
+    const ps = [this.eat("id").v];
+    while (this.at(",")) { this.next(); ps.push(this.eat("id").v); }
+    this.eat(">");
+    return ps;
   }
   parseKernel(): KernelDecl {
     this.eat("kernel");

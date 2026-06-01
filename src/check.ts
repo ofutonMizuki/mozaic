@@ -1,7 +1,7 @@
 // Semantic analysis: name resolution + strict type checking.
 import type { Program, Stmt, Expr, Param, Method, Sig, VarInfo } from "./ast.ts";
 import {
-  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, unifyInt, unifyFloat,
+  BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, containsAtomic, isStdinLines, isBufferNew, isAtomicNew,
 } from "./ast.ts";
 
@@ -36,6 +36,7 @@ class Checker {
   scopeStack: string[] = [];               // active scope ids (bare spawns join at scope end)
   scopeCount = 0;
   target: "cpu" | "metal" = "cpu";         // emit target (Buffer<Atomic<T>> is CPU-only)
+  curTypeParams = new Set<string>();       // generic type params in scope (opaque, treated as known types)
   // Does a type transitively contain an Atomic? (uses the registered struct field types)
   hasAtomic(t: string): boolean {
     const sf = new Map<string, string[]>();
@@ -185,6 +186,25 @@ class Checker {
       }
     }
   }
+  // Infer generic type-param bindings by structurally matching a declared param type `pt`
+  // (which may mention type params in `tps`) against a concrete argument type `at`.
+  inferTypeParam(pt: string, at: string, tps: string[], bind: Map<string, string>): void {
+    if (tps.includes(pt)) {
+      const norm = at === "intlit" ? "i32" : at === "floatlit" ? "f64" : at;   // bind to a concrete type
+      const prev = bind.get(pt);
+      if (prev !== undefined && prev !== norm) this.err(`conflicting types for type parameter ${pt}: ${prev} vs ${norm}`);
+      else bind.set(pt, norm);
+      return;
+    }
+    const pr = refInner(pt), ar = refInner(at); if (pr !== null && ar !== null) return this.inferTypeParam(pr, ar, tps, bind);
+    const po = optInner(pt), ao = optInner(at); if (po !== null && ao !== null) return this.inferTypeParam(po, ao, tps, bind);
+    const ps = sliceElem(pt), as_ = sliceElem(at); if (ps !== null && as_ !== null) return this.inferTypeParam(ps, as_, tps, bind);
+    const pa = arrayParts(pt), aa = arrayParts(at); if (pa !== null && aa !== null) return this.inferTypeParam(pa[0], aa[0], tps, bind);
+    const pb = bufferElem(pt), ab = bufferElem(at); if (pb !== null && ab !== null) return this.inferTypeParam(pb, ab, tps, bind);
+    const pres = resultArgs(pt), ares = resultArgs(at);
+    if (pres !== null && ares !== null) { this.inferTypeParam(pres[0], ares[0], tps, bind); this.inferTypeParam(pres[1], ares[1], tps, bind); }
+    // otherwise nothing to infer here; a final assignability check (post-substitution) catches mismatches
+  }
   err(m: string) { this.errs.push(m); }
   // Buffer.shared / Atomic.new yield a placeholder type that only directly initializes an annotated
   // binding (where the element type is known). Nesting it elsewhere has no valid C++ lowering.
@@ -195,6 +215,7 @@ class Checker {
   // Types that have a textual form (for format(x) and template interpolation).
   formattable(t: string): boolean { return t === "str" || t === "bool" || t === "char" || isInt(t) || isFloat(t); }
   typeKnown(t: string): boolean {
+    if (this.curTypeParams.has(t)) return true;                          // generic type param (opaque)
     const oi = optInner(t); if (oi !== null) return this.typeKnown(oi);   // T? known iff T known
     const ri = refInner(t); if (ri !== null) return this.typeKnown(ri);   // &T / &mut T known iff T known
     if (BUILTIN_TYPES.has(t) || this.structs.has(t) || this.enums.has(t)) return true;
@@ -252,13 +273,15 @@ class Checker {
     }
     for (const it of p.items) if (it.kind === "FnDecl") {
       if (this.fns.has(it.name)) this.err(`duplicate function '${it.name}'`);
-      this.fns.set(it.name, { params: it.params, retTy: it.retTy });
+      this.fns.set(it.name, { params: it.params, retTy: it.retTy, typeParams: it.typeParams });
+      this.curTypeParams = new Set(it.typeParams ?? []);   // params/return may reference them
       for (const pa of it.params) {
         if (!this.typeKnown(pa.ty)) this.err(`unknown type '${pa.ty}' for parameter '${pa.name}'`);
         const bad = this.badAtomicElem(pa.ty); if (bad) this.err(`${bad} (parameter '${pa.name}')`);
       }
       if (it.retTy && !this.typeKnown(it.retTy)) this.err(`unknown return type '${it.retTy}' for '${it.name}'`);
       if (it.retTy && this.hasAtomic(it.retTy)) this.err(`'${it.name}': cannot return an atomic-containing type by value`);
+      this.curTypeParams = new Set();
     }
     if (!this.fns.has("main")) this.err("no `main` function");
     const main = this.fns.get("main");
@@ -269,12 +292,14 @@ class Checker {
       this.borrows = new Map();
       this.tasks = new Map();
       this.inKernel = it.kind === "KernelDecl";
+      this.curTypeParams = it.kind === "FnDecl" ? new Set(it.typeParams ?? []) : new Set();
       this.curParams = new Set(it.params.map((pa) => pa.name));
       for (const pa of it.params) this.define(pa.name, pa.ty);
       for (const s of it.body) this.checkStmt(s);
       for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
       for (const [name, t] of this.tasks) if (!t.joined) this.err(`'${name}' is a Task that was never joined; join it before it goes out of scope`);
       this.inKernel = false;
+      this.curTypeParams = new Set();
       this.pop();
     }
     // struct method bodies: bind `self` (typed by the receiver form) + params, then check.
@@ -711,6 +736,20 @@ class Checker {
           const sig = this.fns.get(e.callee.name);
           if (sig) {
             if (e.args.length !== sig.params.length) this.err(`'${e.callee.name}' expects ${sig.params.length} arg(s), got ${e.args.length}`);
+            const tps = sig.typeParams ?? [];
+            if (tps.length) {   // generic call: infer type params from args, then check post-substitution
+              const bind = new Map<string, string>();
+              for (let k = 0; k < e.args.length; k++) { const at = this.checkExpr(e.args[k]); const p = sig.params[k]; if (p) this.inferTypeParam(p.ty, at, tps, bind); }
+              for (const tp of tps) if (!bind.has(tp)) this.err(`'${e.callee.name}': cannot infer type parameter ${tp} from the arguments`);
+              for (let k = 0; k < e.args.length; k++) {
+                const p = sig.params[k]; if (!p) continue;
+                const want = substituteType(p.ty, bind);
+                if (!this.assignable(e.args[k].ty ?? "unit", want)) this.err(`arg ${k + 1} of '${e.callee.name}': cannot pass ${e.args[k].ty} as ${want}`);
+              }
+              this.checkArgAliasing(e.args, `call to '${e.callee.name}'`);
+              e.ty = substituteType(sig.retTy ?? "unit", bind);
+              return e.ty;
+            }
             for (let k = 0; k < e.args.length; k++) {
               const at = this.checkExpr(e.args[k]);
               const p = sig.params[k];
