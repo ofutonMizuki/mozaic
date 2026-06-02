@@ -6,10 +6,10 @@
 > `Vec<T>` / `Map<K,V>` / 可変 `String` / `readFile`/`writeFile` / `stdin.readAll` / 論理 `&& || !` / `else if` /
 > `import` / disjoint-field 借用 / **格納参照 + NLL** / `Send`/`Sync` 規則 / **`Box<T>` 再帰型** /
 > **カーネル workgroup**(`shared`/`local`/`group`/`barrier`/`gridGroups`、実機 GPU 検証) / **実行時 Device 選択**。
-> **M7 実用サブセット self-host**: [tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = **mozaic で書いた mozaic→C++ コンパイラ**。
-> 対応: 関数+再帰 / int・bool・str / struct / enum+match / 制御フロー / 全演算子 / println。
-> 再帰・struct・文字列・enum/match プログラムを clang++ で通る C++ に変換・実行・正答(実機確認)。
-> **残り(唯一)**: M7 全機能セルフホスト(selfhost.mzc を generics/atomic/comptime/optional/被コンパイル側 Vec・Box/GPU 等へ拡張)。
+> **M7 サブセット self-host(★自己ホスト不動点到達)**: [tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = **mozaic で書いた mozaic→C++ コンパイラ**が
+> **自分自身をコンパイルして同一ソースを再生成**(gen2==gen3、`./selfhost-check.sh` で検証)。対応サブセット: 関数+再帰 / int・bool・str・char /
+> struct+メソッド / enum+match / 固定配列 / `as` / 被コンパイル側 `Vec`・`Box`・`Map` / 参照 / テンプレート・`format` / コメント / `const` / `abort` / `stdin.readAll`。
+> **残り(唯一)**: M7 全機能版(selfhost.mzc を generics/atomic/comptime/optional/SIMD/GPU 等へ拡張し、生成 C++ で 102 ゴールデン全件)。
 > コンパイラ編集時の注意は memory `mozaic-compiler-conventions` 参照。
 
 ---

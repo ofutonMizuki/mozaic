@@ -4,7 +4,7 @@
 > 他社 UMA は**非目標**で、長期構想として [VISION.md](VISION.md) に残置する(完成の定義には含めない)。
 > GPU は Apple Silicon / Metal のまま。
 
-## 現在地（M3・M4 完了・M5 ほぼ完了・M6 完了・M7 bootstrap 実証 / branch `m3-abstraction`、ゴールデン **102/102**）
+## 現在地（M3・M4 完了・M5 ほぼ完了・M6 完了・M7 サブセットで**自己ホスト不動点到達** / branch `m3-abstraction`、ゴールデン **102/102**）
 - パイプライン `lexer → parser → check → emit`(C++ 生成)+ ランタイム `runtime/mozaic_rt.h`。
 - GPU/Metal バックエンド(Objective-C++、UMA ゼロコピー、`borrow=device-sync` キーストーン)。
 - **M3 完了**: 総称型(fn+struct+メソッド) / `i128`/`u128`/`f16` / SIMD ベクタ(`f32x4` 等、host=`mz::Simd`/kernel=MSL) /
@@ -18,16 +18,18 @@
 - **M6 完了**: `import`(複数ファイル解決・diamond dedup)/ 可変長 `Vec<T>` / `Map<K,V>`(ハッシュマップ)/
   可変 `String` 構築(`String.new`/`push`/`pushStr`)/ ファイル I/O(`readFile`/`writeFile`)/ `stdin.readAll()`。
 - **言語コア補完**: 論理演算子 `&& || !`(短絡)、`else if` 連鎖。
-- **M7 実用サブセット self-host**: 再帰データの要 **`Box<T>`** + `match` の `&Enum` 透過。
-  **[tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = mozaic で書いた mozaic→C++ コンパイラ**。対応サブセット:
-  関数+再帰 / int・bool・str / **struct(宣言・リテラル・フィールド)** / **enum + match** / 制御フロー / 全演算子 / println。
-  再帰・struct・文字列・enum/match のプログラムを **clang++ で通る C++ に変換し正しく実行**(実機検証)。
-  関連実証: [calc_mz.mzc](tests/cases/calc_mz.mzc) / [lexer_mz.mzc](tests/cases/lexer_mz.mzc) / [ast_eval.mzc](tests/cases/ast_eval.mzc)。
+- **M7 サブセット self-host(★不動点到達)**: **[tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = mozaic で書いた mozaic→C++ コンパイラ**が
+  **自分自身をコンパイルして同一ソースを再生成**(gen1→gen2→gen3、gen2==gen3 をバイト一致で確認。[selfhost-check.sh](selfhost-check.sh))。
+  これは古典的なセルフホスティングの達成 = **mozaic が(サブセットの)mozaic コンパイラを記述し、それが自身を再生産**する。
+  対応サブセット: 関数+再帰 / int・bool・str・char / struct+メソッド(`&self`/`&mut self`)/ enum+match / 固定配列 /
+  `as` / 被コンパイル側 `Vec`・`Box`(再帰AST)・`Map` / 参照(`&T`)/ テンプレート文字列・`format` / 全演算子(ラップ含む)/
+  lvalue 代入・else-if / コメント / トップレベル `const` / `abort` / `stdin.readAll`。基盤の鍵: `Box<T>`、`match` の `&Enum` 透過、
+  種別考慮トークン照合、前方宣言、`mz::fmt` 汎用フォーマッタ。関連実証: [calc_mz.mzc](tests/cases/calc_mz.mzc) / [lexer_mz.mzc](tests/cases/lexer_mz.mzc)。
 
 ## 残り(唯一の未完項目)
-- **M7 全機能セルフホスト ★(最大の残作業)**: アーキテクチャは実証済み(上記サブセットが動作)。残るは selfhost.mzc を
-  残りの言語機能(generics / atomic / comptime / optional・Result / 被コンパイル側の `Vec`・`Box`・`Map` / GPU カーネル等)へ
-  拡張し、`src/*.ts`(約 2700 行)相当を mozaic で書き切って生成 C++ で既存 102 ゴールデン全件を通すこと。網羅実装(数千行規模)。
+- **M7 全機能版 ★(最大の残作業)**: 自己ホスト不動点はサブセットで達成済み。残るは selfhost.mzc を
+  残りの言語機能(generics / atomic / comptime / optional・Result / SIMD / GPU カーネル等)へ拡張し、`src/*.ts`(約 2700 行)
+  相当を mozaic で書き切って生成 C++ で既存 102 ゴールデン**全件**を通すこと(=型検査器込みの全面移植、数千行規模)。
 - **M5(借用完全形の残り)**: NLL(最終使用での解放)・格納参照の文跨ぎフロー解析・明示 lifetime 注釈。
   データフロー解析が要で、過剰な制約はセルフホストの記述を妨げうるため慎重に。
 - **M4 任意残**: `Send`/`Sync` の明示的形式化(現状は Buffer/Atomic/Mutex/Channel を by-ref Sync として保守的に扱う実装で代替)。
@@ -57,7 +59,7 @@
 | ~~**M4**~~ ✅ | 並行性の完成(**実装済み**) | ✅ `Mutex<T>` / `Channel<T>` / `Arc<T>` ・ 結果返し `join`(`Task<R>`)・ `Atomic` の `SeqCst` ・ **カーネル `local.{x,y,z}` / `group.{x,y,z}` / `barrier()` / `shared [T;N]`**(`gridGroups`、GPU=native MSL threadgroup・CPU=std::thread+std::barrier 模倣、実機 GPU で検証)・ **実行時 Device 選択**(`Device.gpu.first() ?? Device.cpu`)。残(任意): `Send`/`Sync` の明示的形式化 | M2(一部 M3) | 中〜大 |
 | **M5** | 借用チェッカ完全形(ほぼ ✅) | ✅ disjoint-field 借用 ・ ✅ 格納参照の文跨ぎ別名 + NLL(最終使用で解放)・ ✅ `Send`/`Sync` 明示規則。残(任意): 明示 lifetime 注釈構文(provenance escape + NLL で安全性は担保済のため設計上省略) | 現在地(独立) | 中 |
 | ~~**M6**~~ ✅ | モジュール & 標準ライブラリ(**実装済み**) | ✅ `import`(複数ファイル解決) ・ `Vec<T>` / `Map<K,V>` collections ・ 可変 `String` 構築 ・ **ファイル I/O** `readFile`/`writeFile` ・ `stdin.readAll` | M2, M3 | 大 |
-| **M7** | セルフホスト ★完成(実用サブセット ✅ / 全機能版残) | ✅ **mozaic で書いた mozaic→C++ コンパイラ** [selfhost.mzc](tests/cases/selfhost.mzc)(lex→再帰下降 parse(`Box` 再帰 AST)→C++ emit)。対応: 関数+再帰 / int・bool・str・char / **struct + メソッド(&self/&mut self)** / **enum + match** / **固定配列 [T;N]** / **`as` キャスト** / lvalue 代入(name/field/index)・if-else-if・while / 全演算子 / 呼出し / println。再帰・struct+メソッド・文字列・char・enum/match・配列・変更プログラムを **clang++ で通る C++ に変換し正しく実行**(実機検証)。残(Phase B-D): ランタイム基盤 emit + 被コンパイル側 `Vec`/`Box`/`Map`・テンプレート・`format`(B)→ optional/Result/総称型 + 最小型推論(C)→ mozc が自分自身をコンパイル=self-compile 不動点(D)。型検査器の移植が最大の山 | M2 + M3 + M6 | 最大 |
+| **M7** | セルフホスト ★(サブセットで**不動点到達** / 全機能版残) | ✅ **mozaic で書いた mozaic→C++ コンパイラ** [selfhost.mzc](tests/cases/selfhost.mzc) が **自分自身をコンパイルして同一ソースを再生成(self-hosting 不動点 gen2==gen3、[selfhost-check.sh](selfhost-check.sh) で検証)**。対応サブセット: 関数+再帰 / int・bool・str・char / struct+メソッド / enum+match / 固定配列 / `as` / **被コンパイル側 `Vec`/`Box`/`Map`** / 参照(`&T`)/ **テンプレート文字列**・`format` / 論理・比較・算術(ラップ含む)/ lvalue代入・else-if / コメント / トップレベル `const` / `abort` / `stdin.readAll`。残: generics/atomic/comptime/optional/Result/SIMD/GPU を被コンパイル側に加え(=型検査器込みの全面移植)、生成 C++ で既存 102 ゴールデン全件を通す | M2 + M3 + M6 | 最大 |
 
 ## クリティカルパス
 **M2(文字列・collections・エラー処理)→ M3(総称型・comptime)→ M6(モジュール + ファイル I/O)→ M7(自己記述)★**
