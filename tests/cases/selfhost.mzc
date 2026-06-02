@@ -24,7 +24,9 @@ enum Expr {
   Call(str, Vec<Box<Expr>>),         // function call, OR enum-variant construction (resolved at emit)
   StrLit(str),                       // "..."
   BoolLit(bool),                     // true / false
-  Field(Box<Expr>, str),             // e.field
+  Field(Box<Expr>, str),             // e.field  (.len -> .size())
+  Index(Box<Expr>, Box<Expr>),       // e[i]
+  ArrLit(Vec<Box<Expr>>),            // [a, b, c]  (only as an initializer)
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
 }
 enum Stmt {
@@ -110,11 +112,32 @@ struct Parser {
     if (self.text() == t) { self.adv(); } else { abort(`parse: expected '${t}'`); }
   }
   function word(&mut self): str { let w: str = self.text(); self.adv(); return w; }
+  function parseType(&mut self): str {   // returns a C++ type string directly
+    if (self.text() == "[") {
+      self.adv();
+      let elem: str = self.parseType();
+      self.eat(";");
+      let nv: i64 = self.ival(); self.adv();
+      self.eat("]");
+      return `std::array<${elem}, ${format(nv)}>`;
+    }
+    return mapType(self.word());
+  }
 
   function parsePrimary(&mut self): Box<Expr> {
     if (self.kind() == KNUM) { let v: i64 = self.ival(); self.adv(); return Box.new(Num(v)); }
     if (self.kind() == KSTR) { let s: str = self.text(); self.adv(); return Box.new(StrLit(s)); }
     if (self.text() == "(") { self.adv(); let e: Box<Expr> = self.parseExpr(); self.eat(")"); return e; }
+    if (self.text() == "[") {                   // array literal [a, b, c]
+      self.adv();
+      let elems: Vec<Box<Expr>> = Vec.new();
+      while (self.text() != "]") {
+        elems.push(self.parseExpr());
+        if (self.text() == ",") { self.adv(); }
+      }
+      self.eat("]");
+      return Box.new(ArrLit(elems));
+    }
     if (self.kind() == KWORD) {
       if (self.text() == "true") { self.adv(); return Box.new(BoolLit(true)); }
       if (self.text() == "false") { self.adv(); return Box.new(BoolLit(false)); }
@@ -147,7 +170,10 @@ struct Parser {
   }
   function parsePostfix(&mut self): Box<Expr> {
     let e: Box<Expr> = self.parsePrimary();
-    while (self.text() == ".") { self.adv(); let f: str = self.word(); e = Box.new(Field(e, f)); }
+    while (self.text() == "." || self.text() == "[") {
+      if (self.text() == ".") { self.adv(); let f: str = self.word(); e = Box.new(Field(e, f)); }
+      else { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
+    }
     return e;
   }
   function parseUnary(&mut self): Box<Expr> {
@@ -204,7 +230,7 @@ struct Parser {
       self.adv();
       let name: str = self.word();
       self.eat(":");
-      let ty: str = self.word();
+      let ty: str = self.parseType();
       self.eat("=");
       let v: Box<Expr> = self.parseExpr();
       self.eat(";");
@@ -281,17 +307,17 @@ struct Parser {
     self.eat("(");
     let params: Vec<Param> = Vec.new();
     if (self.text() != ")") {
-      let pn: str = self.word(); self.eat(":"); let pt: str = self.word();
+      let pn: str = self.word(); self.eat(":"); let pt: str = self.parseType();
       params.push(Param { name: pn, ty: pt });
       while (self.text() == ",") {
         self.adv();
-        let qn: str = self.word(); self.eat(":"); let qt: str = self.word();
+        let qn: str = self.word(); self.eat(":"); let qt: str = self.parseType();
         params.push(Param { name: qn, ty: qt });
       }
     }
     self.eat(")");
     let ret: str = "";
-    if (self.text() == ":") { self.adv(); ret = self.word(); }
+    if (self.text() == ":") { self.adv(); ret = self.parseType(); }
     let body: Vec<Stmt> = self.parseBlock();
     return Func { name: name, params: params, ret: ret, body: body };
   }
@@ -301,7 +327,7 @@ struct Parser {
     self.eat("{");
     let fields: Vec<Param> = Vec.new();
     while (self.text() != "}") {
-      let fname: str = self.word(); self.eat(":"); let fty: str = self.word(); self.eat(";");
+      let fname: str = self.word(); self.eat(":"); let fty: str = self.parseType(); self.eat(";");
       fields.push(Param { name: fname, ty: fty });
     }
     self.eat("}");
@@ -317,8 +343,8 @@ struct Parser {
       let payloads: Vec<str> = Vec.new();
       if (self.text() == "(") {
         self.adv();
-        payloads.push(self.word());
-        while (self.text() == ",") { self.adv(); payloads.push(self.word()); }
+        payloads.push(self.parseType());
+        while (self.text() == ",") { self.adv(); payloads.push(self.parseType()); }
         self.eat(")");
       }
       variants.push(Variant { name: vn, payloads: payloads });
@@ -398,7 +424,17 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     StrLit(s) => { return `"${s}"`; }
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
-    Field(o, f) => { return `(${emitExpr(o.get(), enums)}).${f}`; }
+    Field(o, f) => {
+      if (f == "len") { return `(${emitExpr(o.get(), enums)}).size()`; }   // .len -> .size() (array/string)
+      return `(${emitExpr(o.get(), enums)}).${f}`;
+    }
+    Index(o, idx) => { return `(${emitExpr(o.get(), enums)})[${emitExpr(idx.get(), enums)}]`; }
+    ArrLit(elems) => {
+      let s: str = "{ ";
+      let ai: u32 = 0;
+      while (ai < elems.len) { if (ai > 0) { s = s + ", "; } s = s + emitExpr(elems[ai].get(), enums); ai = ai +% 1; }
+      return s + " }";
+    }
     Bin(op, l, r) => { return `(${emitExpr(l.get(), enums)} ${op} ${emitExpr(r.get(), enums)})`; }
     Call(name, args) => {
       let vi: VInfo = findVariant(enums, name);
@@ -496,7 +532,7 @@ function main() {
   let src: str = stdin.readAll();
   let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), noStruct: false };
   let funcs: Vec<Func> = p.parseProgram();
-  let out: str = "#include <cstdint>\n#include <iostream>\n#include <string>\n\n";
+  let out: str = "#include <cstdint>\n#include <iostream>\n#include <string>\n#include <array>\n\n";
   // enum + struct definitions, then function prototypes (any-order defs / recursion), then bodies.
   let e: u32 = 0;
   while (e < p.enums.len) { out = out + emitEnum(&p.enums[e]); e = e +% 1; }
