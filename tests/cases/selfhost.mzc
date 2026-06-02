@@ -46,6 +46,7 @@ enum Expr {
   SpawnExpr(str, Vec<Box<Expr>>),               // spawn f(args) — fn name + args (only as a let value)
   TryQ(Box<Expr>),                              // e? -> propagate none/Err (statement-expr)
   TryCast(Box<Expr>, str),                      // e as? T -> mz::checked_cast<T>(e)
+  Comptime(Box<Expr>),                          // comptime e -> e (build-time; may only read consts/literals)
 }
 enum Stmt {
   Let(str, str, Box<Expr>, bool),    // name, mozaic type, value, isConst (declared with `const`)
@@ -323,7 +324,7 @@ struct Parser {
     return e;
   }
   function parseUnary(&mut self): Box<Expr> {
-    if (self.at("comptime")) { self.adv(); return self.parseUnary(); }   // build-time eval: same value at runtime / C++ static init, so emit the operand
+    if (self.at("comptime")) { self.adv(); return Box.new(Comptime(self.parseUnary())); }   // build-time eval (emit is a no-op; checker forbids reading runtime values)
     if (self.at("!")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
     if (self.at("&")) {   // &e / &mut e -> Borrow (erased in emit)
       self.adv();
@@ -957,6 +958,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     ErrE(x) => { return `{ false, {}, ${emitExpr(x.get(), enums)} }`; }
     OrElse(a, b) => { return `(${emitExpr(a.get(), enums)}).value_or(${emitExpr(b.get(), enums)})`; }
     SpawnExpr(fn, sa) => { return fn; }   // only meaningful as a let value (handled in Let); standalone unused
+    Comptime(x) => { return emitExpr(x.get(), enums); }   // build-time value -> emit the operand (C++ folds / static-inits it)
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
@@ -1341,6 +1343,7 @@ function typeOf(e: &Expr, env: &Vec<Param>): str {
       if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||") { return "bool"; }
       return typeOf(l.get(), env);
     }
+    Comptime(x) => { return typeOf(x.get(), env); }
     _ => { return ""; }
   }
 }
@@ -1368,6 +1371,21 @@ function methodIsMut(structs: &Vec<StructDef>, sname: str, m: str): bool {
   }
   return false;
 }
+// A comptime expression may only read compile-time values: literals, function calls, top-level consts,
+// or local `const` bindings — never a runtime local/param (a non-const binding in scope).
+function comptimeCheck(e: &Expr, env: &Vec<Param>, consts: &Vec<str>): str {
+  match e {
+    Var(n) => { if (envType(env, n) != "" && !contains(consts, n)) { return `'${n}' is not a compile-time value`; } }
+    Bin(op, l, r) => { let a: str = comptimeCheck(l.get(), env, consts); if (a != "") { return a; } return comptimeCheck(r.get(), env, consts); }
+    Not(x) => { return comptimeCheck(x.get(), env, consts); }
+    Field(o, f) => { return comptimeCheck(o.get(), env, consts); }
+    Index(o, ix) => { let a: str = comptimeCheck(o.get(), env, consts); if (a != "") { return a; } return comptimeCheck(ix.get(), env, consts); }
+    Cast(x, t) => { return comptimeCheck(x.get(), env, consts); }
+    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = comptimeCheck(args[i].get(), env, consts); if (z != "") { return z; } i = i +% 1; } }
+    _ => { }
+  }
+  return "";
+}
 // Reject mutating a const binding: `&mut c` and `c.mutMethod(...)` where c was declared `const`.
 function checkConstMutExpr(e: &Expr, env: &Vec<Param>, consts: &Vec<str>, structs: &Vec<StructDef>): str {
   match e {
@@ -1394,6 +1412,7 @@ function checkConstMutExpr(e: &Expr, env: &Vec<Param>, consts: &Vec<str>, struct
     OrElse(a2, b2) => { let a: str = checkConstMutExpr(a2.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(b2.get(), env, consts, structs); }
     Cast(x, t) => { return checkConstMutExpr(x.get(), env, consts, structs); }
     TryQ(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    Comptime(x) => { let r: str = comptimeCheck(x.get(), env, consts); if (r != "") { return r; } return checkConstMutExpr(x.get(), env, consts, structs); }
     Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkConstMutExpr(exprs[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
     ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkConstMutExpr(els[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
     StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkConstMutExpr(vals[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
@@ -1505,6 +1524,7 @@ function checkExpr(e: &Expr, env: &Vec<Param>, moved: &Vec<str>): str {
     Cast(x, t) => { return checkExpr(x.get(), env, moved); }
     TryQ(x) => { return checkExpr(x.get(), env, moved); }
     TryCast(x, t) => { return checkExpr(x.get(), env, moved); }
+    Comptime(x) => { return checkExpr(x.get(), env, moved); }
     Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkExpr(exprs[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
     ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkExpr(els[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
     StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkExpr(vals[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
@@ -1616,6 +1636,7 @@ function exprMentions(e: &Expr, name: str): bool {
     Cast(x, t) => { return exprMentions(x.get(), name); }
     TryQ(x) => { return exprMentions(x.get(), name); }
     TryCast(x, t) => { return exprMentions(x.get(), name); }
+    Comptime(x) => { return exprMentions(x.get(), name); }
     Template(strs, ex) => { let i: u32 = 0; while (i < ex.len) { if (exprMentions(ex[i].get(), name)) { return true; } i = i +% 1; } return false; }
     ArrLit(els) => { let i: u32 = 0; while (i < els.len) { if (exprMentions(els[i].get(), name)) { return true; } i = i +% 1; } return false; }
     StructLit(n2, vals) => { let i: u32 = 0; while (i < vals.len) { if (exprMentions(vals[i].get(), name)) { return true; } i = i +% 1; } return false; }
@@ -1755,6 +1776,7 @@ function exprJoins(e: &Expr, joined: &mut Vec<str>) {
     OrElse(a, b) => { exprJoins(a.get(), joined); exprJoins(b.get(), joined); }
     Cast(x, t) => { exprJoins(x.get(), joined); }
     TryQ(x) => { exprJoins(x.get(), joined); }
+    Comptime(x) => { exprJoins(x.get(), joined); }
     Template(strs, ex) => { let i: u32 = 0; while (i < ex.len) { exprJoins(ex[i].get(), joined); i = i +% 1; } }
     _ => { }
   }
