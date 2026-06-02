@@ -4,7 +4,7 @@
 > 他社 UMA は**非目標**で、長期構想として [VISION.md](VISION.md) に残置する(完成の定義には含めない)。
 > GPU は Apple Silicon / Metal のまま。
 
-## 現在地（M3・M4 完了・M5 一部・M6 完了・M7 実証 / branch `m3-abstraction`、ゴールデン **98/98**）
+## 現在地（M3・M4 完了・M5 ほぼ完了・M6 完了・M7 bootstrap 実証 / branch `m3-abstraction`、ゴールデン **102/102**）
 - パイプライン `lexer → parser → check → emit`(C++ 生成)+ ランタイム `runtime/mozaic_rt.h`。
 - GPU/Metal バックエンド(Objective-C++、UMA ゼロコピー、`borrow=device-sync` キーストーン)。
 - **M3 完了**: 総称型(fn+struct+メソッド) / `i128`/`u128`/`f16` / SIMD ベクタ(`f32x4` 等、host=`mz::Simd`/kernel=MSL) /
@@ -14,19 +14,19 @@
   **カーネルのワークグループ機構**(`shared [T;N]`/`local`/`group`/`barrier()`/`gridGroups`、GPU=MSL threadgroup・
   CPU=std::thread+std::barrier、[group_reduce.mzc](tests/cases/group_reduce.mzc) を**実機 Apple Silicon GPU で検証**)/
   **実行時 Device 選択** `Device.gpu.first() ?? Device.cpu`。
-- **M5 一部**: **disjoint-field 借用**(`&mut v.a` と `&mut v.b` は独立、アクセスパスで別名判定)。
+- **M5 ほぼ完了**: disjoint-field 借用 / **格納参照の文跨ぎ別名 + NLL**(`let r = &mut x` は r の最終使用まで x を借用、最終使用で解放)/ **`Send`/`Sync` 明示規則**(非 Sync 型への参照は spawn 引数にできない)。
 - **M6 完了**: `import`(複数ファイル解決・diamond dedup)/ 可変長 `Vec<T>` / `Map<K,V>`(ハッシュマップ)/
   可変 `String` 構築(`String.new`/`push`/`pushStr`)/ ファイル I/O(`readFile`/`writeFile`)/ `stdin.readAll()`。
 - **言語コア補完**: 論理演算子 `&& || !`(短絡)、`else if` 連鎖。
-- **M7 実証**: 再帰データの要 **`Box<T>`**(型推論つき、enum ペイロード可)+ `match` の `&Enum` 透過。
-  [tests/cases/calc_mz.mzc](tests/cases/calc_mz.mzc) = **mozaic で書いた完全な式コンパイラ**(字句解析 +
-  再帰下降パーサ→`Box<Expr>` AST + 評価器、stdin 入力)。[tests/cases/lexer_mz.mzc](tests/cases/lexer_mz.mzc) /
-  [tests/cases/ast_eval.mzc](tests/cases/ast_eval.mzc) も同様。**言語がコンパイラ段を記述できる表現力に到達**。
+- **M7 bootstrap 実証**: 再帰データの要 **`Box<T>`** + `match` の `&Enum` 透過。
+  **[tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = mozaic で書いた mozaic→C++ コンパイラ**(lex→再帰下降
+  parse(`Box` 再帰 AST)→C++ emit)。再帰プログラム(fib/sumTo)を **clang++ で通る C++ に変換 → 実行 → 正答**を実機確認。
+  関連実証: [calc_mz.mzc](tests/cases/calc_mz.mzc)(式評価器)/ [lexer_mz.mzc](tests/cases/lexer_mz.mzc) / [ast_eval.mzc](tests/cases/ast_eval.mzc)。
 
 ## 残り(次セッションの着手対象)
-- **M7 完全セルフホスト ★(最大の残作業)**: 上の実証で**言語側の前提は揃った**。残るは `src/*.ts`(約 2700 行:
-  lexer/parser/check/emit/comptime)を mozaic で書き直し、生成 C++ で既存 96 ゴールデンを通す段階 bootstrap。
-  これは数千行規模の移植で、本セッションでは未完(言語の表現力実証までを達成)。
+- **M7 全機能セルフホスト ★(最大の残作業)**: bootstrap は実証済み。残るは selfhost.mzc のサブセットを
+  全言語機能(generics / atomic / comptime / 文字列 / GPU 等)へ拡張し、`src/*.ts`(約 2700 行)相当を mozaic で書き切って
+  生成 C++ で既存 102 ゴールデン全件を通すこと。アーキテクチャは実証済みで、残るは網羅実装(数千行規模)。
 - **M5(借用完全形の残り)**: NLL(最終使用での解放)・格納参照の文跨ぎフロー解析・明示 lifetime 注釈。
   データフロー解析が要で、過剰な制約はセルフホストの記述を妨げうるため慎重に。
 - **M4 任意残**: `Send`/`Sync` の明示的形式化(現状は Buffer/Atomic/Mutex/Channel を by-ref Sync として保守的に扱う実装で代替)。
@@ -54,9 +54,9 @@
 | ~~**M2**~~ ✅ | 言語コア充実(**実装済み**) | `as`/`as?` ・ `T?` ・ `Result<T,E>` ・ `defer` ・ `[T;N]` / `[]T` ・ `char`+文字リテラル ・ `str`/`String`(`.len`/`+`/`[i]`/`format`)+ テンプレート `` `…${e}…` `` ・ `abort`/`assert`。残: `Result` コンビネータ、可変 `String` API、境界検査、単項マイナス | — | 完了 |
 | ~~**M3**~~ ✅ | 抽象化(**実装済み**) | ✅ ユーザ総称型: generic fn（型推論）+ generic struct + **総称 struct のメソッド**（C++ テンプレートへ降ろし、コンテナ実装可能）。✅ `i128`/`u128`/`f16`。✅ ベクタ/SIMD(`f32x4` 等: splat/レーン構築/レーン演算/添字、host=`mz::Vec` / kernel=MSL native)。✅ `comptime` + トップレベル `const`(ビルド時評価器でテーブル生成) | M2 | 完了 |
 | ~~**M4**~~ ✅ | 並行性の完成(**実装済み**) | ✅ `Mutex<T>` / `Channel<T>` / `Arc<T>` ・ 結果返し `join`(`Task<R>`)・ `Atomic` の `SeqCst` ・ **カーネル `local.{x,y,z}` / `group.{x,y,z}` / `barrier()` / `shared [T;N]`**(`gridGroups`、GPU=native MSL threadgroup・CPU=std::thread+std::barrier 模倣、実機 GPU で検証)・ **実行時 Device 選択**(`Device.gpu.first() ?? Device.cpu`)。残(任意): `Send`/`Sync` の明示的形式化 | M2(一部 M3) | 中〜大 |
-| **M5** | 借用チェッカ完全形(一部 ✅) | ✅ disjoint-field 借用。残: 格納参照の文跨ぎ別名 ・ NLL(最終使用での解放)・ 明示 lifetime 注釈 + 多引数関係 | 現在地(独立) | 中 |
+| **M5** | 借用チェッカ完全形(ほぼ ✅) | ✅ disjoint-field 借用 ・ ✅ 格納参照の文跨ぎ別名 + NLL(最終使用で解放)・ ✅ `Send`/`Sync` 明示規則。残(任意): 明示 lifetime 注釈構文(provenance escape + NLL で安全性は担保済のため設計上省略) | 現在地(独立) | 中 |
 | ~~**M6**~~ ✅ | モジュール & 標準ライブラリ(**実装済み**) | ✅ `import`(複数ファイル解決) ・ `Vec<T>` / `Map<K,V>` collections ・ 可変 `String` 構築 ・ **ファイル I/O** `readFile`/`writeFile` ・ `stdin.readAll` | M2, M3 | 大 |
-| **M7** | セルフホスト ★完成(実証 ✅ / 完全版残) | ✅ 言語の表現力実証(`Box<T>` 再帰型 + mozaic 製の lexer/parser/eval = [calc_mz.mzc](tests/cases/calc_mz.mzc))。残: `lexer→parser→check→emit` 全体を mozaic で書き直し、生成 C++ で既存ゴールデンを通す段階 bootstrap(数千行) | M2 + M3 + M6 | 最大 |
+| **M7** | セルフホスト ★完成(bootstrap 実証 ✅ / 全機能版残) | ✅ **mozaic で書いた mozaic→C++ コンパイラ** [selfhost.mzc](tests/cases/selfhost.mzc)(lex→再帰下降 parse→C++ emit)が再帰プログラムを **clang++ で通る C++ に変換し正しく実行**(fib/sumTo を実機検証)。残: 対応サブセットを全言語(generics/atomic/comptime/GPU 等)へ拡張し、生成 C++ で既存ゴールデン全件を通す | M2 + M3 + M6 | 最大 |
 
 ## クリティカルパス
 **M2(文字列・collections・エラー処理)→ M3(総称型・comptime)→ M6(モジュール + ファイル I/O)→ M7(自己記述)★**

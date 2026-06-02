@@ -1,13 +1,14 @@
 # HANDOFF
 
 > **最新状況は [ROADMAP.md](ROADMAP.md) 「現在地」を参照**(本ファイル以下は M1/M2 当時の歴史メモ)。
-> 2026-06-02 時点: **M3・M4 完了・M5 一部・M6 完了・M7 実証**(branch `m3-abstraction`, ゴールデン **98/98**)。
+> 2026-06-02 時点: **M3・M4 完了・M5 ほぼ完了・M6 完了・M7 bootstrap 実証**(branch `m3-abstraction`, ゴールデン **102/102**)。
 > 追加実装: 総称型 / SIMD `f32x4` / `comptime`+`const` / `Task<R>` / `Arc`・`Mutex`・`Channel` / `SeqCst` /
 > `Vec<T>` / `Map<K,V>` / 可変 `String` / `readFile`/`writeFile` / `stdin.readAll` / 論理 `&& || !` / `else if` /
-> `import`(複数ファイル) / disjoint-field 借用 / **`Box<T>` 再帰型** /
+> `import` / disjoint-field 借用 / **格納参照 + NLL** / `Send`/`Sync` 規則 / **`Box<T>` 再帰型** /
 > **カーネル workgroup**(`shared`/`local`/`group`/`barrier`/`gridGroups`、実機 GPU 検証) / **実行時 Device 選択**。
-> **M7 実証**: [tests/cases/calc_mz.mzc](tests/cases/calc_mz.mzc) = mozaic で書いた式コンパイラ(lex→parse→eval)。
-> **残り**: M7 完全セルフホスト(`src/*.ts` ~2700 行を mozaic へ移植、最大の作業)、M5 残り(NLL/lifetime)。
+> **M7 bootstrap 実証**: [tests/cases/selfhost.mzc](tests/cases/selfhost.mzc) = **mozaic で書いた mozaic→C++ コンパイラ**。
+> 再帰プログラムを clang++ で通る C++ に変換・実行・正答(実機確認)。
+> **残り**: M7 全機能セルフホスト(selfhost.mzc を全言語へ拡張、最大の作業)、M5 任意(明示 lifetime 注釈構文)。
 > コンパイラ編集時の注意は memory `mozaic-compiler-conventions` 参照。
 
 ---
