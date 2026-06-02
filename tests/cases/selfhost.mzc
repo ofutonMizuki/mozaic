@@ -1598,6 +1598,127 @@ function checkEscapeBody(body: &Vec<Stmt>, localRefs: &mut Vec<str>): str {
   }
   return "";
 }
+// Does the variable `name` appear anywhere in an expression?
+function exprMentions(e: &Expr, name: str): bool {
+  match e {
+    Var(n) => { return n == name; }
+    Bin(op, l, r) => { return exprMentions(l.get(), name) || exprMentions(r.get(), name); }
+    Not(x) => { return exprMentions(x.get(), name); }
+    Field(o, f) => { return exprMentions(o.get(), name); }
+    Index(o, ix) => { return exprMentions(o.get(), name) || exprMentions(ix.get(), name); }
+    Borrow(bm, x) => { return exprMentions(x.get(), name); }
+    MethodCall(o, m, args) => { if (exprMentions(o.get(), name)) { return true; } let i: u32 = 0; while (i < args.len) { if (exprMentions(args[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    Call(n2, args) => { let i: u32 = 0; while (i < args.len) { if (exprMentions(args[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    Some(x) => { return exprMentions(x.get(), name); }
+    OkE(x) => { return exprMentions(x.get(), name); }
+    ErrE(x) => { return exprMentions(x.get(), name); }
+    OrElse(a, b) => { return exprMentions(a.get(), name) || exprMentions(b.get(), name); }
+    Cast(x, t) => { return exprMentions(x.get(), name); }
+    TryQ(x) => { return exprMentions(x.get(), name); }
+    TryCast(x, t) => { return exprMentions(x.get(), name); }
+    Template(strs, ex) => { let i: u32 = 0; while (i < ex.len) { if (exprMentions(ex[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    ArrLit(els) => { let i: u32 = 0; while (i < els.len) { if (exprMentions(els[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    StructLit(n2, vals) => { let i: u32 = 0; while (i < vals.len) { if (exprMentions(vals[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    SpawnExpr(fn, sa) => { let i: u32 = 0; while (i < sa.len) { if (exprMentions(sa[i].get(), name)) { return true; } i = i +% 1; } return false; }
+    _ => { return false; }
+  }
+}
+function stmtMentions(s: &Stmt, name: str): bool {
+  match s {
+    Let(n, t, v, c) => { return exprMentions(v.get(), name); }
+    Assign(tg, v) => { return exprMentions(tg.get(), name) || exprMentions(v.get(), name); }
+    Ret(v) => { return exprMentions(v.get(), name); }
+    Print(v) => { return exprMentions(v.get(), name); }
+    ExprS(v) => { return exprMentions(v.get(), name); }
+    If(c, t, e) => { return exprMentions(c.get(), name); }
+    While(c, b) => { return exprMentions(c.get(), name); }
+    _ => { return false; }
+  }
+}
+// A stored exclusive borrow: `let r = &mut c` (a Borrow) or `let job = dev.launch(... &mut x ...)`.
+// Helpers return the holder/value/kind by VALUE (no move of the match binding).
+function borrowMutArg(args: &Vec<Box<Expr>>): str {   // first &mut arg's base value, else ""
+  let ai: u32 = 0;
+  while (ai < args.len) { match args[ai].get() { Borrow(bm, inn) => { if (bm) { return baseVar(inn.get()); } } _ => { } } ai = ai +% 1; }
+  return "";
+}
+function borrowHolder(s: &Stmt): str {
+  match s {
+    Let(n, t, v, c) => {
+      match v.get() {
+        Borrow(bm, inner) => { if (bm) { return n; } }
+        MethodCall(o, m, args) => { if (m == "launch" && borrowMutArg(&args) != "") { return n; } }
+        _ => { }
+      }
+    }
+    _ => { }
+  }
+  return "";
+}
+function borrowedValue(s: &Stmt): str {
+  match s {
+    Let(n, t, v, c) => {
+      match v.get() {
+        Borrow(bm, inner) => { if (bm) { return baseVar(inner.get()); } }
+        MethodCall(o, m, args) => { if (m == "launch") { return borrowMutArg(&args); } }
+        _ => { }
+      }
+    }
+    _ => { }
+  }
+  return "";
+}
+function borrowIsLaunch(s: &Stmt): bool {
+  match s {
+    Let(n, t, v, c) => { match v.get() { MethodCall(o, m, args) => { if (m == "launch" && borrowMutArg(&args) != "") { return true; } } _ => { } } }
+    _ => { }
+  }
+  return false;
+}
+// borrow=exclusive: a value touched while it is exclusively borrowed is an error. The borrow is held by
+// a stored `let r = &mut c` (until r's last use) or by `let job = dev.launch(... &mut x ...)` (until
+// job.await()). Linear per statement-list; recurses into nested blocks.
+function checkBorrowLiveness(body: &Vec<Stmt>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    let rvar: str = borrowHolder(&body[i]);
+    let bvar: str = borrowedValue(&body[i]);
+    let isLaunch: bool = borrowIsLaunch(&body[i]);
+    if (bvar != "" && rvar != "") {
+      let endIdx: u32 = i +% 1;
+      if (isLaunch) {                                // borrow ends at job.await()
+        let k: u32 = i +% 1;
+        endIdx = body.len;
+        let done: bool = false;
+        while (k < body.len && !done) {
+          match body[k] { ExprS(v) => { match v.get() { MethodCall(o, m, a) => { match o.get() { Var(jn) => { if (jn == rvar && m == "await") { endIdx = k; done = true; } } _ => { } } } _ => { } } } _ => { } }
+          k = k +% 1;
+        }
+      } else {                                        // borrow ends at the ref's last use (NLL)
+        let k: u32 = i +% 1;
+        while (k < body.len) { if (stmtMentions(&body[k], rvar)) { endIdx = k +% 1; } k = k +% 1; }
+      }
+      let j: u32 = i +% 1;
+      while (j < endIdx) {
+        if (stmtMentions(&body[j], bvar)) {
+          if (isLaunch) { return "exclusively borrowed"; }
+          return "while it is mutably borrowed";
+        }
+        j = j +% 1;
+      }
+    }
+    match body[i] {                                   // recurse into nested blocks
+      If(c, then, els) => { let a: str = checkBorrowLiveness(&then); if (a != "") { return a; } let b: str = checkBorrowLiveness(&els); if (b != "") { return b; } }
+      While(c, wb) => { let a: str = checkBorrowLiveness(&wb); if (a != "") { return a; } }
+      ForOf(n, it, fb) => { let a: str = checkBorrowLiveness(&fb); if (a != "") { return a; } }
+      Scope(sb) => { let a: str = checkBorrowLiveness(&sb); if (a != "") { return a; } }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { let a: str = checkBorrowLiveness(&arms[ai].body); if (a != "") { return a; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 // A spawn target may not receive a reference to a non-Sync value (it would cross a thread boundary).
 function checkSpawnArgs(args: &Vec<Box<Expr>>, env: &Vec<Param>, structs: &Vec<StructDef>): str {
   let i: u32 = 0;
@@ -1731,6 +1852,8 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     while (pm < funcs[fi].params.len) { se.push(Param { name: funcs[fi].params[pm].name, ty: funcs[fi].params[pm].ty }); pm = pm +% 1; }
     let st: str = checkSpawnTasks(&funcs[fi].body, &mut se, &joined, structs);
     if (st != "") { return st; }
+    let bl: str = checkBorrowLiveness(&funcs[fi].body);
+    if (bl != "") { return bl; }
     let rt: str = funcs[fi].ret;
     if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
       let lr: Vec<str> = Vec.new();
