@@ -15,6 +15,7 @@ const KOP: i32 = 2;      // operator / punctuation (text)
 const KEOF: i32 = 3;     // end of input
 const KSTR: i32 = 4;     // string literal (text = raw content)
 const KCHAR: i32 = 5;    // char literal (ival = codepoint)
+const KTMPL: i32 = 6;    // template string (text = raw content with ${...} and escapes kept)
 struct Token { kind: i32; text: str; ival: i64; }
 
 // ---- AST ----
@@ -34,6 +35,7 @@ enum Expr {
   ArrLit(Vec<Box<Expr>>),            // [a, b, c]  (only as an initializer)
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
   MethodCall(Box<Expr>, str, Vec<Box<Expr>>),   // obj.method(args)
+  Template(Vec<str>, Vec<Box<Expr>>),           // `lit ${e} lit` ; strings.len == exprs.len + 1
 }
 enum Stmt {
   Let(str, str, Box<Expr>),          // name, mozaic type, value
@@ -50,6 +52,7 @@ struct Param { name: str; ty: str; }
 struct Method { name: str; isMut: bool; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
 struct Func { name: str; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
 struct StructDef { name: str; fields: Vec<Param>; methods: Vec<Method>; }
+struct ConstD { name: str; ty: str; value: Box<Expr>; }
 struct Variant { name: str; payloads: Vec<str>; }   // payload type names ([] = unit variant)
 struct EnumDef { name: str; variants: Vec<Variant>; }
 struct VInfo { found: bool; enumName: str; tag: i32; payloads: Vec<str>; }   // result of a variant lookup
@@ -65,7 +68,13 @@ function lex(src: str): Vec<Token> {
   let n: u32 = src.len;
   while (i < n) {
     let c: char = src[i];
-    if (isSpace(c)) {
+    if (c == '/' && i +% 1 < n && src[i +% 1] == '/') {        // line comment
+      while (i < n && src[i] != '\n') { i = i +% 1; }
+    } else if (c == '/' && i +% 1 < n && src[i +% 1] == '*') {  // block comment
+      i = i +% 2;
+      while (i +% 1 < n && !(src[i] == '*' && src[i +% 1] == '/')) { i = i +% 1; }
+      i = i +% 2;
+    } else if (isSpace(c)) {
       i = i +% 1;
     } else if (isDigit(c)) {
       let v: i64 = 0;
@@ -101,11 +110,28 @@ function lex(src: str): Vec<Token> {
       }
       i = i +% 1;                    // closing quote
       toks.push(Token { kind: KCHAR, text: "", ival: cp });
+    } else if (c == '`') {           // template string -> raw content (escapes & ${...} kept verbatim)
+      i = i +% 1;
+      let raw: str = "";
+      let brace: i32 = 0;
+      let done: bool = false;
+      while (i < n && !done) {
+        let d: char = src[i];
+        if (brace == 0 && d == '`') { i = i +% 1; done = true; }
+        else if (brace == 0 && d == '\\') { raw = raw + format(d); i = i +% 1; if (i < n) { raw = raw + format(src[i]); i = i +% 1; } }
+        else if (brace == 0 && d == '$' && i +% 1 < n && src[i +% 1] == '{') { brace = 1; raw = raw + "${"; i = i +% 2; }
+        else if (brace > 0) {
+          if (d == '{') { brace = brace +% 1; } else if (d == '}') { brace = brace -% 1; }
+          raw = raw + format(d); i = i +% 1;
+        } else { raw = raw + format(d); i = i +% 1; }
+      }
+      toks.push(Token { kind: KTMPL, text: raw, ival: 0 });
     } else {
       // two-character operators first
       let two: str = "";
       if (i +% 1 < n) { two = format(src[i]) + format(src[i +% 1]); }
-      if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>") {
+      if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>"
+          || two == "+%" || two == "-%" || two == "*%" || two == "+|" || two == "-|" || two == "*|") {
         toks.push(Token { kind: KOP, text: two, ival: 0 });
         i = i +% 2;
       } else {
@@ -124,25 +150,28 @@ struct Parser {
   pos: u32;
   structs: Vec<StructDef>;
   enums: Vec<EnumDef>;
+  consts: Vec<ConstD>;
   noStruct: bool;          // suppress `Name { ... }` struct-literal parsing (e.g. for a match scrutinee)
   function kind(&self): i32 { return self.toks[self.pos].kind; }
   function text(&self): str { return self.toks[self.pos].text; }
   function ival(&self): i64 { return self.toks[self.pos].ival; }
   function adv(&mut self) { self.pos = self.pos +% 1; }
+  // Match an operator/keyword token by text (NOT a string/char/template literal of the same text).
+  function at(&self, t: str): bool { let k: i32 = self.kind(); return (k == KOP || k == KWORD) && self.text() == t; }
   function eat(&mut self, t: str) {
-    if (self.text() == t) { self.adv(); } else { abort(`parse: expected '${t}'`); }
+    if (self.at(t)) { self.adv(); } else { abort(`parse: expected '${t}'`); }
   }
   function word(&mut self): str { let w: str = self.text(); self.adv(); return w; }
   function parseType(&mut self): str {   // returns a C++ type string directly
-    if (self.text() == "&") {             // &T -> const T&  /  &mut T -> T&
+    if (self.at("&")) {             // &T -> const T&  /  &mut T -> T&
       self.adv();
       let isMut: bool = false;
-      if (self.text() == "mut") { self.adv(); isMut = true; }
+      if (self.at("mut")) { self.adv(); isMut = true; }
       let inner: str = self.parseType();
       if (isMut) { return inner + "&"; }
       return `const ${inner}&`;
     }
-    if (self.text() == "[") {
+    if (self.at("[")) {
       self.adv();
       let elem: str = self.parseType();
       self.eat(";");
@@ -151,10 +180,10 @@ struct Parser {
       return `std::array<${elem}, ${format(nv)}>`;
     }
     let w: str = self.word();
-    if (self.text() == "<") {              // generic: Vec<T> / Box<T> / Map<K,V> / user Name<...>
+    if (self.at("<")) {              // generic: Vec<T> / Box<T> / Map<K,V> / user Name<...>
       self.adv();
       let args: str = self.parseType();
-      while (self.text() == ",") { self.adv(); args = args + ", " + self.parseType(); }
+      while (self.at(",")) { self.adv(); args = args + ", " + self.parseType(); }
       self.eat(">");
       if (w == "Vec") { return `mz::Vec<${args}>`; }
       if (w == "Box") { return `mz::Box<${args}>`; }
@@ -168,60 +197,61 @@ struct Parser {
     if (self.kind() == KNUM) { let v: i64 = self.ival(); self.adv(); return Box.new(Num(v)); }
     if (self.kind() == KCHAR) { let cp: i64 = self.ival(); self.adv(); return Box.new(CharLit(cp)); }
     if (self.kind() == KSTR) { let s: str = self.text(); self.adv(); return Box.new(StrLit(s)); }
-    if (self.text() == "(") { self.adv(); let e: Box<Expr> = self.parseExpr(); self.eat(")"); return e; }
-    if (self.text() == "[") {                   // array literal [a, b, c]
+    if (self.kind() == KTMPL) { let raw: str = self.text(); self.adv(); return self.parseTemplate(raw); }
+    if (self.at("(")) { self.adv(); let e: Box<Expr> = self.parseExpr(); self.eat(")"); return e; }
+    if (self.at("[")) {                   // array literal [a, b, c]
       self.adv();
       let elems: Vec<Box<Expr>> = Vec.new();
-      while (self.text() != "]") {
+      while (!self.at("]")) {
         elems.push(self.parseExpr());
-        if (self.text() == ",") { self.adv(); }
+        if (self.at(",")) { self.adv(); }
       }
       self.eat("]");
       return Box.new(ArrLit(elems));
     }
     if (self.kind() == KWORD) {
-      if (self.text() == "true") { self.adv(); return Box.new(BoolLit(true)); }
-      if (self.text() == "false") { self.adv(); return Box.new(BoolLit(false)); }
+      if (self.at("true")) { self.adv(); return Box.new(BoolLit(true)); }
+      if (self.at("false")) { self.adv(); return Box.new(BoolLit(false)); }
       let name: str = self.word();
-      if (self.text() == "(") {                 // function call / enum-variant construction
+      if (self.at("(")) {                 // function call / enum-variant construction
         self.adv();
         let args: Vec<Box<Expr>> = Vec.new();
-        if (self.text() != ")") {
+        if (!self.at(")")) {
           args.push(self.parseExpr());
-          while (self.text() == ",") { self.adv(); args.push(self.parseExpr()); }
+          while (self.at(",")) { self.adv(); args.push(self.parseExpr()); }
         }
         self.eat(")");
         return Box.new(Call(name, args));
       }
-      if (self.text() == "{" && !self.noStruct) {   // struct literal Name { f: v, ... } (declared order)
+      if (self.at("{") && !self.noStruct) {   // struct literal Name { f: v, ... } (declared order)
         self.adv();
         let vals: Vec<Box<Expr>> = Vec.new();
-        while (self.text() != "}") {
+        while (!self.at("}")) {
           self.word(); self.eat(":");           // field name discarded (values must be in declared order)
           vals.push(self.parseExpr());
-          if (self.text() == ",") { self.adv(); }
+          if (self.at(",")) { self.adv(); }
         }
         self.eat("}");
         return Box.new(StructLit(name, vals));
       }
       return Box.new(Var(name));
     }
-    abort("parse: unexpected token");
+    abort(`parse: unexpected token '${self.text()}' (kind ${self.kind()}) at ${self.pos}`);
     return Box.new(Num(0));
   }
   function parsePostfix(&mut self): Box<Expr> {
     let e: Box<Expr> = self.parsePrimary();
-    while (self.text() == "." || self.text() == "[") {
-      if (self.text() == "[") { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
+    while (self.at(".") || self.at("[")) {
+      if (self.at("[")) { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
       else {
         self.adv();
         let m: str = self.word();
-        if (self.text() == "(") {                 // method call obj.m(args)
+        if (self.at("(")) {                 // method call obj.m(args)
           self.adv();
           let args: Vec<Box<Expr>> = Vec.new();
-          if (self.text() != ")") {
+          if (!self.at(")")) {
             args.push(self.parseExpr());
-            while (self.text() == ",") { self.adv(); args.push(self.parseExpr()); }
+            while (self.at(",")) { self.adv(); args.push(self.parseExpr()); }
           }
           self.eat(")");
           e = Box.new(MethodCall(e, m, args));
@@ -233,10 +263,10 @@ struct Parser {
     return e;
   }
   function parseUnary(&mut self): Box<Expr> {
-    if (self.text() == "!") { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
-    if (self.text() == "&") {   // &e / &mut e -> Borrow (erased in emit)
+    if (self.at("!")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
+    if (self.at("&")) {   // &e / &mut e -> Borrow (erased in emit)
       self.adv();
-      if (self.text() == "mut") { self.adv(); }
+      if (self.at("mut")) { self.adv(); }
       let e: Box<Expr> = self.parseUnary();
       return Box.new(Borrow(e));
     }
@@ -244,12 +274,12 @@ struct Parser {
   }
   function parseCast(&mut self): Box<Expr> {   // e as T (binds tighter than * /)
     let e: Box<Expr> = self.parseUnary();
-    while (self.text() == "as") { self.adv(); let t: str = self.parseType(); e = Box.new(Cast(e, t)); }
+    while (self.at("as")) { self.adv(); let t: str = self.parseType(); e = Box.new(Cast(e, t)); }
     return e;
   }
   function parseMul(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseCast();
-    while (self.text() == "*" || self.text() == "/" || self.text() == "%") {
+    while (self.at("*") || self.at("/") || self.at("%") || self.at("*%") || self.at("*|")) {
       let op: str = self.word();
       let right: Box<Expr> = self.parseCast();
       left = Box.new(Bin(op, left, right));
@@ -258,7 +288,7 @@ struct Parser {
   }
   function parseAdd(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseMul();
-    while (self.text() == "+" || self.text() == "-") {
+    while (self.at("+") || self.at("-") || self.at("+%") || self.at("-%") || self.at("+|") || self.at("-|")) {
       let op: str = self.word();
       let right: Box<Expr> = self.parseMul();
       left = Box.new(Bin(op, left, right));
@@ -267,7 +297,7 @@ struct Parser {
   }
   function parseCmp(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseAdd();
-    while (self.text() == "<" || self.text() == "<=" || self.text() == ">" || self.text() == ">=" || self.text() == "==" || self.text() == "!=") {
+    while (self.at("<") || self.at("<=") || self.at(">") || self.at(">=") || self.at("==") || self.at("!=")) {
       let op: str = self.word();
       let right: Box<Expr> = self.parseAdd();
       left = Box.new(Bin(op, left, right));
@@ -276,24 +306,24 @@ struct Parser {
   }
   function parseAnd(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseCmp();
-    while (self.text() == "&&") { self.adv(); let right: Box<Expr> = self.parseCmp(); left = Box.new(Bin("&&", left, right)); }
+    while (self.at("&&")) { self.adv(); let right: Box<Expr> = self.parseCmp(); left = Box.new(Bin("&&", left, right)); }
     return left;
   }
   function parseExpr(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseAnd();
-    while (self.text() == "||") { self.adv(); let right: Box<Expr> = self.parseAnd(); left = Box.new(Bin("||", left, right)); }
+    while (self.at("||")) { self.adv(); let right: Box<Expr> = self.parseAnd(); left = Box.new(Bin("||", left, right)); }
     return left;
   }
 
   function parseBlock(&mut self): Vec<Stmt> {
     self.eat("{");
     let out: Vec<Stmt> = Vec.new();
-    while (self.text() != "}") { out.push(self.parseStmt()); }
+    while (!self.at("}")) { out.push(self.parseStmt()); }
     self.eat("}");
     return out;
   }
   function parseStmt(&mut self): Stmt {
-    if (self.text() == "let") {
+    if (self.at("let")) {
       self.adv();
       let name: str = self.word();
       self.eat(":");
@@ -303,46 +333,46 @@ struct Parser {
       self.eat(";");
       return Let(name, ty, v);
     }
-    if (self.text() == "return") {
+    if (self.at("return")) {
       self.adv();
       let v: Box<Expr> = self.parseExpr();
       self.eat(";");
       return Ret(v);
     }
-    if (self.text() == "if") {
+    if (self.at("if")) {
       self.adv(); self.eat("(");
       let c: Box<Expr> = self.parseExpr();
       self.eat(")");
       let then: Vec<Stmt> = self.parseBlock();
       let els: Vec<Stmt> = Vec.new();
-      if (self.text() == "else") {
+      if (self.at("else")) {
         self.adv();
-        if (self.text() == "if") { els.push(self.parseStmt()); }   // else if -> nested If
+        if (self.at("if")) { els.push(self.parseStmt()); }   // else if -> nested If
         else { els = self.parseBlock(); }
       }
       return If(c, then, els);
     }
-    if (self.text() == "while") {
+    if (self.at("while")) {
       self.adv(); self.eat("(");
       let c: Box<Expr> = self.parseExpr();
       self.eat(")");
       let body: Vec<Stmt> = self.parseBlock();
       return While(c, body);
     }
-    if (self.text() == "match") {
+    if (self.at("match")) {
       self.adv();
       self.noStruct = true;
       let scrut: Box<Expr> = self.parseExpr();
       self.noStruct = false;
       self.eat("{");
       let arms: Vec<Arm> = Vec.new();
-      while (self.text() != "}") {
+      while (!self.at("}")) {
         let vn: str = self.word();
         let binds: Vec<str> = Vec.new();
-        if (self.text() == "(") {
+        if (self.at("(")) {
           self.adv();
           binds.push(self.word());
-          while (self.text() == ",") { self.adv(); binds.push(self.word()); }
+          while (self.at(",")) { self.adv(); binds.push(self.word()); }
           self.eat(")");
         }
         self.eat("=>");
@@ -352,7 +382,7 @@ struct Parser {
       self.eat("}");
       return Match(scrut, arms);
     }
-    if (self.text() == "stdout") {            // stdout.println(e);
+    if (self.at("stdout")) {            // stdout.println(e);
       self.adv(); self.eat("."); self.eat("println"); self.eat("(");
       let e: Box<Expr> = self.parseExpr();
       self.eat(")"); self.eat(";");
@@ -360,7 +390,7 @@ struct Parser {
     }
     // assignment `lvalue = e;` (lvalue = name / e.field / a[i]) or bare expression `e;`
     let e: Box<Expr> = self.parseExpr();
-    if (self.text() == "=") {
+    if (self.at("=")) {
       self.adv();
       let v: Box<Expr> = self.parseExpr();
       self.eat(";");
@@ -375,10 +405,10 @@ struct Parser {
     let name: str = self.word();
     self.eat("(");
     let params: Vec<Param> = Vec.new();
-    if (self.text() != ")") {
+    if (!self.at(")")) {
       let pn: str = self.word(); self.eat(":"); let pt: str = self.parseType();
       params.push(Param { name: pn, ty: pt });
-      while (self.text() == ",") {
+      while (self.at(",")) {
         self.adv();
         let qn: str = self.word(); self.eat(":"); let qt: str = self.parseType();
         params.push(Param { name: qn, ty: qt });
@@ -386,7 +416,7 @@ struct Parser {
     }
     self.eat(")");
     let ret: str = "";
-    if (self.text() == ":") { self.adv(); ret = self.parseType(); }
+    if (self.at(":")) { self.adv(); ret = self.parseType(); }
     let body: Vec<Stmt> = self.parseBlock();
     return Func { name: name, params: params, ret: ret, body: body };
   }
@@ -396,17 +426,17 @@ struct Parser {
     self.eat("(");
     self.eat("&");
     let isMut: bool = false;
-    if (self.text() == "mut") { self.adv(); isMut = true; }
+    if (self.at("mut")) { self.adv(); isMut = true; }
     self.eat("self");
     let params: Vec<Param> = Vec.new();
-    while (self.text() == ",") {
+    while (self.at(",")) {
       self.adv();
       let pn: str = self.word(); self.eat(":"); let pt: str = self.parseType();
       params.push(Param { name: pn, ty: pt });
     }
     self.eat(")");
     let ret: str = "";
-    if (self.text() == ":") { self.adv(); ret = self.parseType(); }
+    if (self.at(":")) { self.adv(); ret = self.parseType(); }
     let body: Vec<Stmt> = self.parseBlock();
     return Method { name: name, isMut: isMut, params: params, ret: ret, body: body };
   }
@@ -416,8 +446,8 @@ struct Parser {
     self.eat("{");
     let fields: Vec<Param> = Vec.new();
     let methods: Vec<Method> = Vec.new();
-    while (self.text() != "}") {
-      if (self.text() == "function") { methods.push(self.parseMethod()); }
+    while (!self.at("}")) {
+      if (self.at("function")) { methods.push(self.parseMethod()); }
       else {
         let fname: str = self.word(); self.eat(":"); let fty: str = self.parseType(); self.eat(";");
         fields.push(Param { name: fname, ty: fty });
@@ -431,26 +461,71 @@ struct Parser {
     let name: str = self.word();
     self.eat("{");
     let variants: Vec<Variant> = Vec.new();
-    while (self.text() != "}") {
+    while (!self.at("}")) {
       let vn: str = self.word();
       let payloads: Vec<str> = Vec.new();
-      if (self.text() == "(") {
+      if (self.at("(")) {
         self.adv();
         payloads.push(self.parseType());
-        while (self.text() == ",") { self.adv(); payloads.push(self.parseType()); }
+        while (self.at(",")) { self.adv(); payloads.push(self.parseType()); }
         self.eat(")");
       }
       variants.push(Variant { name: vn, payloads: payloads });
-      if (self.text() == ",") { self.adv(); }
+      if (self.at(",")) { self.adv(); }
     }
     self.eat("}");
     return EnumDef { name: name, variants: variants };
   }
+  function parseConst(&mut self): ConstD {
+    self.eat("const");
+    let name: str = self.word();
+    self.eat(":");
+    let ty: str = self.parseType();
+    self.eat("=");
+    let v: Box<Expr> = self.parseExpr();
+    self.eat(";");
+    return ConstD { name: name, ty: ty, value: v };
+  }
+  // Split a template's raw content into literal `strings` and reparsed `${...}` `exprs`.
+  // Escapes are kept raw (so emit can wrap each literal in C++ "..." directly).
+  function parseTemplate(&mut self, raw: str): Box<Expr> {
+    let strings: Vec<str> = Vec.new();
+    let exprs: Vec<Box<Expr>> = Vec.new();
+    let cur: str = "";
+    let i: u32 = 0;
+    let n: u32 = raw.len;
+    while (i < n) {
+      if (raw[i] == '\\') {
+        cur = cur + format(raw[i]); i = i +% 1;
+        if (i < n) { cur = cur + format(raw[i]); i = i +% 1; }
+      } else if (raw[i] == '$' && i +% 1 < n && raw[i +% 1] == '{') {
+        strings.push(cur); cur = "";
+        let brace: i32 = 1;
+        let j: u32 = i +% 2;
+        let src2: str = "";
+        while (j < n && brace > 0) {
+          let d: char = raw[j];
+          if (d == '{') { brace = brace +% 1; src2 = src2 + format(d); }
+          else if (d == '}') { brace = brace -% 1; if (brace > 0) { src2 = src2 + format(d); } }
+          else { src2 = src2 + format(d); }
+          j = j +% 1;
+        }
+        let sub: Parser = Parser { toks: lex(src2), pos: 0, structs: Vec.new(), enums: Vec.new(), consts: Vec.new(), noStruct: false };
+        exprs.push(sub.parseExpr());
+        i = j;
+      } else {
+        cur = cur + format(raw[i]); i = i +% 1;
+      }
+    }
+    strings.push(cur);
+    return Box.new(Template(strings, exprs));
+  }
   function parseProgram(&mut self): Vec<Func> {
     let funcs: Vec<Func> = Vec.new();
     while (self.kind() != KEOF) {
-      if (self.text() == "struct") { let sd: StructDef = self.parseStruct(); self.structs.push(sd); }
-      else if (self.text() == "enum") { let ed: EnumDef = self.parseEnum(); self.enums.push(ed); }
+      if (self.at("struct")) { let sd: StructDef = self.parseStruct(); self.structs.push(sd); }
+      else if (self.at("enum")) { let ed: EnumDef = self.parseEnum(); self.enums.push(ed); }
+      else if (self.at("const")) { let cd: ConstD = self.parseConst(); self.consts.push(cd); }
       else { funcs.push(self.parseFunc()); }
     }
     return funcs;
@@ -533,21 +608,21 @@ function emitEnum(ed: &EnumDef): str {
   }
   return out + " };\n";
 }
+// Escape a (raw) string for a C++ "..." literal: bare " becomes \" ; existing \X pairs pass through.
+function cesc(s: str): str {
+  let out: str = "";
+  let i: u32 = 0;
+  let n: u32 = s.len;
+  while (i < n) {
+    if (s[i] == '\\') { out = out + format(s[i]); i = i +% 1; if (i < n) { out = out + format(s[i]); i = i +% 1; } }
+    else if (s[i] == '"') { out = out + format('\\') + format('"'); i = i +% 1; }
+    else { out = out + format(s[i]); i = i +% 1; }
+  }
+  return out;
+}
 function varName(e: &Expr): str {   // the identifier of a Var expr, else ""
   match e {
     Var(n) => { return n; }
-    _ => { }
-  }
-  return "";
-}
-// If `e` is Vec.new()/Map.new()/Channel.new(), return the base name (these default-construct);
-// else "". Used so a `let v: Vec<T> = Vec.new();` emits a default-constructed value.
-function collNewBase(e: &Expr): str {
-  match e {
-    MethodCall(o, m, args) => {
-      let n: str = varName(o.get());
-      if (m == "new" && (n == "Vec" || n == "Map" || n == "Channel")) { return n; }
-    }
     _ => { }
   }
   return "";
@@ -561,7 +636,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (vi.found) { return `${vi.enumName}{ .tag = ${format(vi.tag)} }`; }   // unit variant
       return name;
     }
-    StrLit(s) => { return `"${s}"`; }
+    StrLit(s) => { return `"${cesc(s)}"`; }
     CharLit(cp) => { return `(char32_t)${format(cp)}`; }
     Cast(x, t) => { return `(${t})(${emitExpr(x.get(), enums)})`; }
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
@@ -578,8 +653,20 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       while (ai < elems.len) { if (ai > 0) { s = s + ", "; } s = s + emitExpr(elems[ai].get(), enums); ai = ai +% 1; }
       return s + " }";
     }
-    Bin(op, l, r) => { return `(${emitExpr(l.get(), enums)} ${op} ${emitExpr(r.get(), enums)})`; }
+    Bin(op, l, r) => {                          // wrapping/saturating ops lower to native operators
+      let a: str = emitExpr(l.get(), enums);
+      let b: str = emitExpr(r.get(), enums);
+      if (op == "+%" || op == "+|") { return `(${a} + ${b})`; }
+      if (op == "-%" || op == "-|") { return `(${a} - ${b})`; }
+      if (op == "*%" || op == "*|") { return `(${a} * ${b})`; }
+      return `(${a} ${op} ${b})`;
+    }
     Call(name, args) => {
+      if (name == "format") { return `mz::fmt(${emitExpr(args[0].get(), enums)})`; }
+      if (name == "abort") {
+        if (args.len > 0) { return `mz::panic_str(${emitExpr(args[0].get(), enums)})`; }
+        return "mz::panic_str(\"aborted\")";
+      }
       let vi: VInfo = findVariant(enums, name);
       if (vi.found) {                              // enum-variant construction
         let s: str = `${vi.enumName}{ .tag = ${format(vi.tag)}`;
@@ -598,8 +685,20 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       while (j < vals.len) { if (j > 0) { s = s + ", "; } s = s + emitExpr(vals[j].get(), enums); j = j +% 1; }
       return s + " }";
     }
+    Template(strs, exprs) => {
+      let s: str = `std::string("${cesc(strs[0])}")`;
+      let k: u32 = 0;
+      while (k < exprs.len) {
+        s = s + ` + mz::fmt(${emitExpr(exprs[k].get(), enums)}) + std::string("${cesc(strs[k +% 1])}")`;
+        k = k +% 1;
+      }
+      return `(${s})`;
+    }
     MethodCall(o, m, args) => {
-      if (varName(o.get()) == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
+      let recv: str = varName(o.get());
+      if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
+      if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
+      if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
       let s: str = `(${emitExpr(o.get(), enums)}).${m}(`;
       let k: u32 = 0;
       while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + emitExpr(args[k].get(), enums); k = k +% 1; }
@@ -616,10 +715,7 @@ function emitBlock(body: &Vec<Stmt>, ind: str, enums: &Vec<EnumDef>): str {
 }
 function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
   match s {
-    Let(name, ty, v) => {
-      if (collNewBase(v.get()).len > 0) { return `${ind}${mapType(ty)} ${name};\n`; }   // Vec/Map/Channel.new -> default-construct
-      return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`;
-    }
+    Let(name, ty, v) => { return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`; }
     Assign(target, v) => { return `${ind}${emitExpr(target.get(), enums)} = ${emitExpr(v.get(), enums)};\n`; }
     Ret(v) => { return `${ind}return ${emitExpr(v.get(), enums)};\n`; }
     Print(v) => { return `${ind}std::cout << (${emitExpr(v.get(), enums)}) << "\\n";\n`; }
@@ -683,14 +779,23 @@ function emitFunc(f: &Func, enums: &Vec<EnumDef>): str {
 
 function main() {
   let src: str = stdin.readAll();
-  let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), noStruct: false };
+  let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), consts: Vec.new(), noStruct: false };
   let funcs: Vec<Func> = p.parseProgram();
   let out: str = "#include \"mozaic_rt.h\"\n\n";   // runtime brings cstdint/iostream/string/array + mz::Vec/Box/Map
-  // enum + struct definitions, then function prototypes (any-order defs / recursion), then bodies.
+  // forward-declare all user types (so mutually-recursive structs/enums via Box/Vec fields resolve)
+  let fe: u32 = 0;
+  while (fe < p.enums.len) { out = out + `struct ${p.enums[fe].name};\n`; fe = fe +% 1; }
+  let fs: u32 = 0;
+  while (fs < p.structs.len) { out = out + `struct ${p.structs[fs].name};\n`; fs = fs +% 1; }
+  out = out + "\n";
+  // enum + struct definitions, then top-level consts, then function prototypes, then bodies.
   let e: u32 = 0;
   while (e < p.enums.len) { out = out + emitEnum(&p.enums[e]); e = e +% 1; }
   let s: u32 = 0;
   while (s < p.structs.len) { out = out + emitStruct(&p.structs[s]); s = s +% 1; }
+  out = out + "\n";
+  let ci: u32 = 0;
+  while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
   out = out + "\n";
   let i: u32 = 0;
   while (i < funcs.len) { if (funcs[i].name != "main") { out = out + emitProto(&funcs[i]); } i = i +% 1; }

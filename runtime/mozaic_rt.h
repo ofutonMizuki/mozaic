@@ -469,6 +469,20 @@ inline String format(double v)              { std::ostringstream os; os << v; re
 inline void assert_(bool c)                  { if (!c) panic("assertion failed"); }
 inline void assert_(bool c, const String& m) { if (!c) panic_msg(m); }
 
+// ---- helpers used by the SELF-HOSTED compiler (its `str` is std::string; no static type info) ----
+// fmt(x): universal formatter — handles any scalar/string/char/bool via C++ template deduction, so
+// the emitter needn't know x's type (this dissolves the format/template "type-info wall").
+template <class T> std::string fmt(const T& x) {
+  if constexpr (std::is_same_v<T, std::string>) return x;
+  else if constexpr (std::is_same_v<T, bool>) return x ? std::string("true") : std::string("false");
+  else if constexpr (std::is_same_v<T, char>) return std::string(1, x);                      // a byte char -> that character
+  else if constexpr (std::is_same_v<T, char32_t>) return encodeUtf8(std::u32string(1, x));    // codepoint -> UTF-8
+  else if constexpr (std::is_floating_point_v<T>) { std::ostringstream o; o << x; return o.str(); }
+  else return std::to_string((long long)(x));
+}
+[[noreturn]] inline void panic_str(const std::string& m) { std::cerr << "mozaic: " << m << "\n"; std::abort(); }
+inline std::string read_all_stdin_str() { std::ostringstream ss; ss << std::cin.rdbuf(); return ss.str(); }
+
 } // namespace mz
 
 // String literals lower to `U"..."_mz`, yielding an owned mz::String prvalue. (A bare U"..."
