@@ -65,7 +65,7 @@ struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
 struct Method { name: str; isMut: bool; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
 struct Func { name: str; tparams: Vec<str>; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
-struct StructDef { name: str; fields: Vec<Param>; methods: Vec<Method>; }
+struct StructDef { name: str; tparams: Vec<str>; fields: Vec<Param>; methods: Vec<Method>; }
 struct ConstD { name: str; ty: str; value: Box<Expr>; }
 struct Variant { name: str; payloads: Vec<str>; }   // payload type names ([] = unit variant)
 struct EnumDef { name: str; variants: Vec<Variant>; }
@@ -542,6 +542,13 @@ struct Parser {
   function parseStruct(&mut self): StructDef {
     self.eat("struct");
     let name: str = self.word();
+    let tparams: Vec<str> = Vec.new();
+    if (self.at("<")) {                  // struct Name<A, B> -> class template
+      self.adv();
+      tparams.push(self.word());
+      while (self.at(",")) { self.adv(); tparams.push(self.word()); }
+      self.eat(">");
+    }
     self.eat("{");
     let fields: Vec<Param> = Vec.new();
     let methods: Vec<Method> = Vec.new();
@@ -553,7 +560,7 @@ struct Parser {
       }
     }
     self.eat("}");
-    return StructDef { name: name, fields: fields, methods: methods };
+    return StructDef { name: name, tparams: tparams, fields: fields, methods: methods };
   }
   function parseEnum(&mut self): EnumDef {
     self.eat("enum");
@@ -673,21 +680,28 @@ function methodParams(m: &Method): str {
   return s;
 }
 function methodRet(m: &Method): str { if (m.ret.len > 0) { return m.ret; } return "void"; }
-function emitStruct(s: &StructDef): str {
-  let out: str = `struct ${s.name} {`;
+function emitStruct(s: &StructDef, enums: &Vec<EnumDef>): str {
+  let out: str = `${tprefix(&s.tparams)}struct ${s.name} {`;
   let i: u32 = 0;
   while (i < s.fields.len) { out = out + ` ${mapType(s.fields[i].ty)} ${s.fields[i].name};`; i = i +% 1; }
+  let gen: bool = s.tparams.len > 0;
   let mi: u32 = 0;
-  while (mi < s.methods.len) {                       // method declarations (bodies emitted out-of-line)
-    out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})`;
-    if (!s.methods[mi].isMut) { out = out + " const"; }
-    out = out + ";";
+  while (mi < s.methods.len) {
+    let cst: str = "";
+    if (!s.methods[mi].isMut) { cst = " const"; }
+    if (gen) {                                       // template: method bodies must be inline
+      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}`;
+    } else {                                         // non-generic: declare here, define out-of-line
+      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst};`;
+    }
     mi = mi +% 1;
   }
   return out + " };\n";
 }
 // Out-of-line method bodies (after fn prototypes, so a method may call free functions). self -> (*this).
+// Generic structs emit their method bodies inline (in emitStruct), so they are skipped here.
 function emitMethodDefs(s: &StructDef, enums: &Vec<EnumDef>): str {
+  if (s.tparams.len > 0) { return ""; }
   let out: str = "";
   let mi: u32 = 0;
   while (mi < s.methods.len) {
@@ -802,9 +816,12 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     Bin(op, l, r) => {                          // wrapping/saturating ops lower to native operators
       let a: str = emitExpr(l.get(), enums);
       let b: str = emitExpr(r.get(), enums);
-      if (op == "+%" || op == "+|") { return `(${a} + ${b})`; }
-      if (op == "-%" || op == "-|") { return `(${a} - ${b})`; }
-      if (op == "*%" || op == "*|") { return `(${a} * ${b})`; }
+      if (op == "+%") { return `mz::wrap_add(${a}, ${b})`; }   // wrapping (two's complement), left-typed
+      if (op == "-%") { return `mz::wrap_sub(${a}, ${b})`; }
+      if (op == "*%") { return `mz::wrap_mul(${a}, ${b})`; }
+      if (op == "+|") { return `mz::sat_add(${a}, ${b})`; }    // saturating (clamp to type min/max)
+      if (op == "-|") { return `mz::sat_sub(${a}, ${b})`; }
+      if (op == "*|") { return `mz::sat_mul(${a}, ${b})`; }
       return `(${a} ${op} ${b})`;
     }
     Call(name, args) => {
@@ -1007,13 +1024,13 @@ function main() {
   let fe: u32 = 0;
   while (fe < p.enums.len) { out = out + `struct ${p.enums[fe].name};\n`; fe = fe +% 1; }
   let fs: u32 = 0;
-  while (fs < p.structs.len) { out = out + `struct ${p.structs[fs].name};\n`; fs = fs +% 1; }
+  while (fs < p.structs.len) { if (p.structs[fs].tparams.len == 0) { out = out + `struct ${p.structs[fs].name};\n`; } fs = fs +% 1; }   // templates can't be plain-forward-declared
   out = out + "\n";
   // enum + struct definitions, then top-level consts, then function prototypes, then bodies.
   let e: u32 = 0;
   while (e < p.enums.len) { out = out + emitEnum(&p.enums[e]); e = e +% 1; }
   let s: u32 = 0;
-  while (s < p.structs.len) { out = out + emitStruct(&p.structs[s]); s = s +% 1; }
+  while (s < p.structs.len) { out = out + emitStruct(&p.structs[s], &p.enums); s = s +% 1; }
   out = out + "\n";
   let ci: u32 = 0;
   while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }

@@ -91,6 +91,14 @@ template <class T> T wmul(T a, T b) { T r; __builtin_mul_overflow(a, b, &r); ret
 template <class T> T sadd(T a, T b) { T r; if (__builtin_add_overflow(a, b, &r)) return b >= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T ssub(T a, T b) { T r; if (__builtin_sub_overflow(a, b, &r)) return b <= 0 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min(); return r; }
 template <class T> T smul(T a, T b) { T r; if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max(); return r; }
+// Left-operand-typed wrap/saturate ops for the self-hosted compiler: it has no type info, so it emits
+// `mz::wrap_add(a, b)` and T is deduced from the left operand (b is cast into T). a +% b / a +| b etc.
+template <class T, class U> T wrap_add(T a, U b) { T r; __builtin_add_overflow(a, (T)b, &r); return r; }
+template <class T, class U> T wrap_sub(T a, U b) { T r; __builtin_sub_overflow(a, (T)b, &r); return r; }
+template <class T, class U> T wrap_mul(T a, U b) { T r; __builtin_mul_overflow(a, (T)b, &r); return r; }
+template <class T, class U> T sat_add(T a, U b) { return sadd<T>(a, (T)b); }
+template <class T, class U> T sat_sub(T a, U b) { return ssub<T>(a, (T)b); }
+template <class T, class U> T sat_mul(T a, U b) { return smul<T>(a, (T)b); }
 
 // `[]T` slice: a {ptr, len} view (no ownership). Built from a fixed array via slice(arr).
 // Lifetimes are not yet checked (M5), so a slice must not outlive its backing storage.
