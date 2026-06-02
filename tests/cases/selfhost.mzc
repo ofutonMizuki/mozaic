@@ -694,6 +694,65 @@ function simdCpp(w: str): str {
   if (!allDigits(cnt)) { return ""; }
   return `mz::Simd<${lt}, ${cnt}>`;
 }
+function indexOf(s: str, ch: char, from: u32): u32 {   // first index of ch at/after `from`, else s.len
+  let i: u32 = from;
+  while (i < s.len) { if (s[i] == ch) { return i; } i = i +% 1; }
+  return s.len;
+}
+function trimLeft(s: str): str {
+  let i: u32 = 0;
+  while (i < s.len && (s[i] == ' ' || s[i] == '\t')) { i = i +% 1; }
+  return substr(s, i, s.len);
+}
+function contains(v: &Vec<str>, s: str): bool {
+  let i: u32 = 0;
+  while (i < v.len) { if (v[i] == s) { return true; } i = i +% 1; }
+  return false;
+}
+function importPath(line: str): str {   // `import "X";` -> X, else ""
+  let t: str = trimLeft(line);
+  if (!startsWith(t, "import")) { return ""; }
+  let q1: u32 = indexOf(t, '"', 0);
+  if (q1 >= t.len) { return ""; }
+  let q2: u32 = indexOf(t, '"', q1 +% 1);
+  if (q2 >= t.len) { return ""; }
+  return substr(t, q1 +% 1, q2);
+}
+function dirOf(path: str): str {   // directory prefix (through the last '/'), or "" if none
+  let last: i32 = 0 - 1;
+  let i: u32 = 0;
+  while (i < path.len) { if (path[i] == '/') { last = i as i32; } i = i +% 1; }
+  if (last < 0) { return ""; }
+  return substr(path, 0, (last as u32) +% 1);
+}
+// Resolve `import "p";` lines: read each referenced file once (dedup via `seen`), recursively expand
+// its imports (relative to ITS directory), and concatenate dependencies-first, dropping the import lines.
+function resolveImports(src: str, baseDir: str, seen: &mut Vec<str>): str {
+  let deps: str = "";
+  let body: str = "";
+  let line: str = "";
+  let i: u32 = 0;
+  while (i <= src.len) {
+    if (i == src.len || src[i] == '\n') {
+      let imp: str = importPath(line);
+      if (imp != "") {
+        let full: str = baseDir + imp;
+        if (!contains(seen, full)) {
+          seen.push(full);
+          let isrc: str = readFile(baseDir + imp) ?? "";
+          deps = deps + resolveImports(isrc, dirOf(baseDir + imp), seen);
+        }
+      } else {
+        body = body + line + "\n";
+      }
+      line = "";
+    } else {
+      line = line + format(src[i]);
+    }
+    i = i +% 1;
+  }
+  return deps + body;
+}
 function startsWith(s: str, pre: str): bool {
   if (pre.len > s.len) { return false; }
   let i: u32 = 0;
@@ -1137,7 +1196,9 @@ function emitFunc(f: &Func, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str
 }
 
 function main() {
-  let src: str = stdin.readAll();
+  let raw: str = stdin.readAll();
+  let seen: Vec<str> = Vec.new();
+  let src: str = resolveImports(raw, "", &mut seen);   // expand `import "p";` (paths relative to the importing file's dir)
   let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), consts: Vec.new(), noStruct: false };
   let funcs: Vec<Func> = p.parseProgram();
   let out: str = "#include \"mozaic_rt.h\"\n\n";   // runtime brings cstdint/iostream/string/array + mz::Vec/Box/Map
