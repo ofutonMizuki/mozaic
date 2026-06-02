@@ -1402,6 +1402,40 @@ function checkStmtsEnv(body: &Vec<Stmt>, env: &mut Vec<Param>): str {
   }
   return "";
 }
+// For a function that RETURNS a reference or slice: returning `&local`, `slice(x)`, or a local
+// reference-binding would dangle. (Only invoked for ref/slice-returning fns, so value-returning code —
+// including all positives and mozc itself — is never touched.)
+function isSliceCall(e: &Expr): bool {
+  match e { Call(n, a) => { return n == "slice"; } _ => { return false; } }
+}
+function checkEscapeBody(body: &Vec<Stmt>, localRefs: &mut Vec<str>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v) => {
+        let isRef: bool = (t.len > 0 && t[t.len -% 1] == '&');
+        match v.get() { Borrow(b) => { isRef = true; } _ => { } }
+        if (isSliceCall(v.get())) { isRef = true; }
+        if (isRef) { localRefs.push(n); }
+      }
+      Ret(v) => {
+        match v.get() {
+          Borrow(b) => { return "reference/slice to local data"; }
+          Var(r) => { if (contains(localRefs, r)) { return "reference/slice to local data"; } }
+          _ => { if (isSliceCall(v.get())) { return "reference/slice to local data"; } }
+        }
+      }
+      If(c, then, els) => { let a: str = checkEscapeBody(&then, localRefs); if (a != "") { return a; } let b: str = checkEscapeBody(&els, localRefs); if (b != "") { return b; } }
+      While(c, wb) => { let e: str = checkEscapeBody(&wb, localRefs); if (e != "") { return e; } }
+      ForOf(n, it, fb) => { let e: str = checkEscapeBody(&fb, localRefs); if (e != "") { return e; } }
+      Scope(sb) => { let e: str = checkEscapeBody(&sb, localRefs); if (e != "") { return e; } }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { let e: str = checkEscapeBody(&arms[ai].body, localRefs); if (e != "") { return e; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<EnumDef>): str {
   let ei: u32 = 0;
   while (ei < enums.len) {                          // Ok/Err are reserved for Result
@@ -1434,6 +1468,12 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     while (pj < funcs[fi].params.len) { pe.push(Param { name: funcs[fi].params[pj].name, ty: funcs[fi].params[pj].ty }); pj = pj +% 1; }
     let bce: str = checkStmtsEnv(&funcs[fi].body, &mut pe);
     if (bce != "") { return bce; }
+    let rt: str = funcs[fi].ret;
+    if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
+      let lr: Vec<str> = Vec.new();
+      let esc: str = checkEscapeBody(&funcs[fi].body, &mut lr);
+      if (esc != "") { return esc; }
+    }
     fi = fi +% 1;
   }
   let si: u32 = 0;
