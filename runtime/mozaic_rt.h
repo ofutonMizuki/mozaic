@@ -189,6 +189,7 @@ template <class T> struct Channel {
 template <class T> struct Vec {
   std::vector<T> data;
   void push(const T& v) { data.push_back(v); }
+  void push_back(const T& v) { data.push_back(v); }   // alias: the self-hosted compiler maps mozaic .push -> .push_back (shared with std::string)
   std::optional<T> pop() { if (data.empty()) return std::nullopt; T v = std::move(data.back()); data.pop_back(); return v; }
   uint32_t len() const { return (uint32_t)data.size(); }
   uint32_t size() const { return (uint32_t)data.size(); }

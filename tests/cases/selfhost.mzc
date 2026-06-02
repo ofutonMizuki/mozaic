@@ -321,6 +321,7 @@ struct Parser {
     return e;
   }
   function parseUnary(&mut self): Box<Expr> {
+    if (self.at("comptime")) { self.adv(); return self.parseUnary(); }   // build-time eval: same value at runtime / C++ static init, so emit the operand
     if (self.at("!")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
     if (self.at("&")) {   // &e / &mut e -> Borrow (erased in emit)
       self.adv();
@@ -870,6 +871,9 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (recv == "stdin" && m == "lines") { return "mz::stdin_lines_str()"; }
       if (recv == "clock" && m == "now") { return "mz::now_ns()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
+      if (recv == "String" && m == "new") { return "std::string()"; }
+      if (m == "push") { return `(${emitExpr(o.get(), enums)}).push_back(${emitExpr(args[0].get(), enums)})`; }   // Vec.push / String.push -> push_back
+      if (m == "pushStr") { return `(${emitExpr(o.get(), enums)}).append(${emitExpr(args[0].get(), enums)})`; }   // String.pushStr -> append
       if (m == "fetchAdd") { return `(${emitExpr(o.get(), enums)}).fetch_add(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
       if (m == "compareExchange") {
         let ob: str = emitExpr(o.get(), enums);
@@ -1032,12 +1036,12 @@ function main() {
   let s: u32 = 0;
   while (s < p.structs.len) { out = out + emitStruct(&p.structs[s], &p.enums); s = s +% 1; }
   out = out + "\n";
-  let ci: u32 = 0;
-  while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
-  out = out + "\n";
-  // non-generic prototypes (forward decls), then generic fn defs (templates), then methods, then defs.
+  // non-generic prototypes FIRST, so a comptime const initializer (e.g. const SQ = squares()) can call them.
   let i: u32 = 0;
   while (i < funcs.len) { if (funcs[i].name != "main" && funcs[i].tparams.len == 0) { out = out + emitProto(&funcs[i]); } i = i +% 1; }
+  out = out + "\n";
+  let ci: u32 = 0;
+  while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
   out = out + "\n";
   let gj: u32 = 0;
   while (gj < funcs.len) { if (funcs[gj].tparams.len > 0) { out = out + emitFunc(&funcs[gj], &p.enums); out = out + "\n"; } gj = gj +% 1; }
