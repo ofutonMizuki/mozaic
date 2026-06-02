@@ -525,6 +525,7 @@ inline void assert_(bool c, const String& m) { if (!c) panic_msg(m); }
 // the emitter needn't know x's type (this dissolves the format/template "type-info wall").
 template <class T> std::string fmt(const T& x) {
   if constexpr (std::is_same_v<T, std::string>) return x;
+  else if constexpr (std::is_same_v<T, std::u32string>) return encodeUtf8(x);                  // codepoint string -> UTF-8 (self-hosted compiler's str)
   else if constexpr (std::is_same_v<T, bool>) return x ? std::string("true") : std::string("false");
   else if constexpr (std::is_same_v<T, char>) return std::string(1, x);                      // a byte char -> that character
   else if constexpr (std::is_same_v<T, char32_t>) return encodeUtf8(std::u32string(1, x));    // codepoint -> UTF-8
@@ -534,6 +535,17 @@ template <class T> std::string fmt(const T& x) {
   else return std::to_string((long long)(x));
 }
 inline std::string fmt(const char* s) { return std::string(s); }   // non-template overload (avoid pointer->int)
+// ufmt(x): like fmt but returns a u32string — the self-hosted compiler's str is std::u32string, so its
+// string-building (format(x), template interpolation) must yield codepoint strings, not UTF-8 bytes.
+template <class T> std::u32string ufmt(const T& x) {
+  if constexpr (std::is_same_v<T, std::u32string>) return x;
+  else if constexpr (std::is_same_v<T, std::string>) return decodeUtf8(x);
+  else if constexpr (std::is_same_v<T, bool>) return x ? std::u32string(U"true") : std::u32string(U"false");
+  else if constexpr (std::is_same_v<T, char32_t>) return std::u32string(1, x);
+  else if constexpr (std::is_same_v<T, char>) return std::u32string(1, (char32_t)x);
+  else return decodeUtf8(fmt(x));   // numbers / floats / 128-bit: format as ASCII, then widen
+}
+inline std::u32string ufmt(const char* s) { return decodeUtf8(std::string(s)); }
 [[noreturn]] inline void panic_str(const std::string& m) { std::cerr << "mozaic: " << m << "\n"; std::abort(); }
 inline std::string read_all_stdin_str() { std::ostringstream ss; ss << std::cin.rdbuf(); return ss.str(); }
 inline std::optional<std::string> read_file_str(const std::string& path) {

@@ -801,7 +801,7 @@ function mapType(t: str): str {
   if (t == "u32") { return "uint32_t"; }
   if (t == "u64") { return "uint64_t"; }
   if (t == "bool") { return "bool"; }
-  if (t == "str") { return "std::string"; }
+  if (t == "str") { return "std::u32string"; }   // codepoint string (.len = code points, s[i] = code point)
   if (t == "char") { return "char32_t"; }
   if (t == "f16") { return "_Float16"; }
   if (t == "f32") { return "float"; }
@@ -944,7 +944,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (vi.found) { return `${vi.enumName}{ .tag = ${format(vi.tag)} }`; }   // unit variant
       return name;
     }
-    StrLit(s) => { return `std::string("${cesc(s)}")`; }   // a real std::string (so + concatenates, fmt formats)
+    StrLit(s) => { return `std::u32string(U"${cesc(s)}")`; }   // u32string object (so + / == work; non-ASCII passes through as UTF-8 source)
     CharLit(cp) => { return `(char32_t)${format(cp)}`; }
     Cast(x, t) => { return `(${t})(${emitExpr(x.get(), enums)})`; }
     Some(x) => { return `{ ${emitExpr(x.get(), enums)} }`; }
@@ -1006,13 +1006,13 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
         }
         return `mz::launch(${gridArg(args[1].get(), enums)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${launchArgs(&args, 2, enums)}); })`;
       }
-      if (name == "format") { return `mz::fmt(${emitExpr(args[0].get(), enums)})`; }
+      if (name == "format") { return `mz::ufmt(${emitExpr(args[0].get(), enums)})`; }   // -> u32string (str)
       if (name == "slice") { return `mz::make_slice(${emitExpr(args[0].get(), enums)})`; }
-      if (name == "readFile") { return `mz::read_file_str(${emitExpr(args[0].get(), enums)})`; }
-      if (name == "writeFile") { return `mz::write_file_str(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
+      if (name == "readFile") { return `mz::read_file(${emitExpr(args[0].get(), enums)})`; }
+      if (name == "writeFile") { return `mz::write_file(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
       if (name == "abort") {
-        if (args.len > 0) { return `mz::panic_str(${emitExpr(args[0].get(), enums)})`; }
-        return "mz::panic_str(\"aborted\")";
+        if (args.len > 0) { return `mz::panic_msg(${emitExpr(args[0].get(), enums)})`; }
+        return "mz::panic_msg(U\"aborted\")";
       }
       if (name == "assert") { return `mz::assert_(${emitExpr(args[0].get(), enums)})`; }   // message dropped (subset)
       let vi: VInfo = findVariant(enums, name);
@@ -1034,10 +1034,10 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return s + " }";
     }
     Template(strs, exprs) => {
-      let s: str = `std::string("${cesc(strs[0])}")`;
+      let s: str = `std::u32string(U"${cesc(strs[0])}")`;
       let k: u32 = 0;
       while (k < exprs.len) {
-        s = s + ` + mz::fmt(${emitExpr(exprs[k].get(), enums)}) + std::string("${cesc(strs[k +% 1])}")`;
+        s = s + ` + mz::ufmt(${emitExpr(exprs[k].get(), enums)}) + U"${cesc(strs[k +% 1])}"`;
         k = k +% 1;
       }
       return `(${s})`;
@@ -1052,11 +1052,11 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Arc" && m == "new") { return `mz::arc_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Atomic" && m == "new") { return emitExpr(args[0].get(), enums); }   // in a struct literal: Atomic.new(0) -> 0 (direct-init the atomic field)
-      if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
-      if (recv == "stdin" && m == "lines") { return "mz::stdin_lines_str()"; }
+      if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin()"; }
+      if (recv == "stdin" && m == "lines") { return "mz::stdin_lines()"; }
       if (recv == "clock" && m == "now") { return "mz::now_ns()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
-      if (recv == "String" && m == "new") { return "std::string()"; }
+      if (recv == "String" && m == "new") { return "std::u32string()"; }
       if (m == "push") { return `(${emitExpr(o.get(), enums)}).push_back(${emitExpr(args[0].get(), enums)})`; }   // Vec.push / String.push -> push_back
       if (m == "pushStr") { return `(${emitExpr(o.get(), enums)}).append(${emitExpr(args[0].get(), enums)})`; }   // String.pushStr -> append
       if (m == "fetchAdd") { return `(${emitExpr(o.get(), enums)}).fetch_add(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
