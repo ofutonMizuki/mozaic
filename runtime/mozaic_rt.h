@@ -120,6 +120,7 @@ template <class T, int N> struct Simd {
   T lane[N];
   T& operator[](uint32_t i) { return lane[i]; }
   const T& operator[](uint32_t i) const { return lane[i]; }
+  uint32_t size() const { return N; }
   static Simd splat(T s) { Simd v{}; for (int i = 0; i < N; i++) v.lane[i] = s; return v; }
 };
 template <class T, int N> Simd<T, N> operator+(const Simd<T, N>& a, const Simd<T, N>& b) { Simd<T, N> r{}; for (int i = 0; i < N; i++) r.lane[i] = a.lane[i] + b.lane[i]; return r; }

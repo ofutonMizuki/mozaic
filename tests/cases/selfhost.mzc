@@ -64,7 +64,7 @@ enum Stmt {
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
 struct Method { name: str; isMut: bool; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
-struct Func { name: str; tparams: Vec<str>; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
+struct Func { name: str; tparams: Vec<str>; params: Vec<Param>; ret: str; body: Vec<Stmt>; isKernel: bool; }
 struct StructDef { name: str; tparams: Vec<str>; fields: Vec<Param>; methods: Vec<Method>; }
 struct ConstD { name: str; ty: str; value: Box<Expr>; }
 struct Variant { name: str; payloads: Vec<str>; }   // payload type names ([] = unit variant)
@@ -226,7 +226,8 @@ struct Parser {
         else if (w == "Task") { r = `mz::JoinFuture<${args}>`; }   // Task<R> result-returning task
         else { r = `${w}<${args}>`; }
       } else {
-        r = mapType(w);
+        let sd: str = simdCpp(w);                  // f32x4 / i32x4 -> mz::Simd<lane, N>
+        if (sd != "") { r = sd; } else { r = mapType(w); }
       }
     }
     while (self.at("?")) { self.adv(); r = `std::optional<${r}>`; }   // T? -> std::optional<T>
@@ -518,7 +519,26 @@ struct Parser {
     let ret: str = "";
     if (self.at(":")) { self.adv(); ret = self.parseType(); }
     let body: Vec<Stmt> = self.parseBlock();
-    return Func { name: name, tparams: tparams, params: params, ret: ret, body: body };
+    return Func { name: name, tparams: tparams, params: params, ret: ret, body: body, isKernel: false };
+  }
+  function parseKernel(&mut self): Func {   // kernel name(params) { body } -> CPU void fn with grid_{x,y,z} prepended
+    self.eat("kernel");
+    let name: str = self.word();
+    self.eat("(");
+    let params: Vec<Param> = Vec.new();
+    if (!self.at(")")) {
+      let pn: str = self.word(); self.eat(":"); let pt: str = self.parseType();
+      params.push(Param { name: pn, ty: pt });
+      while (self.at(",")) {
+        self.adv();
+        let qn: str = self.word(); self.eat(":"); let qt: str = self.parseType();
+        params.push(Param { name: qn, ty: qt });
+      }
+    }
+    self.eat(")");
+    let tparams: Vec<str> = Vec.new();
+    let body: Vec<Stmt> = self.parseBlock();
+    return Func { name: name, tparams: tparams, params: params, ret: "", body: body, isKernel: true };
   }
   function parseMethod(&mut self): Method {
     self.eat("function");
@@ -633,6 +653,7 @@ struct Parser {
       if (self.at("struct")) { let sd: StructDef = self.parseStruct(); self.structs.push(sd); }
       else if (self.at("enum")) { let ed: EnumDef = self.parseEnum(); self.enums.push(ed); }
       else if (self.at("const")) { let cd: ConstD = self.parseConst(); self.consts.push(cd); }
+      else if (self.at("kernel")) { funcs.push(self.parseKernel()); }
       else { funcs.push(self.parseFunc()); }
     }
     return funcs;
@@ -640,6 +661,39 @@ struct Parser {
 }
 
 // ---- emitter (AST -> C++) ----
+function substr(s: str, a: u32, b: u32): str {   // s[a..b)
+  let r: str = "";
+  let i: u32 = a;
+  while (i < b) { r = r + format(s[i]); i = i +% 1; }
+  return r;
+}
+function allDigits(s: str): bool {
+  if (s.len == 0) { return false; }
+  let i: u32 = 0;
+  while (i < s.len) { if (s[i] < '0' || s[i] > '9') { return false; } i = i +% 1; }
+  return true;
+}
+function laneType(s: str): str {   // C++ lane type for a SIMD scalar prefix; "" if not a numeric scalar
+  if (s == "i8" || s == "i16" || s == "i32" || s == "i64" || s == "u8" || s == "u16" || s == "u32" || s == "u64" || s == "f16" || s == "f32" || s == "f64") { return mapType(s); }
+  return "";
+}
+// SIMD type name like "f32x4" -> "mz::Simd<float, 4>" ("" if not a SIMD name). simdLane gives just "float".
+function simdSplitLane(w: str): str {
+  let xpos: u32 = 0; let found: bool = false; let i: u32 = 0;
+  while (i < w.len) { if (!found && w[i] == 'x') { xpos = i; found = true; } i = i +% 1; }
+  if (!found) { return ""; }
+  return laneType(substr(w, 0, xpos));
+}
+function simdCpp(w: str): str {
+  let xpos: u32 = 0; let found: bool = false; let i: u32 = 0;
+  while (i < w.len) { if (!found && w[i] == 'x') { xpos = i; found = true; } i = i +% 1; }
+  if (!found) { return ""; }
+  let lt: str = laneType(substr(w, 0, xpos));
+  if (lt == "") { return ""; }
+  let cnt: str = substr(w, xpos +% 1, w.len);
+  if (!allDigits(cnt)) { return ""; }
+  return `mz::Simd<${lt}, ${cnt}>`;
+}
 function startsWith(s: str, pre: str): bool {
   if (pre.len > s.len) { return false; }
   let i: u32 = 0;
@@ -672,6 +726,8 @@ function mapType(t: str): str {
   if (t == "f32") { return "float"; }
   if (t == "f64") { return "double"; }
   if (t == "Task") { return "std::thread"; }   // void task
+  if (t == "Device") { return "mz::Device"; }
+  if (t == "Job") { return "mz::Job"; }
   return t;   // user struct/enum type names pass through unchanged
 }
 function methodParams(m: &Method): str {
@@ -774,6 +830,24 @@ function varName(e: &Expr): str {   // the identifier of a Var expr, else ""
   }
   return "";
 }
+// The grid argument of a launch: grid2(w,h)/grid3(x,y,z) build an mz::Grid; a bare scalar is 1-D.
+function gridArg(e: &Expr, enums: &Vec<EnumDef>): str {
+  match e {
+    Call(nm, a) => {
+      if (nm == "grid2") { return `mz::Grid{ (uint32_t)(${emitExpr(a[0].get(), enums)}), (uint32_t)(${emitExpr(a[1].get(), enums)}), 1 }`; }
+      if (nm == "grid3") { return `mz::Grid{ (uint32_t)(${emitExpr(a[0].get(), enums)}), (uint32_t)(${emitExpr(a[1].get(), enums)}), (uint32_t)(${emitExpr(a[2].get(), enums)}) }`; }
+    }
+    _ => { }
+  }
+  return `mz::Grid{ (uint32_t)(${emitExpr(e, enums)}), 1, 1 }`;
+}
+// args[from..] of a launch call, each comma-prefixed (kernel call args; & is erased by emitExpr).
+function launchArgs(args: &Vec<Box<Expr>>, from: u32, enums: &Vec<EnumDef>): str {
+  let s: str = "";
+  let i: u32 = from;
+  while (i < args.len) { s = s + ", " + emitExpr(args[i].get(), enums); i = i +% 1; }
+  return s;
+}
 function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
   match e {
     Num(v) => { return format(v); }
@@ -803,6 +877,10 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
+      let ov: str = varName(o.get());
+      if ((ov == "grid" || ov == "local" || ov == "group") && (f == "x" || f == "y" || f == "z")) { return `${ov}_${f}`; }   // GPU thread indices -> kernel params
+      if (ov == "Device" && f == "gpu") { return "mz::Device{ 1 }"; }
+      if (ov == "Device" && f == "cpu") { return "mz::Device{ 0 }"; }
       if (f == "len") { return `(${emitExpr(o.get(), enums)}).size()`; }   // .len -> .size() (array/string)
       return `(${emitExpr(o.get(), enums)}).${f}`;
     }
@@ -826,6 +904,18 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return `(${a} ${op} ${b})`;
     }
     Call(name, args) => {
+      let simd: str = simdCpp(name);                 // f32x4(a,b,c,d) lane-constructor
+      if (simd != "") {
+        let lt: str = simdSplitLane(name);
+        let s: str = simd + "{ {";
+        let k: u32 = 0;
+        while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + `(${lt})(${emitExpr(args[k].get(), enums)})`; k = k +% 1; }   // cast each lane (no narrowing in braced-init)
+        return s + "} }";
+      }
+      if (name == "launch") {                        // launch(kernel, gridSize, kargs...) -> serial mz::launch
+        let kn: str = varName(args[0].get());
+        return `mz::launch(${gridArg(args[1].get(), enums)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${launchArgs(&args, 2, enums)}); })`;
+      }
       if (name == "format") { return `mz::fmt(${emitExpr(args[0].get(), enums)})`; }
       if (name == "slice") { return `mz::make_slice(${emitExpr(args[0].get(), enums)})`; }
       if (name == "readFile") { return `mz::read_file_str(${emitExpr(args[0].get(), enums)})`; }
@@ -864,6 +954,11 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     }
     MethodCall(o, m, args) => {
       let recv: str = varName(o.get());
+      if (m == "launch" && args.len >= 2) {          // dev.launch(kernel, grid, kargs...) -> serial launch, returns a Job
+        let kn: str = varName(args[0].get());
+        return `([&]{ mz::launch(${gridArg(args[1].get(), enums)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${launchArgs(&args, 2, enums)}); }); return mz::Job{}; }())`;
+      }
+      if (m == "splat" && simdCpp(recv) != "") { return `${simdCpp(recv)}::splat(${emitExpr(args[0].get(), enums)})`; }   // f32x4.splat(s)
       if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Arc" && m == "new") { return `mz::arc_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Atomic" && m == "new") { return emitExpr(args[0].get(), enums); }   // in a struct literal: Atomic.new(0) -> 0 (direct-init the atomic field)
@@ -1006,8 +1101,17 @@ function tprefix(tp: &Vec<str>): str {   // "" or "template <class T, class U>\n
   while (i < tp.len) { s = s + ", class " + tp[i]; i = i +% 1; }
   return s + ">\n";
 }
-function emitProto(f: &Func): str { return `${retType(f)} ${f.name}(${paramList(f)});\n`; }
+function kernelSig(f: &Func): str {   // void name(uint32_t grid_x, grid_y, grid_z [, params])
+  let pl: str = paramList(f);
+  if (pl == "") { return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z)`; }
+  return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, ${pl})`;
+}
+function emitProto(f: &Func): str {
+  if (f.isKernel) { return kernelSig(f) + ";\n"; }
+  return `${retType(f)} ${f.name}(${paramList(f)});\n`;
+}
 function emitFunc(f: &Func, enums: &Vec<EnumDef>): str {
+  if (f.isKernel) { return kernelSig(f) + ` {\n${emitBlock(&f.body, "  ", enums)}}\n`; }
   // main is `int main()`, but mozaic main is void and may `return;` early — wrap the body in a
   // void IIFE so a bare `return;` exits the lambda, then return 0 from the real main.
   if (f.name == "main") {
