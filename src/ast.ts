@@ -275,6 +275,37 @@ export function usesWorkgroup(stmts: Stmt[]): boolean {
   };
   return stmts.some(st);
 }
+// Does an expression / statement mention the identifier `name` anywhere? (for last-use / NLL).
+export function exprMentions(e: Expr, name: string): boolean {
+  switch (e.kind) {
+    case "Ident": return e.name === name;
+    case "Member": return exprMentions(e.obj, name);
+    case "Index": return exprMentions(e.obj, name) || exprMentions(e.index, name);
+    case "Call": return exprMentions(e.callee, name) || e.args.some((a) => exprMentions(a, name));
+    case "Binary": return exprMentions(e.left, name) || exprMentions(e.right, name);
+    case "Unary": case "Comptime": case "Some": case "Try": case "Cast": case "Borrow": case "Ok": case "Err": return exprMentions(e.expr, name);
+    case "OrElse": return exprMentions(e.opt, name) || exprMentions(e.alt, name);
+    case "Array": return e.elems.some((x) => exprMentions(x, name));
+    case "Template": return e.exprs.some((x) => exprMentions(x, name));
+    case "StructLit": return e.fields.some((f) => exprMentions(f.value, name));
+    case "SpawnExpr": return exprMentions(e.call, name);
+    default: return false;
+  }
+}
+export function stmtMentions(s: Stmt, name: string): boolean {
+  switch (s.kind) {
+    case "Let": return exprMentions(s.value, name);
+    case "Assign": return exprMentions(s.target, name) || exprMentions(s.value, name);
+    case "While": return exprMentions(s.cond, name) || s.body.some((x) => stmtMentions(x, name));
+    case "If": return exprMentions(s.cond, name) || s.then.some((x) => stmtMentions(x, name)) || (s.els?.some((x) => stmtMentions(x, name)) ?? false);
+    case "ForOf": return exprMentions(s.iter, name) || s.body.some((x) => stmtMentions(x, name));
+    case "Match": return exprMentions(s.scrut, name) || s.arms.some((a) => a.body.some((x) => stmtMentions(x, name)));
+    case "Return": return s.value ? exprMentions(s.value, name) : false;
+    case "Scope": case "Defer": return s.body.some((x) => stmtMentions(x, name));
+    case "ExprStmt": return exprMentions(s.expr, name);
+    default: return false;
+  }
+}
 // All `shared name: [T;N];` declarations in a kernel body (recursively), in order.
 export function collectShared(stmts: Stmt[]): { name: string; ty: string }[] {
   const out: { name: string; ty: string }[] = [];

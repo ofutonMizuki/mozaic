@@ -4,6 +4,7 @@ import {
   BUILTIN_TYPES, ARITH_OPS, ATOMIC_INTS, isInt, isFloat, isCopy, isMutRef, refInner, optInner, resultArgs, sliceElem, arrayParts, substituteType, unifyInt, unifyFloat,
   bufferElem, atomicElem, genericArgs, containsAtomic, isStdinLines, isBufferNew, isAtomicNew, vecParts,
   isSyncShared, libBase, isArcNew, isMutexNew, isChannelNew, LIB_GENERICS, isVecNew, dynVecElem, isMapNew, isBoxNew,
+  stmtMentions,
 } from "./ast.ts";
 import { Comptime, CompileError } from "./comptime.ts";
 
@@ -41,6 +42,12 @@ class Checker {
   scopeCount = 0;
   target: "cpu" | "metal" = "cpu";         // emit target (Buffer<Atomic<T>> is CPU-only)
   curTypeParams = new Set<string>();       // generic type params in scope (opaque, treated as known types)
+  // M5: stored-reference borrows. `let r = &x` / `&mut x` of a local makes `x` borrowed until r's
+  // LAST use (NLL) within its block. While a &mut borrow is live, x cannot be read/written/re-borrowed;
+  // while a & borrow is live, x cannot be written or &mut-borrowed (but may still be read).
+  localBorrows: { root: string; mut: boolean; owner: string; releaseAfter: number }[] = [];
+  inBorrowInit = false;                     // true while checking the `&x` that creates a stored borrow (don't self-flag)
+  suppressBorrowRoot: string | null = null; // assignment target root (its read is the write, checked separately)
   consts = new Map<string, string>();      // top-level const name -> type
   constVals = new Map<string, CTValue>();  // top-level const name -> evaluated compile-time value
   comptimeEval!: Comptime;                 // tree-walking evaluator for `comptime` / const folding
@@ -358,8 +365,9 @@ class Checker {
       this.inKernel = it.kind === "KernelDecl";
       this.curTypeParams = it.kind === "FnDecl" ? new Set(it.typeParams ?? []) : new Set();
       this.curParams = new Set(it.params.map((pa) => pa.name));
+      this.localBorrows = [];
       for (const pa of it.params) this.define(pa.name, pa.ty);
-      for (const s of it.body) this.checkStmt(s);
+      this.checkStmts(it.body);
       for (const [name, b] of this.borrows) this.err(`'${name}' is still borrowed by job '${b.job}' at end of '${it.name}'; await/join before it goes out of scope`);
       for (const [name, t] of this.tasks) if (!t.joined) this.err(`'${name}' is a Task that was never joined; join it before it goes out of scope`);
       this.inKernel = false;
@@ -382,12 +390,44 @@ class Checker {
         this.define(pa.name, pa.ty);
       }
       if (m.retTy && !this.typeKnown(m.retTy)) this.err(`unknown return type '${m.retTy}' for '${it.name}.${m.name}'`);
-      for (const s of m.body) this.checkStmt(s);
+      this.localBorrows = [];
+      this.checkStmts(m.body);
       this.curTypeParams = new Set();
       this.pop();
     }
   }
-  checkBlock(stmts: Stmt[]) { this.push(); for (const s of stmts) this.checkStmt(s); this.pop(); }
+  checkBlock(stmts: Stmt[]) { this.push(); this.checkStmts(stmts); this.pop(); }
+  // Check a statement list, tracking stored-reference borrows with NLL release (M5).
+  checkStmts(stmts: Stmt[]) {
+    const base = this.localBorrows.length;
+    for (let i = 0; i < stmts.length; i++) {
+      const s = stmts[i];
+      this.checkStmt(s);
+      if (s.kind === "Let" && s.value.kind === "Borrow") {   // `let r = &x` / `&mut x` of a local
+        const root = this.rootIdent(s.value.expr);
+        if (root !== null && this.lookupVar(root) && !this.curParams.has(root))
+          this.localBorrows.push({ root, mut: s.value.mut, owner: s.name, releaseAfter: this.lastUse(s.name, stmts, i) });
+      }
+      for (let k = this.localBorrows.length - 1; k >= base; k--) if (this.localBorrows[k].releaseAfter === i) this.localBorrows.splice(k, 1);   // NLL: release at owner's last use
+    }
+    this.localBorrows.length = base;   // drop any borrows scoped to this block
+  }
+  lastUse(name: string, stmts: Stmt[], from: number): number {
+    let last = from;
+    for (let i = from + 1; i < stmts.length; i++) if (stmtMentions(stmts[i], name)) last = i;
+    return last;
+  }
+  // Conflict between accessing `root` and a live stored-reference borrow of it.
+  borrowConflict(root: string, kind: "read" | "write" | "borrowShared" | "borrowMut") {
+    if (this.inBorrowInit) return;
+    for (const b of this.localBorrows) {
+      if (b.root !== root) continue;
+      if (b.mut) this.err(`cannot use '${root}' while it is mutably borrowed by '${b.owner}'`);   // &mut is exclusive
+      else if (kind === "write") this.err(`cannot assign to '${root}' while it is borrowed by '${b.owner}'`);
+      else if (kind === "borrowMut") this.err(`cannot mutably borrow '${root}' while it is borrowed by '${b.owner}'`);
+      // shared borrow + read / additional shared borrow: allowed
+    }
+  }
 
   checkStmt(s: Stmt) {
     switch (s.kind) {
@@ -461,9 +501,13 @@ class Checker {
           this.suppressBufRead = s.target.obj.name;     // ...so don't also flag it as a read
         }
         if (s.target.kind === "Ident") this.suppressMovedCheck = s.target.name;  // assigning TO x is not a use of x
+        const tRoot = this.rootIdent(s.target);
+        this.suppressBorrowRoot = tRoot;                                          // the target's read is the write (checked below)
         const tt = this.checkExpr(s.target);
         this.suppressBufRead = null;
         this.suppressMovedCheck = null;
+        this.suppressBorrowRoot = null;
+        if (tRoot !== null) this.borrowConflict(tRoot, "write");                  // writing a borrowed local is illegal
         if (this.hasAtomic(tt)) { this.err(`cannot assign to an Atomic; use .store(value, order)`); break; }
         // field-assignment mutability: through a shared `&` ref, or via a const/immutable root, is illegal.
         if (s.target.kind === "Member" && s.target.obj.kind === "Ident") {
@@ -505,7 +549,7 @@ class Checker {
           covered.add(arm.variant);
           this.push();
           arm.bindings.forEach((b, i) => this.define(b, payload[i] ?? "i32"));
-          for (const st2 of arm.body) this.checkStmt(st2);
+          this.checkStmts(arm.body);
           this.pop();
         }
         if (!hasWild) for (const vn of variants.keys()) if (!covered.has(vn)) this.err(`non-exhaustive match: missing variant '${vn}'`);
@@ -516,7 +560,7 @@ class Checker {
         this.push();
         this.define(s.binder, "str");
         this.loopDepth++;
-        for (const st of s.body) this.checkStmt(st);
+        this.checkStmts(s.body);
         this.loopDepth--;
         this.pop();
         break;
@@ -546,7 +590,7 @@ class Checker {
       case "Defer": {
         // checked in the current scope (the body runs at scope exit, but sees names in scope here)
         this.push();
-        for (const st of s.body) this.checkStmt(st);
+        this.checkStmts(s.body);
         this.pop();
         break;
       }
@@ -554,7 +598,7 @@ class Checker {
         const sid = "scope#" + (this.scopeCount++);   // bare spawns inside join here
         this.scopeStack.push(sid);
         this.push();
-        for (const st of s.body) this.checkStmt(st);
+        this.checkStmts(s.body);
         this.pop();
         this.scopeStack.pop();
         for (const [name, b] of [...this.borrows]) if (b.job === sid) this.borrows.delete(name);
@@ -690,6 +734,7 @@ class Checker {
         const vs = this.lookupVar(e.name);
         if (vs) {
           if (vs.moved && this.suppressMovedCheck !== e.name) this.err(`use of moved value '${e.name}'`);
+          if (this.suppressBorrowRoot !== e.name) this.borrowConflict(e.name, "read");   // reading a &mut-borrowed local is illegal
           e.ty = vs.ty; return vs.ty;
         }
         const ct = this.consts.get(e.name);
@@ -1101,11 +1146,16 @@ class Checker {
         this.err("M0: unsupported call"); e.ty = "unit"; return e.ty;
       }
       case "Borrow": {
-        const it = this.checkExpr(e.expr);   // &x : &T  /  &mut x : &mut T  (validity checked at the use site)
+        const saved = this.inBorrowInit;
+        this.inBorrowInit = true;             // suppress the read-flag for the var we're borrowing
+        const it = this.checkExpr(e.expr);    // &x : &T  /  &mut x : &mut T
+        this.inBorrowInit = saved;
         if (e.mut && e.expr.kind === "Ident") {
           const vs = this.lookupVar(e.expr.name);
           if (vs && !vs.mutable) this.err(`cannot take '&mut ${e.expr.name}': it is a const binding (use 'let')`);
         }
+        const root = this.rootIdent(e.expr);   // re-borrow conflict against a live stored borrow
+        if (root !== null) this.borrowConflict(root, e.mut ? "borrowMut" : "borrowShared");
         e.ty = (e.mut ? "&mut " : "&") + it;
         return e.ty;
       }

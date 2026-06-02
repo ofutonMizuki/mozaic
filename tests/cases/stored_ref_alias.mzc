@@ -1,0 +1,8 @@
+// Negative (M5): a value cannot be touched while a stored &mut reference to it is still live.
+struct Cell { v: i32; }
+function main() {
+  let c: Cell = Cell { v: 5 };
+  let r: &mut Cell = &mut c;
+  c.v = 10;            // error: c is mutably borrowed by r (r used below)
+  stdout.println(r.v);
+}

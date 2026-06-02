@@ -1,0 +1,9 @@
+// Positive (M5 / NLL): once the stored reference's LAST use has passed, the value is free again.
+struct Cell { v: i32; }
+function main() {
+  let c: Cell = Cell { v: 5 };
+  let r: &mut Cell = &mut c;
+  r.v = 10;            // last use of r -> borrow ends here (NLL)
+  c.v = c.v +% 1;      // OK: r is dead, c usable again
+  stdout.println(c.v); // 11
+}
