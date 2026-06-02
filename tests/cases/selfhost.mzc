@@ -1301,6 +1301,107 @@ function checkBodyTypes(body: &Vec<Stmt>): str {   // validate let-binding types
   }
   return "";
 }
+// A conservative partial type inference: returns the C++ type of an expr, or "" when unknown.
+// "" disables every downstream check (so we never flag valid code we can't fully type).
+function envType(env: &Vec<Param>, name: str): str {
+  let i: u32 = env.len;
+  while (i > 0) { i = i -% 1; if (env[i].name == name) { return env[i].ty; } }   // innermost binding wins
+  return "";
+}
+function typeOf(e: &Expr, env: &Vec<Param>): str {
+  match e {
+    Num(v) => { return "int32_t"; }
+    FloatLit(s) => { return "double"; }
+    BoolLit(b) => { return "bool"; }
+    StrLit(s) => { return "std::u32string"; }
+    CharLit(c) => { return "char32_t"; }
+    Var(n) => { return envType(env, n); }
+    Not(x) => { return "bool"; }
+    Some(x) => { return "opt"; }
+    NoneLit => { return "opt"; }
+    TryCast(x, t) => { return "opt"; }
+    Cast(x, t) => { return t; }
+    Bin(op, l, r) => {
+      if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||") { return "bool"; }
+      return typeOf(l.get(), env);
+    }
+    _ => { return ""; }
+  }
+}
+// Recursively check an expression: logical operands must be bool, atomics must not be used as plain
+// values, and load() may not take a Release/AcqRel order. Recurses into every sub-expression.
+function checkExpr(e: &Expr, env: &Vec<Param>): str {
+  match e {
+    Bin(op, l, r) => {
+      if (op == "&&" || op == "||") {
+        let lt: str = typeOf(l.get(), env);
+        let rt: str = typeOf(r.get(), env);
+        if (lt != "" && lt != "bool") { return "requires bool operands"; }
+        if (rt != "" && rt != "bool") { return "requires bool operands"; }
+      } else {
+        if (startsWith(typeOf(l.get(), env), "std::atomic") || startsWith(typeOf(r.get(), env), "std::atomic")) { return "Atomic can only be accessed via load/store/fetchAdd/compareExchange"; }
+      }
+      let a: str = checkExpr(l.get(), env); if (a != "") { return a; }
+      return checkExpr(r.get(), env);
+    }
+    Not(x) => {
+      let xt: str = typeOf(x.get(), env);
+      if (xt != "" && xt != "bool") { return "requires bool operands"; }
+      return checkExpr(x.get(), env);
+    }
+    MethodCall(o, m, args) => {
+      if (m == "load" && args.len >= 1) {
+        match args[0].get() { Var(ord) => { if (ord == "Release" || ord == "AcqRel") { return "load's order must be one of Relaxed, Acquire"; } } _ => { } }
+      }
+      let a: str = checkExpr(o.get(), env); if (a != "") { return a; }
+      let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env); if (z != "") { return z; } i = i +% 1; }
+    }
+    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
+    Field(o, f) => { return checkExpr(o.get(), env); }
+    Index(o, ix) => { let a: str = checkExpr(o.get(), env); if (a != "") { return a; } return checkExpr(ix.get(), env); }
+    Borrow(x) => { return checkExpr(x.get(), env); }
+    Some(x) => { return checkExpr(x.get(), env); }
+    OkE(x) => { return checkExpr(x.get(), env); }
+    ErrE(x) => { return checkExpr(x.get(), env); }
+    OrElse(a2, b2) => { let a: str = checkExpr(a2.get(), env); if (a != "") { return a; } return checkExpr(b2.get(), env); }
+    Cast(x, t) => { return checkExpr(x.get(), env); }
+    TryQ(x) => { return checkExpr(x.get(), env); }
+    TryCast(x, t) => { return checkExpr(x.get(), env); }
+    Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkExpr(exprs[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
+    ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkExpr(els[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
+    StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkExpr(vals[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
+    _ => { }
+  }
+  return "";
+}
+function checkStmtsEnv(body: &Vec<Stmt>, env: &mut Vec<Param>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v) => {
+        let ce: str = checkExpr(v.get(), env); if (ce != "") { return ce; }
+        if (startsWith(t, "std::optional<")) {                 // no implicit wrap: T? must be init from an optional
+          let vt: str = typeOf(v.get(), env);
+          if (vt != "" && vt != "opt") { return "cannot init an optional with a non-optional value"; }
+        }
+        env.push(Param { name: n, ty: t });
+      }
+      Assign(tg, v) => { let a: str = checkExpr(tg.get(), env); if (a != "") { return a; } let b: str = checkExpr(v.get(), env); if (b != "") { return b; } }
+      Ret(v) => { return checkExpr(v.get(), env); }
+      Print(v) => { return checkExpr(v.get(), env); }
+      ExprS(v) => { return checkExpr(v.get(), env); }
+      If(c, then, els) => { let a: str = checkExpr(c.get(), env); if (a != "") { return a; } let t1: str = checkStmtsEnv(&then, env); if (t1 != "") { return t1; } return checkStmtsEnv(&els, env); }
+      While(c, wb) => { let a: str = checkExpr(c.get(), env); if (a != "") { return a; } return checkStmtsEnv(&wb, env); }
+      ForOf(n, it, fb) => { env.push(Param { name: n, ty: "" }); return checkStmtsEnv(&fb, env); }
+      Scope(sb) => { return checkStmtsEnv(&sb, env); }
+      Defer(db) => { return checkStmtsEnv(&db, env); }
+      Match(sc, arms) => { let a: str = checkExpr(sc.get(), env); if (a != "") { return a; } let ai: u32 = 0; while (ai < arms.len) { let t: str = checkStmtsEnv(&arms[ai].body, env); if (t != "") { return t; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<EnumDef>): str {
   let ei: u32 = 0;
   while (ei < enums.len) {                          // Ok/Err are reserved for Result
@@ -1328,6 +1429,11 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     }
     let be: str = checkBodyTypes(&funcs[fi].body);
     if (be != "") { return be; }
+    let pe: Vec<Param> = Vec.new();                 // seed the env with the params, then walk the body
+    let pj: u32 = 0;
+    while (pj < funcs[fi].params.len) { pe.push(Param { name: funcs[fi].params[pj].name, ty: funcs[fi].params[pj].ty }); pj = pj +% 1; }
+    let bce: str = checkStmtsEnv(&funcs[fi].body, &mut pe);
+    if (bce != "") { return bce; }
     fi = fi +% 1;
   }
   let si: u32 = 0;
