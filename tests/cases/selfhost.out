@@ -1,7 +1,4 @@
-#include <cstdint>
-#include <iostream>
-#include <string>
-#include <array>
+#include "mozaic_rt.h"
 
 struct Shape { int tag; int64_t Seg_0; };
 struct Point { int64_t x; int64_t y; };

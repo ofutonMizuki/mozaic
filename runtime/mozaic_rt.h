@@ -117,6 +117,9 @@ template <class T> struct Box {
   std::shared_ptr<T> p;
   const T& get() const { return *p; }
 };
+// box_new(v): construct a Box with T deduced from v (used by the self-hosted compiler's emit,
+// which has no type info; the in-language `Box.new(v)` lowers via the type-aware path in emit.ts).
+template <class T> Box<T> box_new(T v) { return Box<T>{ std::make_shared<T>(std::move(v)) }; }
 
 // Arc<T>: atomically reference-counted shared ownership. clone() hands out another owning handle
 // (refcount++, thread-safe); get() reads the shared, immutable value. Lower than a borrow: an Arc
@@ -158,6 +161,7 @@ template <class T> struct Vec {
   void push(const T& v) { data.push_back(v); }
   std::optional<T> pop() { if (data.empty()) return std::nullopt; T v = std::move(data.back()); data.pop_back(); return v; }
   uint32_t len() const { return (uint32_t)data.size(); }
+  uint32_t size() const { return (uint32_t)data.size(); }
   T& operator[](uint32_t i) { return data[i]; }
   const T& operator[](uint32_t i) const { return data[i]; }
 };
@@ -170,6 +174,7 @@ template <class K, class V> struct Map {
   std::optional<V> get(const K& k) const { auto it = m.find(k); if (it == m.end()) return std::nullopt; return it->second; }
   bool has(const K& k) const { return m.find(k) != m.end(); }
   uint32_t len() const { return (uint32_t)m.size(); }
+  uint32_t size() const { return (uint32_t)m.size(); }
 };
 
 // `x as? To` — fallible numeric cast. Returns none unless the value round-trips exactly

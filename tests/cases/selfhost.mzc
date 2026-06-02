@@ -30,6 +30,7 @@ enum Expr {
   BoolLit(bool),                     // true / false
   Field(Box<Expr>, str),             // e.field  (.len -> .size())
   Index(Box<Expr>, Box<Expr>),       // e[i]
+  Borrow(Box<Expr>),                 // &e / &mut e  (erased in emit; C++ refs bind to lvalues)
   ArrLit(Vec<Box<Expr>>),            // [a, b, c]  (only as an initializer)
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
   MethodCall(Box<Expr>, str, Vec<Box<Expr>>),   // obj.method(args)
@@ -133,6 +134,14 @@ struct Parser {
   }
   function word(&mut self): str { let w: str = self.text(); self.adv(); return w; }
   function parseType(&mut self): str {   // returns a C++ type string directly
+    if (self.text() == "&") {             // &T -> const T&  /  &mut T -> T&
+      self.adv();
+      let isMut: bool = false;
+      if (self.text() == "mut") { self.adv(); isMut = true; }
+      let inner: str = self.parseType();
+      if (isMut) { return inner + "&"; }
+      return `const ${inner}&`;
+    }
     if (self.text() == "[") {
       self.adv();
       let elem: str = self.parseType();
@@ -141,7 +150,18 @@ struct Parser {
       self.eat("]");
       return `std::array<${elem}, ${format(nv)}>`;
     }
-    return mapType(self.word());
+    let w: str = self.word();
+    if (self.text() == "<") {              // generic: Vec<T> / Box<T> / Map<K,V> / user Name<...>
+      self.adv();
+      let args: str = self.parseType();
+      while (self.text() == ",") { self.adv(); args = args + ", " + self.parseType(); }
+      self.eat(">");
+      if (w == "Vec") { return `mz::Vec<${args}>`; }
+      if (w == "Box") { return `mz::Box<${args}>`; }
+      if (w == "Map") { return `mz::Map<${args}>`; }
+      return `${w}<${args}>`;
+    }
+    return mapType(w);
   }
 
   function parsePrimary(&mut self): Box<Expr> {
@@ -214,6 +234,12 @@ struct Parser {
   }
   function parseUnary(&mut self): Box<Expr> {
     if (self.text() == "!") { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
+    if (self.text() == "&") {   // &e / &mut e -> Borrow (erased in emit)
+      self.adv();
+      if (self.text() == "mut") { self.adv(); }
+      let e: Box<Expr> = self.parseUnary();
+      return Box.new(Borrow(e));
+    }
     return self.parsePostfix();
   }
   function parseCast(&mut self): Box<Expr> {   // e as T (binds tighter than * /)
@@ -507,6 +533,25 @@ function emitEnum(ed: &EnumDef): str {
   }
   return out + " };\n";
 }
+function varName(e: &Expr): str {   // the identifier of a Var expr, else ""
+  match e {
+    Var(n) => { return n; }
+    _ => { }
+  }
+  return "";
+}
+// If `e` is Vec.new()/Map.new()/Channel.new(), return the base name (these default-construct);
+// else "". Used so a `let v: Vec<T> = Vec.new();` emits a default-constructed value.
+function collNewBase(e: &Expr): str {
+  match e {
+    MethodCall(o, m, args) => {
+      let n: str = varName(o.get());
+      if (m == "new" && (n == "Vec" || n == "Map" || n == "Channel")) { return n; }
+    }
+    _ => { }
+  }
+  return "";
+}
 function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
   match e {
     Num(v) => { return format(v); }
@@ -526,6 +571,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return `(${emitExpr(o.get(), enums)}).${f}`;
     }
     Index(o, idx) => { return `(${emitExpr(o.get(), enums)})[${emitExpr(idx.get(), enums)}]`; }
+    Borrow(x) => { return emitExpr(x.get(), enums); }   // erase & — the C++ reference param binds to the lvalue
     ArrLit(elems) => {
       let s: str = "{ ";
       let ai: u32 = 0;
@@ -553,6 +599,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return s + " }";
     }
     MethodCall(o, m, args) => {
+      if (varName(o.get()) == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
       let s: str = `(${emitExpr(o.get(), enums)}).${m}(`;
       let k: u32 = 0;
       while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + emitExpr(args[k].get(), enums); k = k +% 1; }
@@ -569,7 +616,10 @@ function emitBlock(body: &Vec<Stmt>, ind: str, enums: &Vec<EnumDef>): str {
 }
 function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
   match s {
-    Let(name, ty, v) => { return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`; }
+    Let(name, ty, v) => {
+      if (collNewBase(v.get()).len > 0) { return `${ind}${mapType(ty)} ${name};\n`; }   // Vec/Map/Channel.new -> default-construct
+      return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`;
+    }
     Assign(target, v) => { return `${ind}${emitExpr(target.get(), enums)} = ${emitExpr(v.get(), enums)};\n`; }
     Ret(v) => { return `${ind}return ${emitExpr(v.get(), enums)};\n`; }
     Print(v) => { return `${ind}std::cout << (${emitExpr(v.get(), enums)}) << "\\n";\n`; }
@@ -635,7 +685,7 @@ function main() {
   let src: str = stdin.readAll();
   let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), noStruct: false };
   let funcs: Vec<Func> = p.parseProgram();
-  let out: str = "#include <cstdint>\n#include <iostream>\n#include <string>\n#include <array>\n\n";
+  let out: str = "#include \"mozaic_rt.h\"\n\n";   // runtime brings cstdint/iostream/string/array + mz::Vec/Box/Map
   // enum + struct definitions, then function prototypes (any-order defs / recursion), then bodies.
   let e: u32 = 0;
   while (e < p.enums.len) { out = out + emitEnum(&p.enums[e]); e = e +% 1; }
