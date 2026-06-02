@@ -55,7 +55,7 @@ enum Stmt {
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
 struct Method { name: str; isMut: bool; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
-struct Func { name: str; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
+struct Func { name: str; tparams: Vec<str>; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
 struct StructDef { name: str; fields: Vec<Param>; methods: Vec<Method>; }
 struct ConstD { name: str; ty: str; value: Box<Expr>; }
 struct Variant { name: str; payloads: Vec<str>; }   // payload type names ([] = unit variant)
@@ -421,6 +421,13 @@ struct Parser {
   function parseFunc(&mut self): Func {
     self.eat("function");
     let name: str = self.word();
+    let tparams: Vec<str> = Vec.new();
+    if (self.at("<")) {                 // generic: function name<T, U>(...)
+      self.adv();
+      tparams.push(self.word());
+      while (self.at(",")) { self.adv(); tparams.push(self.word()); }
+      self.eat(">");
+    }
     self.eat("(");
     let params: Vec<Param> = Vec.new();
     if (!self.at(")")) {
@@ -436,7 +443,7 @@ struct Parser {
     let ret: str = "";
     if (self.at(":")) { self.adv(); ret = self.parseType(); }
     let body: Vec<Stmt> = self.parseBlock();
-    return Func { name: name, params: params, ret: ret, body: body };
+    return Func { name: name, tparams: tparams, params: params, ret: ret, body: body };
   }
   function parseMethod(&mut self): Method {
     self.eat("function");
@@ -796,9 +803,16 @@ function paramList(f: &Func): str {
   }
   return s;
 }
+function tprefix(tp: &Vec<str>): str {   // "" or "template <class T, class U>\n"
+  if (tp.len == 0) { return ""; }
+  let s: str = "template <class " + tp[0];
+  let i: u32 = 1;
+  while (i < tp.len) { s = s + ", class " + tp[i]; i = i +% 1; }
+  return s + ">\n";
+}
 function emitProto(f: &Func): str { return `${retType(f)} ${f.name}(${paramList(f)});\n`; }
 function emitFunc(f: &Func, enums: &Vec<EnumDef>): str {
-  let sig: str = `${retType(f)} ${f.name}(${paramList(f)}) {\n`;
+  let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f)}) {\n`;
   let body: str = emitBlock(&f.body, "  ", enums);
   if (f.name == "main") { body = body + "  return 0;\n"; }
   return sig + body + "}\n";
@@ -824,13 +838,16 @@ function main() {
   let ci: u32 = 0;
   while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
   out = out + "\n";
+  // non-generic prototypes (forward decls), then generic fn defs (templates), then methods, then defs.
   let i: u32 = 0;
-  while (i < funcs.len) { if (funcs[i].name != "main") { out = out + emitProto(&funcs[i]); } i = i +% 1; }
+  while (i < funcs.len) { if (funcs[i].name != "main" && funcs[i].tparams.len == 0) { out = out + emitProto(&funcs[i]); } i = i +% 1; }
   out = out + "\n";
+  let gj: u32 = 0;
+  while (gj < funcs.len) { if (funcs[gj].tparams.len > 0) { out = out + emitFunc(&funcs[gj], &p.enums); out = out + "\n"; } gj = gj +% 1; }
   let mj: u32 = 0;
   while (mj < p.structs.len) { out = out + emitMethodDefs(&p.structs[mj], &p.enums); mj = mj +% 1; }
   out = out + "\n";
   let j: u32 = 0;
-  while (j < funcs.len) { out = out + emitFunc(&funcs[j], &p.enums); out = out + "\n"; j = j +% 1; }
+  while (j < funcs.len) { if (funcs[j].tparams.len == 0) { out = out + emitFunc(&funcs[j], &p.enums); out = out + "\n"; } j = j +% 1; }
   stdout.println(out);
 }
