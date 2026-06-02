@@ -233,6 +233,13 @@ template <class T, class E> E result_unwrap_err(const Result<T, E>& r) {
   if (r.ok) panic("unwrapErr() on an Ok value");
   return r.err;
 }
+// Postfix `?` propagation helpers — overloaded for optional AND Result so the self-hosted compiler
+// needn't know which it is (C++ overload resolution picks by type; the `?` emit just returns the
+// operand unchanged on the failing path, which is the enclosing fn's return type in both cases).
+template <class T> bool is_ok(const std::optional<T>& o) { return o.has_value(); }
+template <class T, class E> bool is_ok(const Result<T, E>& r) { return r.ok; }
+template <class T> T get_val(const std::optional<T>& o) { return o.value(); }
+template <class T, class E> T get_val(const Result<T, E>& r) { return r.val; }
 
 // ---- device buffers + data-parallel launch ----
 // Two backends, selected at compile time:
@@ -451,6 +458,16 @@ inline std::vector<String> stdin_lines() {
   while (std::getline(std::cin, line)) {
     if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF
     lines.push_back(decodeUtf8(line));
+  }
+  return lines;
+}
+// std::string (byte) variant for the self-hosted compiler, whose str == std::string.
+inline std::vector<std::string> stdin_lines_str() {
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF
+    lines.push_back(line);
   }
   return lines;
 }

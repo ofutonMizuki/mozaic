@@ -44,6 +44,8 @@ enum Expr {
   ErrE(Box<Expr>),                              // Err(e) -> { false, {}, e }
   OrElse(Box<Expr>, Box<Expr>),                 // a ?? b -> (a).value_or(b)
   SpawnExpr(str, Vec<Box<Expr>>),               // spawn f(args) — fn name + args (only as a let value)
+  TryQ(Box<Expr>),                              // e? -> propagate none/Err (statement-expr)
+  TryCast(Box<Expr>, str),                      // e as? T -> mz::checked_cast<T>(e)
 }
 enum Stmt {
   Let(str, str, Box<Expr>),          // name, mozaic type, value
@@ -57,6 +59,7 @@ enum Stmt {
   Match(Box<Expr>, Vec<Arm>),
   Defer(Vec<Stmt>),                  // defer { ... } / defer stmt -> MZ_DEFER(...)
   Scope(Vec<Stmt>),                  // scope { spawn f(..); ... } -> thread vector, join all at block end
+  ForOf(str, Box<Expr>, Vec<Stmt>),  // for (const x of iter) { ... } -> range-for
 }
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
@@ -295,8 +298,9 @@ struct Parser {
   }
   function parsePostfix(&mut self): Box<Expr> {
     let e: Box<Expr> = self.parsePrimary();
-    while (self.at(".") || self.at("[")) {
-      if (self.at("[")) { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
+    while (self.at(".") || self.at("[") || self.at("?")) {
+      if (self.at("?")) { self.adv(); e = Box.new(TryQ(e)); }      // e? -> propagate none/Err
+      else if (self.at("[")) { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
       else {
         self.adv();
         let m: str = self.word();
@@ -328,7 +332,13 @@ struct Parser {
   }
   function parseCast(&mut self): Box<Expr> {   // e as T (binds tighter than * /)
     let e: Box<Expr> = self.parseUnary();
-    while (self.at("as")) { self.adv(); let t: str = self.parseType(); e = Box.new(Cast(e, t)); }
+    while (self.at("as")) {
+      self.adv();
+      let fallible: bool = false;
+      if (self.at("?")) { self.adv(); fallible = true; }          // as? -> fallible cast
+      let t: str = self.parseType();
+      if (fallible) { e = Box.new(TryCast(e, t)); } else { e = Box.new(Cast(e, t)); }
+    }
     return e;
   }
   function parseMul(&mut self): Box<Expr> {
@@ -453,6 +463,16 @@ struct Parser {
       self.adv();
       let body: Vec<Stmt> = self.parseBlock();
       return Scope(body);
+    }
+    if (self.at("for")) {               // for (const x of iter) { ... }
+      self.adv(); self.eat("(");
+      if (self.at("const") || self.at("let")) { self.adv(); }
+      let nm: str = self.word();
+      self.eat("of");
+      let it: Box<Expr> = self.parseExpr();
+      self.eat(")");
+      let body: Vec<Stmt> = self.parseBlock();
+      return ForOf(nm, it, body);
     }
     if (self.at("stdout")) {            // stdout.println(e);
       self.adv(); self.eat("."); self.eat("println"); self.eat("(");
@@ -758,7 +778,9 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     CharLit(cp) => { return `(char32_t)${format(cp)}`; }
     Cast(x, t) => { return `(${t})(${emitExpr(x.get(), enums)})`; }
     Some(x) => { return `{ ${emitExpr(x.get(), enums)} }`; }
-    NoneLit => { return "{}"; }
+    NoneLit => { return "std::nullopt"; }
+    TryQ(x) => { return `({ auto _t = (${emitExpr(x.get(), enums)}); if (!mz::is_ok(_t)) return _t; mz::get_val(_t); })`; }
+    TryCast(x, t) => { return `mz::checked_cast<${t}>(${emitExpr(x.get(), enums)})`; }
     OkE(x) => { return `{ true, ${emitExpr(x.get(), enums)} }`; }
     ErrE(x) => { return `{ false, {}, ${emitExpr(x.get(), enums)} }`; }
     OrElse(a, b) => { return `(${emitExpr(a.get(), enums)}).value_or(${emitExpr(b.get(), enums)})`; }
@@ -828,6 +850,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (recv == "Arc" && m == "new") { return `mz::arc_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Atomic" && m == "new") { return emitExpr(args[0].get(), enums); }   // in a struct literal: Atomic.new(0) -> 0 (direct-init the atomic field)
       if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
+      if (recv == "stdin" && m == "lines") { return "mz::stdin_lines_str()"; }
       if (recv == "clock" && m == "now") { return "mz::now_ns()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
       if (m == "fetchAdd") { return `(${emitExpr(o.get(), enums)}).fetch_add(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
@@ -861,6 +884,14 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
           if (ty == "std::thread") { return `${ind}std::thread ${name}(${fn}, ${spawnArgs(&sa, enums)});\n`; }
           return `${ind}${mapType(ty)} ${name}{ std::async(std::launch::async, ${fn}, ${spawnArgs(&sa, enums)}) };\n`;   // Task<R>
         }
+        ArrLit(elems) => {
+          if (ty == "auto") {                  // untyped `let xs = [..]` -> std::to_array deduces element type + N
+            let inner: str = "";
+            let k: u32 = 0;
+            while (k < elems.len) { if (k > 0) { inner = inner + ", "; } inner = inner + emitExpr(elems[k].get(), enums); k = k +% 1; }
+            return `${ind}auto ${name} = std::to_array({ ${inner} });\n`;
+          }
+        }
         MethodCall(o, m, margs) => {
           let rv: str = varName(o.get());
           if (rv == "Atomic" && m == "new") { return `${ind}${mapType(ty)} ${name}{ ${emitExpr(margs[0].get(), enums)} };\n`; }   // non-movable: brace-init in place
@@ -885,6 +916,10 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
     While(c, body) => {
       let inner: str = ind + "  ";
       return `${ind}while (${emitExpr(c.get(), enums)}) {\n${emitBlock(&body, inner, enums)}${ind}}\n`;
+    }
+    ForOf(nm, it, body) => {
+      let inner: str = ind + "  ";
+      return `${ind}for (auto& ${nm} : ${emitExpr(it.get(), enums)}) {\n${emitBlock(&body, inner, enums)}${ind}}\n`;
     }
     Defer(body) => { return `${ind}MZ_DEFER(\n${emitBlock(&body, ind + "  ", enums)}${ind});\n`; }
     Scope(body) => {
@@ -952,9 +987,14 @@ function tprefix(tp: &Vec<str>): str {   // "" or "template <class T, class U>\n
 }
 function emitProto(f: &Func): str { return `${retType(f)} ${f.name}(${paramList(f)});\n`; }
 function emitFunc(f: &Func, enums: &Vec<EnumDef>): str {
+  // main is `int main()`, but mozaic main is void and may `return;` early — wrap the body in a
+  // void IIFE so a bare `return;` exits the lambda, then return 0 from the real main.
+  if (f.name == "main") {
+    let mbody: str = emitBlock(&f.body, "    ", enums);
+    return `int main() {\n  ([&]() -> void {\n${mbody}  })();\n  return 0;\n}\n`;
+  }
   let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f)}) {\n`;
   let body: str = emitBlock(&f.body, "  ", enums);
-  if (f.name == "main") { body = body + "  return 0;\n"; }
   return sig + body + "}\n";
 }
 
