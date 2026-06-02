@@ -1259,12 +1259,97 @@ function emitFunc(f: &Func, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str
   return sig + body + "}\n";
 }
 
+// ---- a minimal validity checker (mozc has no full type/borrow checker; this rejects the structural
+// errors the language forbids: reserved variant names, bad Atomic<T>, atomic in kernels / by-value return,
+// array/slice kernel params). Returns an error message, or "" if the program is structurally valid.
+function containsSub(s: str, sub: str): bool {
+  if (sub.len > s.len) { return false; }
+  let i: u32 = 0;
+  while (i +% sub.len <= s.len) {
+    let j: u32 = 0;
+    let ok: bool = true;
+    while (j < sub.len) { if (s[i +% j] != sub[j]) { ok = false; j = sub.len; } else { j = j +% 1; } }
+    if (ok) { return true; }
+    i = i +% 1;
+  }
+  return false;
+}
+function validAtomicT(t: str): bool {
+  return t == "uint32_t" || t == "int32_t" || t == "uint64_t" || t == "int64_t";
+}
+function checkTypeStr(ty: str): str {   // Atomic<T> must hold a word-size integer
+  if (startsWith(ty, "std::atomic<")) {
+    let inner: str = substr(ty, 12, ty.len -% 1);   // strip "std::atomic<" .. ">"
+    if (!validAtomicT(inner)) { return "T must be one of u32, i32, u64, i64"; }
+  }
+  return "";
+}
+function checkBodyTypes(body: &Vec<Stmt>): str {   // validate let-binding types in nested blocks
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v) => { let e: str = checkTypeStr(t); if (e != "") { return e; } }
+      If(c, then, els) => { let a: str = checkBodyTypes(&then); if (a != "") { return a; } let b: str = checkBodyTypes(&els); if (b != "") { return b; } }
+      While(c, wb) => { let e: str = checkBodyTypes(&wb); if (e != "") { return e; } }
+      ForOf(n, it, fb) => { let e: str = checkBodyTypes(&fb); if (e != "") { return e; } }
+      Scope(sb) => { let e: str = checkBodyTypes(&sb); if (e != "") { return e; } }
+      Defer(db) => { let e: str = checkBodyTypes(&db); if (e != "") { return e; } }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { let e: str = checkBodyTypes(&arms[ai].body); if (e != "") { return e; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
+function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<EnumDef>): str {
+  let ei: u32 = 0;
+  while (ei < enums.len) {                          // Ok/Err are reserved for Result
+    let vi: u32 = 0;
+    while (vi < enums[ei].variants.len) {
+      let vn: str = enums[ei].variants[vi].name;
+      if (vn == "Ok" || vn == "Err") { return `'${vn}' is reserved for Result`; }
+      vi = vi +% 1;
+    }
+    ei = ei +% 1;
+  }
+  let fi: u32 = 0;
+  while (fi < funcs.len) {
+    if (containsSub(funcs[fi].ret, "std::atomic")) { return "cannot return an atomic-containing type by value"; }
+    let pi: u32 = 0;
+    while (pi < funcs[fi].params.len) {
+      let pt: str = funcs[fi].params[pi].ty;
+      let te: str = checkTypeStr(pt);
+      if (te != "") { return te; }
+      if (funcs[fi].isKernel) {
+        if (startsWith(pt, "std::array") || startsWith(pt, "mz::Slice")) { return "cannot be an array/slice"; }
+        if (containsSub(pt, "atomic")) { return "Atomic is not supported inside a kernel"; }
+      }
+      pi = pi +% 1;
+    }
+    let be: str = checkBodyTypes(&funcs[fi].body);
+    if (be != "") { return be; }
+    fi = fi +% 1;
+  }
+  let si: u32 = 0;
+  while (si < structs.len) {
+    let sf: u32 = 0;
+    while (sf < structs[si].fields.len) {
+      let te2: str = checkTypeStr(structs[si].fields[sf].ty);
+      if (te2 != "") { return te2; }
+      sf = sf +% 1;
+    }
+    si = si +% 1;
+  }
+  return "";
+}
 function main() {
   let raw: str = stdin.readAll();
   let seen: Vec<str> = Vec.new();
   let src: str = resolveImports(raw, "", &mut seen);   // expand `import "p";` (paths relative to the importing file's dir)
   let p: Parser = Parser { toks: lex(src), pos: 0, structs: Vec.new(), enums: Vec.new(), consts: Vec.new(), noStruct: false };
   let funcs: Vec<Func> = p.parseProgram();
+  let cerr: str = checkProgram(&funcs, &p.structs, &p.enums);   // reject structurally-invalid programs
+  if (cerr != "") { abort(cerr); }
   let out: str = "#include \"mozaic_rt.h\"\n\n";   // runtime brings cstdint/iostream/string/array + mz::Vec/Box/Map
   // forward-declare all user types (so mutually-recursive structs/enums via Box/Vec fields resolve)
   let fe: u32 = 0;
