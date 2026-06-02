@@ -1,11 +1,12 @@
 // mozc — a mozaic-subset compiler WRITTEN IN MOZAIC (M7 self-host).
 // Reads a mozaic program from stdin, compiles it to standalone C++ on stdout.
 // Subset ("μmozaic"): functions + recursion; scalar int/bool types, str, structs (decl/literal/
-// field access), enums + match (tagged unions); let/assign/return/if-else/while; arithmetic
-// (+ - * / %), comparison, logical (&& || !); calls; stdout.println. (Struct-literal fields must
-// be written in declared order.) Pipeline mirrors the real compiler: lex -> parse (Box-recursive
-// AST + Vec lists + struct-method parser) -> emit C++. Verified to compile recursive programs,
-// structs, strings, and enum/match programs to C++ that builds with clang++ and runs correctly.
+// field access), enums + match (tagged unions), fixed arrays [T;N] (literal/index/.len);
+// let/assign/return/if-else/while; arithmetic (+ - * / %), comparison, logical (&& || !); calls;
+// stdout.println. (Struct-literal fields must be written in declared order.) Pipeline mirrors the
+// real compiler: lex -> parse (Box-recursive AST + Vec lists + struct-method parser) -> emit C++.
+// Verified to compile recursive / struct / string / enum-match / array programs to C++ that builds
+// with clang++ and runs correctly.
 
 // ---- tokens ----
 const KNUM: i32 = 0;     // integer literal (ival)
