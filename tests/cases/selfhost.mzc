@@ -60,6 +60,7 @@ enum Stmt {
   Defer(Vec<Stmt>),                  // defer { ... } / defer stmt -> MZ_DEFER(...)
   Scope(Vec<Stmt>),                  // scope { spawn f(..); ... } -> thread vector, join all at block end
   ForOf(str, Box<Expr>, Vec<Stmt>),  // for (const x of iter) { ... } -> range-for
+  Shared(str, str),                  // shared name: T; (threadgroup memory -> kernel param + per-group decl)
 }
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
@@ -465,6 +466,14 @@ struct Parser {
       self.adv();
       let body: Vec<Stmt> = self.parseBlock();
       return Scope(body);
+    }
+    if (self.at("shared")) {            // shared name: T; (workgroup/threadgroup memory)
+      self.adv();
+      let nm: str = self.word();
+      self.eat(":");
+      let ty: str = self.parseType();
+      self.eat(";");
+      return Shared(nm, ty);
     }
     if (self.at("for")) {               // for (const x of iter) { ... }
       self.adv(); self.eat("(");
@@ -984,8 +993,17 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
         while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + `(${lt})(${emitExpr(args[k].get(), enums)})`; k = k +% 1; }   // cast each lane (no narrowing in braced-init)
         return s + "} }";
       }
+      if (name == "barrier") { return "_bar.arrive_and_wait()"; }   // workgroup barrier
       if (name == "launch") {                        // launch(kernel, gridSize, kargs...) -> serial mz::launch
         let kn: str = varName(args[0].get());
+        match args[1].get() {                        // gridGroups(ngrp, gs) -> workgroup launch via the _wg wrapper
+          Call(gn, ga) => {
+            if (gn == "gridGroups") {
+              return `_wg_${kn}(mz::Grid{ (uint32_t)(${emitExpr(ga[0].get(), enums)}) * (uint32_t)(${emitExpr(ga[1].get(), enums)}), 1, 1, (uint32_t)(${emitExpr(ga[1].get(), enums)}), 1, 1 }${launchArgs(&args, 2, enums)})`;
+            }
+          }
+          _ => { }
+        }
         return `mz::launch(${gridArg(args[1].get(), enums)}, [&](uint32_t grid_x, uint32_t grid_y, uint32_t grid_z){ ${kn}(grid_x, grid_y, grid_z${launchArgs(&args, 2, enums)}); })`;
       }
       if (name == "format") { return `mz::fmt(${emitExpr(args[0].get(), enums)})`; }
@@ -1109,6 +1127,7 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
       let inner: str = ind + "  ";
       return `${ind}for (auto& ${nm} : ${emitExpr(it.get(), enums)}) {\n${emitBlock(&body, inner, enums)}${ind}}\n`;
     }
+    Shared(nm, ty) => { return ""; }   // declared per-group in the _wg wrapper; passed in as a param
     Defer(body) => { return `${ind}MZ_DEFER(\n${emitBlock(&body, ind + "  ", enums)}${ind});\n`; }
     Scope(body) => {
       let out: str = `${ind}{\n${ind}  std::vector<std::thread> _sc;\n`;
@@ -1173,10 +1192,55 @@ function tprefix(tp: &Vec<str>): str {   // "" or "template <class T, class U>\n
   while (i < tp.len) { s = s + ", class " + tp[i]; i = i +% 1; }
   return s + ">\n";
 }
-function kernelSig(f: &Func, structs: &Vec<StructDef>): str {   // void name(uint32_t grid_x, grid_y, grid_z [, params])
+function collectShared(body: &Vec<Stmt>): Vec<Param> {   // the `shared` decls in a kernel body
+  let r: Vec<Param> = Vec.new();
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Shared(n, t) => { r.push(Param { name: n, ty: t }); }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return r;
+}
+function kernelSig(f: &Func, structs: &Vec<StructDef>): str {
   let pl: str = paramList(f, structs);
+  let shared: Vec<Param> = collectShared(&f.body);
+  if (shared.len > 0) {   // workgroup kernel: grid + local + group indices, a barrier, and shared arrays
+    let sp: str = "";
+    let i: u32 = 0;
+    while (i < shared.len) { sp = sp + `, ${shared[i].ty}& ${shared[i].name}`; i = i +% 1; }
+    let base: str = `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, uint32_t local_x, uint32_t local_y, uint32_t local_z, uint32_t group_x, uint32_t group_y, uint32_t group_z, std::barrier<>& _bar${sp}`;
+    if (pl == "") { return base + ")"; }
+    return base + ", " + pl + ")";
+  }
   if (pl == "") { return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z)`; }
   return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, ${pl})`;
+}
+// The host-side fan-out for a workgroup kernel: one std::thread per lane, grouped, sharing a barrier
+// and per-group shared arrays. Mirrors the serial Metal threadgroup dispatch on the CPU path.
+function emitWgWrapper(f: &Func, structs: &Vec<StructDef>): str {
+  let shared: Vec<Param> = collectShared(&f.body);
+  let pl: str = paramList(f, structs);
+  let userParams: str = "";
+  if (pl != "") { userParams = ", " + pl; }
+  let out: str = `void _wg_${f.name}(mz::Grid _g${userParams}) {\n`;
+  out = out + "  uint32_t _total = _g.x;\n  uint32_t _gs = _g.tx ? _g.tx : _total;\n  uint32_t _ngrp = _gs ? (_total + _gs - 1) / _gs : 0;\n";
+  out = out + "  for (uint32_t _grp = 0; _grp < _ngrp; _grp++) {\n";
+  let si: u32 = 0;
+  while (si < shared.len) { out = out + `    ${shared[si].ty} ${shared[si].name}{};\n`; si = si +% 1; }
+  out = out + "    std::barrier<> _bar((std::ptrdiff_t)_gs);\n    std::vector<std::thread> _ts;\n";
+  out = out + "    for (uint32_t _l = 0; _l < _gs; _l++) {\n      uint32_t _gid = _grp * _gs + _l;\n";
+  let sn: str = "";
+  let s2: u32 = 0;
+  while (s2 < shared.len) { sn = sn + ", " + shared[s2].name; s2 = s2 +% 1; }
+  let ua: str = "";
+  let ui: u32 = 0;
+  while (ui < f.params.len) { ua = ua + ", " + f.params[ui].name; ui = ui +% 1; }
+  out = out + `      _ts.emplace_back([&, _gid, _l, _grp]{ ${f.name}(_gid, 0u, 0u, _l, 0u, 0u, _grp, 0u, 0u, _bar${sn}${ua}); });\n`;
+  out = out + "    }\n    for (auto& _t : _ts) _t.join();\n  }\n}\n";
+  return out;
 }
 function emitProto(f: &Func, structs: &Vec<StructDef>): str {
   if (f.isKernel) { return kernelSig(f, structs) + ";\n"; }
@@ -1217,6 +1281,16 @@ function main() {
   // non-generic prototypes FIRST, so a comptime const initializer (e.g. const SQ = squares()) can call them.
   let i: u32 = 0;
   while (i < funcs.len) { if (funcs[i].name != "main" && funcs[i].tparams.len == 0) { out = out + emitProto(&funcs[i], &p.structs); } i = i +% 1; }
+  // workgroup wrapper prototypes (definitions come after the kernel bodies; main calls these)
+  let wp: u32 = 0;
+  while (wp < funcs.len) {
+    if (funcs[wp].isKernel && collectShared(&funcs[wp].body).len > 0) {
+      let pl: str = paramList(&funcs[wp], &p.structs);
+      if (pl == "") { out = out + `void _wg_${funcs[wp].name}(mz::Grid);\n`; }
+      else { out = out + `void _wg_${funcs[wp].name}(mz::Grid, ${pl});\n`; }
+    }
+    wp = wp +% 1;
+  }
   out = out + "\n";
   let ci: u32 = 0;
   while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
@@ -1228,5 +1302,8 @@ function main() {
   out = out + "\n";
   let j: u32 = 0;
   while (j < funcs.len) { if (funcs[j].tparams.len == 0) { out = out + emitFunc(&funcs[j], &p.enums, &p.structs); out = out + "\n"; } j = j +% 1; }
+  // workgroup-kernel host wrappers (_wg_*), emitted after the kernel bodies they dispatch.
+  let wj: u32 = 0;
+  while (wj < funcs.len) { if (funcs[wj].isKernel && collectShared(&funcs[wj].body).len > 0) { out = out + emitWgWrapper(&funcs[wj], &p.structs); } wj = wj +% 1; }
   stdout.println(out);
 }
