@@ -1349,6 +1349,83 @@ function isUserStruct(structs: &Vec<StructDef>, ty: str): bool {
   while (i < structs.len) { if (structs[i].name == ty) { return true; } i = i +% 1; }
   return false;
 }
+function baseVar(e: &Expr): str {   // the root variable of a place expression
+  match e { Var(n) => { return n; } Field(o, f) => { return baseVar(o.get()); } Index(o, ix) => { return baseVar(o.get()); } _ => { return ""; } }
+}
+function baseName(ty: str): str {   // "Cell<int32_t>" -> "Cell"
+  let i: u32 = 0;
+  while (i < ty.len) { if (ty[i] == '<') { return substr(ty, 0, i); } i = i +% 1; }
+  return ty;
+}
+function methodIsMut(structs: &Vec<StructDef>, sname: str, m: str): bool {
+  let i: u32 = 0;
+  while (i < structs.len) {
+    if (structs[i].name == sname) {
+      let mi: u32 = 0;
+      while (mi < structs[i].methods.len) { if (structs[i].methods[mi].name == m) { return structs[i].methods[mi].isMut; } mi = mi +% 1; }
+    }
+    i = i +% 1;
+  }
+  return false;
+}
+// Reject mutating a const binding: `&mut c` and `c.mutMethod(...)` where c was declared `const`.
+function checkConstMutExpr(e: &Expr, env: &Vec<Param>, consts: &Vec<str>, structs: &Vec<StructDef>): str {
+  match e {
+    Borrow(bm, inner) => {
+      if (bm) { let bv: str = baseVar(inner.get()); if (bv != "" && contains(consts, bv)) { return `cannot take '&mut ${bv}': it is a const binding`; } }
+      return checkConstMutExpr(inner.get(), env, consts, structs);
+    }
+    MethodCall(o, m, args) => {
+      match o.get() {
+        Var(c) => { if (contains(consts, c) && methodIsMut(structs, baseName(envType(env, c)), m)) { return `'${m}' needs &mut self but '${c}' is immutable`; } }
+        _ => { }
+      }
+      let a: str = checkConstMutExpr(o.get(), env, consts, structs); if (a != "") { return a; }
+      let i: u32 = 0; while (i < args.len) { let z: str = checkConstMutExpr(args[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; }
+    }
+    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkConstMutExpr(args[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
+    Bin(op, l, r) => { let a: str = checkConstMutExpr(l.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(r.get(), env, consts, structs); }
+    Not(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    Field(o, f) => { return checkConstMutExpr(o.get(), env, consts, structs); }
+    Index(o, ix) => { let a: str = checkConstMutExpr(o.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(ix.get(), env, consts, structs); }
+    Some(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    OkE(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    ErrE(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    OrElse(a2, b2) => { let a: str = checkConstMutExpr(a2.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(b2.get(), env, consts, structs); }
+    Cast(x, t) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    TryQ(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkConstMutExpr(exprs[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
+    ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkConstMutExpr(els[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
+    StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkConstMutExpr(vals[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
+    _ => { }
+  }
+  return "";
+}
+function checkConstMut(body: &Vec<Stmt>, env: &mut Vec<Param>, consts: &mut Vec<str>, structs: &Vec<StructDef>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v, isConst) => {
+        let a: str = checkConstMutExpr(v.get(), env, consts, structs); if (a != "") { return a; }
+        env.push(Param { name: n, ty: t });
+        if (isConst) { consts.push(n); }
+      }
+      Assign(tg, v) => { let a: str = checkConstMutExpr(tg.get(), env, consts, structs); if (a != "") { return a; } let b: str = checkConstMutExpr(v.get(), env, consts, structs); if (b != "") { return b; } }
+      Ret(v) => { let a: str = checkConstMutExpr(v.get(), env, consts, structs); if (a != "") { return a; } }
+      Print(v) => { let a: str = checkConstMutExpr(v.get(), env, consts, structs); if (a != "") { return a; } }
+      ExprS(v) => { let a: str = checkConstMutExpr(v.get(), env, consts, structs); if (a != "") { return a; } }
+      If(c, then, els) => { let a: str = checkConstMutExpr(c.get(), env, consts, structs); if (a != "") { return a; } let t1: str = checkConstMut(&then, env, consts, structs); if (t1 != "") { return t1; } let t2: str = checkConstMut(&els, env, consts, structs); if (t2 != "") { return t2; } }
+      While(c, wb) => { let a: str = checkConstMutExpr(c.get(), env, consts, structs); if (a != "") { return a; } let t: str = checkConstMut(&wb, env, consts, structs); if (t != "") { return t; } }
+      ForOf(n, it, fb) => { env.push(Param { name: n, ty: "" }); let t: str = checkConstMut(&fb, env, consts, structs); if (t != "") { return t; } }
+      Scope(sb) => { let t: str = checkConstMut(&sb, env, consts, structs); if (t != "") { return t; } }
+      Defer(db) => { let t: str = checkConstMut(&db, env, consts, structs); if (t != "") { return t; } }
+      Match(sc, arms) => { let a: str = checkConstMutExpr(sc.get(), env, consts, structs); if (a != "") { return a; } let ai: u32 = 0; while (ai < arms.len) { let t: str = checkConstMut(&arms[ai].body, env, consts, structs); if (t != "") { return t; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 // The lvalue path of an expression (Var "p", Field "o.a", Index "a[]"), or "" if not a place.
 function lvaluePath(e: &Expr): str {
   match e {
@@ -1553,6 +1630,12 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     while (pj < funcs[fi].params.len) { pe.push(Param { name: funcs[fi].params[pj].name, ty: funcs[fi].params[pj].ty }); pj = pj +% 1; }
     let bce: str = checkStmtsEnv(&funcs[fi].body, &mut pe, structs, false, 0);
     if (bce != "") { return bce; }
+    let ce2: Vec<Param> = Vec.new();
+    let pk: u32 = 0;
+    while (pk < funcs[fi].params.len) { ce2.push(Param { name: funcs[fi].params[pk].name, ty: funcs[fi].params[pk].ty }); pk = pk +% 1; }
+    let consts: Vec<str> = Vec.new();
+    let cm: str = checkConstMut(&funcs[fi].body, &mut ce2, &mut consts, structs);
+    if (cm != "") { return cm; }
     let rt: str = funcs[fi].ret;
     if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
       let lr: Vec<str> = Vec.new();
