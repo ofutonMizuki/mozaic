@@ -14,6 +14,7 @@ const KWORD: i32 = 1;    // identifier or keyword (text)
 const KOP: i32 = 2;      // operator / punctuation (text)
 const KEOF: i32 = 3;     // end of input
 const KSTR: i32 = 4;     // string literal (text = raw content)
+const KCHAR: i32 = 5;    // char literal (ival = codepoint)
 struct Token { kind: i32; text: str; ival: i64; }
 
 // ---- AST ----
@@ -24,6 +25,8 @@ enum Expr {
   Not(Box<Expr>),
   Call(str, Vec<Box<Expr>>),         // function call, OR enum-variant construction (resolved at emit)
   StrLit(str),                       // "..."
+  CharLit(i64),                      // 'a' -> codepoint
+  Cast(Box<Expr>, str),              // e as T
   BoolLit(bool),                     // true / false
   Field(Box<Expr>, str),             // e.field  (.len -> .size())
   Index(Box<Expr>, Box<Expr>),       // e[i]
@@ -83,6 +86,20 @@ function lex(src: str): Vec<Token> {
       }
       i = i +% 1;
       toks.push(Token { kind: KSTR, text: s, ival: 0 });
+    } else if (c == '\'') {          // char literal -> codepoint
+      i = i +% 1;
+      let cp: i64 = 0;
+      if (src[i] == '\\') {
+        i = i +% 1;
+        let e: char = src[i];
+        if (e == 'n') { cp = 10; } else if (e == 't') { cp = 9; } else if (e == 'r') { cp = 13; } else if (e == '0') { cp = 0; } else { cp = (e as u32) as i64; }
+        i = i +% 1;
+      } else {
+        cp = (src[i] as u32) as i64;
+        i = i +% 1;
+      }
+      i = i +% 1;                    // closing quote
+      toks.push(Token { kind: KCHAR, text: "", ival: cp });
     } else {
       // two-character operators first
       let two: str = "";
@@ -129,6 +146,7 @@ struct Parser {
 
   function parsePrimary(&mut self): Box<Expr> {
     if (self.kind() == KNUM) { let v: i64 = self.ival(); self.adv(); return Box.new(Num(v)); }
+    if (self.kind() == KCHAR) { let cp: i64 = self.ival(); self.adv(); return Box.new(CharLit(cp)); }
     if (self.kind() == KSTR) { let s: str = self.text(); self.adv(); return Box.new(StrLit(s)); }
     if (self.text() == "(") { self.adv(); let e: Box<Expr> = self.parseExpr(); self.eat(")"); return e; }
     if (self.text() == "[") {                   // array literal [a, b, c]
@@ -198,11 +216,16 @@ struct Parser {
     if (self.text() == "!") { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
     return self.parsePostfix();
   }
+  function parseCast(&mut self): Box<Expr> {   // e as T (binds tighter than * /)
+    let e: Box<Expr> = self.parseUnary();
+    while (self.text() == "as") { self.adv(); let t: str = self.parseType(); e = Box.new(Cast(e, t)); }
+    return e;
+  }
   function parseMul(&mut self): Box<Expr> {
-    let left: Box<Expr> = self.parseUnary();
+    let left: Box<Expr> = self.parseCast();
     while (self.text() == "*" || self.text() == "/" || self.text() == "%") {
       let op: str = self.word();
-      let right: Box<Expr> = self.parseUnary();
+      let right: Box<Expr> = self.parseCast();
       left = Box.new(Bin(op, left, right));
     }
     return left;
@@ -420,6 +443,7 @@ function mapType(t: str): str {
   if (t == "u64") { return "uint64_t"; }
   if (t == "bool") { return "bool"; }
   if (t == "str") { return "std::string"; }
+  if (t == "char") { return "char32_t"; }
   return t;   // user struct/enum type names pass through unchanged
 }
 function methodParams(m: &Method): str {
@@ -493,6 +517,8 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return name;
     }
     StrLit(s) => { return `"${s}"`; }
+    CharLit(cp) => { return `(char32_t)${format(cp)}`; }
+    Cast(x, t) => { return `(${t})(${emitExpr(x.get(), enums)})`; }
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
