@@ -89,10 +89,16 @@ class Checker {
       else this.borrows.set(name, { mut: a.mut, job });
     });
   }
+  // Sync = safe to share by &T across threads (Atomic / Mutex / Channel / Buffer); everything else
+  // crosses a thread boundary only by value (Send). A bare reference to a non-Sync type would let a
+  // thread outlive its referent, so it is rejected as a spawn-target parameter (Send/Sync, SPEC §5).
+  isSync(t: string): boolean { const inner = refInner(t) ?? t; return bufferElem(inner) !== null || this.hasAtomic(inner) || isSyncShared(inner); }
   // spawn f(args): validate like a call; by-ref params (Buffer / atomic-containing) must be borrowed.
   checkSpawnArgs(call: Extract<Expr, { kind: "Call" }>) {
     if (call.callee.kind !== "Ident" || !this.fns.has(call.callee.name)) { this.err("spawn requires a call to a named function"); return; }
     const sig = this.fns.get(call.callee.name)!;
+    for (const p of sig.params) if (refInner(p.ty) !== null && !this.isSync(p.ty))
+      this.err(`spawn '${call.callee.name}': parameter '${p.name}: ${p.ty}' is a reference to a non-Sync type and cannot cross a thread boundary (share state via Atomic / Mutex / Channel, or move ownership via Arc)`);
     if (call.args.length !== sig.params.length) this.err(`spawn '${call.callee.name}': expected ${sig.params.length} arg(s), got ${call.args.length}`);
     for (let k = 0; k < call.args.length; k++) {
       const a = call.args[k], p = sig.params[k];

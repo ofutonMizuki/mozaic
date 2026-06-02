@@ -1,0 +1,7 @@
+// Negative (M4 Send/Sync): a reference to a non-Sync type cannot be a spawn target's parameter.
+struct Point { x: i32; }
+function bad(p: &Point) { stdout.println(p.x); }
+function main() {
+  let pt: Point = Point { x: 1 };
+  scope { spawn bad(&pt); }
+}
