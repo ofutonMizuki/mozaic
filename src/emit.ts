@@ -1,6 +1,6 @@
 // Code generation: typed AST -> C++ source.
 import type { Program, Stmt, Expr, Param, StructDecl, EnumDecl, FnDecl, KernelDecl, ConstDecl, Method, VarInfo, CTValue } from "./ast.ts";
-import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew, isBoxNew, usesWorkgroup, collectShared } from "./ast.ts";
+import { isInt, isUnsigned, isFloat, isCopy, bufferElem, atomicElem, optInner, resultArgs, sliceElem, arrayParts, refInner, isMutRef, containsAtomic, cppType, ARITH_FN, isBufferNew, isAtomicNew, vecParts, genericArgs, isSyncShared, isArcNew, isMutexNew, isChannelNew, isVecNew, dynVecElem, isMapNew, isBoxNew, usesWorkgroup, collectShared } from "./ast.ts";
 
 let STRUCT_FIELDS = new Map<string, string[]>();
 let STRUCT_FIELD_TYPES = new Map<string, string[]>();   // struct name -> field types (parallel to STRUCT_FIELDS)
@@ -337,6 +337,9 @@ function emitMatch(s: Extract<Stmt, { kind: "Match" }>, ind: string, ctx: string
       out += `${ind}  case ${v.index}: {\n${binds ? binds + "\n" : ""}${body}\n${ind}  break; }\n`;
     }
   }
+  // No `_` arm => the checker proved the match is exhaustive, so no other tag can occur. Telling the
+  // optimizer makes the switch total (it can drop bounds/default handling and assume a case is taken).
+  if (!s.arms.some((a) => a.variant === "_")) out += `${ind}  default: __builtin_unreachable();\n`;
   out += `${ind}  }\n${ind}}`;
   return out;
 }
@@ -420,22 +423,38 @@ function emitStmt(s: Stmt, ind: string, ctx: string): string {
   }
 }
 
-function emitParam(p: Param): string {
-  return isByRef(p.ty) ? `${cppType(p.ty)}& ${p.name}` : `${cppType(p.ty)} ${p.name}`;
+// `__restrict` tells the C++ optimizer "no other pointer reaches this object here" — sound only where the
+// borrow checker (or the language's value semantics) already guarantees it:
+// - &mut T whose referent is NOT a by-ref type: an exclusive borrow (P3 rejects aliasing &/&mut of the
+//   same place), and any other param holding the same object is a by-VALUE copy/move (a distinct C++
+//   object), so no C++ reference aliases it. (We exclude &mut Buffer/Atomic/Mutex/Channel: those CAN be
+//   passed bare-by-ref to another param of the same object — e.g. saxpy(&mut buf, buf) — so they may alias.)
+// - kernel Buffer params: launch checks reject passing one buffer for two params, so they are distinct.
+// A & (shared) param is never restricted: the language allows f(&x, &x) (multiple shared borrows).
+function emitParam(p: Param, restrictBuf = false): string {
+  if (isMutRef(p.ty)) {
+    const r = isByRef(refInner(p.ty)!) ? "" : " __restrict";   // exclude &mut Buffer/Atomic/... (may alias a bare by-ref arg)
+    return `${cppType(p.ty)}${r} ${p.name}`;
+  }
+  if (isByRef(p.ty)) {
+    const r = restrictBuf && bufferElem(p.ty) !== null ? " __restrict" : "";  // kernel buffers are non-aliasing
+    return `${cppType(p.ty)}&${r} ${p.name}`;
+  }
+  return `${cppType(p.ty)} ${p.name}`;
 }
 function emitFn(fn: FnDecl): string {
   const body = fn.body.map((s) => emitStmt(s, "  ", fn.name === "main" ? "main" : (fn.retTy ? "value" : "void"))).join("\n");
   if (fn.name === "main") return `int main() {\n${body}\n  return 0;\n}`;
   const ret = fn.retTy ? cppType(fn.retTy) : "void";
   const tmpl = fn.typeParams && fn.typeParams.length ? `template <${fn.typeParams.map((t) => `class ${t}`).join(", ")}>\n` : "";
-  return `${tmpl}${ret} ${fn.name}(${fn.params.map(emitParam).join(", ")}) {\n${body}\n}`;
+  return `${tmpl}${ret} ${fn.name}(${fn.params.map((p) => emitParam(p)).join(", ")}) {\n${body}\n}`;
 }
 // CPU kernel. A plain kernel is `void k(uint32_t grid_x,y,z, params...)` run by a serial loop.
 // A WORKGROUP kernel additionally takes local_*, group_*, a std::barrier&, and one reference per
 // `shared` array (the per-group threadgroup memory); it is driven by the generated _wg_<k> runner.
 function emitKernel(k: KernelDecl): string {
   const body = k.body.map((s) => emitStmt(s, "  ", "void")).join("\n");
-  const params = k.params.map(emitParam);
+  const params = k.params.map((p) => emitParam(p, true));   // kernel buffers are non-aliasing -> __restrict
   if (WG_KERNELS.has(k.name)) {
     const sh = collectShared(k.body).map((s) => `${cppType(s.ty)}& ${s.name}`);
     const sig = ["uint32_t grid_x", "uint32_t grid_y", "uint32_t grid_z",
@@ -454,7 +473,7 @@ function emitWgRunner(k: KernelDecl): string {
   const shDecls = sh.map((s) => `      ${cppType(s.ty)} ${s.name}{};`).join("\n");
   const callArgs = ["_gid", "0u", "0u", "_l", "0u", "0u", "_grp", "0u", "0u", "_bar",
                     ...sh.map((s) => s.name), ...k.params.map((p) => p.name)];
-  const params = k.params.map(emitParam).join(", ");
+  const params = k.params.map((p) => emitParam(p, true)).join(", ");   // kernel buffers are non-aliasing -> __restrict
   return `void _wg_${k.name}(mz::Grid _g${params ? ", " + params : ""}) {
   uint32_t _total = _g.x;
   uint32_t _gs = _g.tx ? _g.tx : _total;
@@ -600,7 +619,7 @@ function emitMslKernel(k: KernelDecl): string {
   return `#include <metal_stdlib>\nusing namespace metal;\nkernel void ${k.name}(${sig.join("," + indent)}) {\n${body}\n}`;
 }
 function methodSig(m: Method): string {   // return-type name(params) [const]  — &self -> const member
-  return `${m.retTy ? cppType(m.retTy) : "void"} ${m.name}(${m.params.map(emitParam).join(", ")})${m.recv === "&self" ? " const" : ""}`;
+  return `${m.retTy ? cppType(m.retTy) : "void"} ${m.name}(${m.params.map((p) => emitParam(p)).join(", ")})${m.recv === "&self" ? " const" : ""}`;
 }
 function emitTypeDecl(it: StructDecl | EnumDecl): string {
   if (it.kind === "StructDecl") {
@@ -621,7 +640,7 @@ function emitMethodDef(structName: string, m: Method, typeParams: string[] = [])
   const body = m.body.map((s) => emitStmt(s, "  ", m.retTy ? "value" : "void")).join("\n");
   const ret = m.retTy ? cppType(m.retTy) : "void";
   const cv = m.recv === "&self" ? " const" : "";
-  const sig = `(${m.params.map(emitParam).join(", ")})${cv}`;
+  const sig = `(${m.params.map((p) => emitParam(p)).join(", ")})${cv}`;
   if (typeParams.length) {   // out-of-line template member: template <class T> ret Name<T>::m(...) { ... }
     return `template <${typeParams.map((t) => `class ${t}`).join(", ")}>\n${ret} ${structName}<${typeParams.join(", ")}>::${m.name}${sig} {\n${body}\n}`;
   }

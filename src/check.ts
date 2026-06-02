@@ -219,6 +219,20 @@ class Checker {
       }
     }
   }
+  // A kernel may not receive the same buffer for two parameters: distinct buffer NAMES are distinct
+  // objects (no aliasing in the language), so the emitter can mark every kernel buffer param __restrict.
+  checkKernelBuffersDistinct(kname: string, passed: Expr[], kparams: Param[]) {
+    const seen = new Set<string>();
+    passed.forEach((a, k) => {
+      const pt = kparams[k]?.ty;
+      if (!pt || bufferElem(pt) === null) return;
+      const nm = a.kind === "Borrow" && a.expr.kind === "Ident" ? a.expr.name
+               : a.kind === "Ident" ? a.name : null;
+      if (nm === null) return;
+      if (seen.has(nm)) this.err(`launch '${kname}': buffer '${nm}' is passed for more than one parameter; kernel buffer arguments must be distinct (no aliasing)`);
+      seen.add(nm);
+    });
+  }
   // Infer generic type-param bindings by structurally matching a declared param type `pt`
   // (which may mention type params in `tps`) against a concrete argument type `at`.
   inferTypeParam(pt: string, at: string, tps: string[], bind: Map<string, string>): void {
@@ -831,6 +845,7 @@ class Checker {
                 const pt = kparams[k]?.ty;
                 if (pt && !this.assignable(at, pt)) this.err(`launch arg ${k + 1}: cannot pass ${at} as ${pt}`);
               }
+              this.checkKernelBuffersDistinct(kn.name, passed, kparams);
             }
           }
           e.ty = "unit"; return e.ty;
@@ -926,6 +941,7 @@ class Checker {
                 } else if (a.kind === "Borrow") this.err(`launch arg ${k + 1}: scalar '${p.name}' must not be borrowed`);
                 if (!this.assignable(at, p.ty)) this.err(`launch arg ${k + 1}: cannot pass ${at} as ${p.ty}`);
               }
+              this.checkKernelBuffersDistinct(kn.name, passed, kparams);
             }
           }
           e.ty = "Job"; return e.ty;

@@ -1,0 +1,11 @@
+// Negative: a kernel may not receive the same buffer for two parameters. Distinct buffer names are
+// distinct objects, which lets the emitter mark every kernel buffer param __restrict (no aliasing).
+kernel addk(input: Buffer<u32>, output: Buffer<u32>, k: u32) {
+  let i: u32 = grid.x;
+  if (i < output.len) { output[i] = input[i] + k; }
+}
+function main() {
+  let buf: Buffer<u32> = Buffer.shared(4);
+  launch(addk, 4, buf, buf, 10);   // same buffer for input AND output -> would alias the __restrict params
+  stdout.println(buf[0]);
+}
