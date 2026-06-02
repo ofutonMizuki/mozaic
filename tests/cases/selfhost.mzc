@@ -33,7 +33,7 @@ enum Expr {
   BoolLit(bool),                     // true / false
   Field(Box<Expr>, str),             // e.field  (.len -> .size())
   Index(Box<Expr>, Box<Expr>),       // e[i]
-  Borrow(Box<Expr>),                 // &e / &mut e  (erased in emit; C++ refs bind to lvalues)
+  Borrow(bool, Box<Expr>),           // &mut e (true) / &e (false)  (erased in emit; C++ refs bind to lvalues)
   ArrLit(Vec<Box<Expr>>),            // [a, b, c]  (only as an initializer)
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
   MethodCall(Box<Expr>, str, Vec<Box<Expr>>),   // obj.method(args)
@@ -48,7 +48,7 @@ enum Expr {
   TryCast(Box<Expr>, str),                      // e as? T -> mz::checked_cast<T>(e)
 }
 enum Stmt {
-  Let(str, str, Box<Expr>),          // name, mozaic type, value
+  Let(str, str, Box<Expr>, bool),    // name, mozaic type, value, isConst (declared with `const`)
   Assign(Box<Expr>, Box<Expr>),      // lvalue = value  (name / e.field / a[i])
   Ret(Box<Expr>),                    // return value
   RetVoid,                           // return; (no value)
@@ -327,9 +327,10 @@ struct Parser {
     if (self.at("!")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
     if (self.at("&")) {   // &e / &mut e -> Borrow (erased in emit)
       self.adv();
-      if (self.at("mut")) { self.adv(); }
+      let isMut: bool = false;
+      if (self.at("mut")) { self.adv(); isMut = true; }
       let e: Box<Expr> = self.parseUnary();
-      return Box.new(Borrow(e));
+      return Box.new(Borrow(isMut, e));
     }
     return self.parsePostfix();
   }
@@ -396,6 +397,7 @@ struct Parser {
   }
   function parseStmt(&mut self): Stmt {
     if (self.at("let") || self.at("const")) {   // local const is an immutable let; type annotation optional (-> auto)
+      let isConst: bool = self.at("const");
       self.adv();
       let name: str = self.word();
       let ty: str = "auto";
@@ -403,7 +405,7 @@ struct Parser {
       self.eat("=");
       let v: Box<Expr> = self.parseExpr();
       self.eat(";");
-      return Let(name, ty, v);
+      return Let(name, ty, v, isConst);
     }
     if (self.at("return")) {
       self.adv();
@@ -897,7 +899,7 @@ function spawnArgs(args: &Vec<Box<Expr>>, enums: &Vec<EnumDef>): str {   // &x -
   while (i < args.len) {
     if (i > 0) { s = s + ", "; }
     match args[i].get() {
-      Borrow(inner) => { s = s + `std::ref(${emitExpr(inner.get(), enums)})`; }
+      Borrow(bm, inner) => { s = s + `std::ref(${emitExpr(inner.get(), enums)})`; }
       _ => { s = s + emitExpr(args[i].get(), enums); }
     }
     i = i +% 1;
@@ -966,7 +968,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       return `(${emitExpr(o.get(), enums)}).${f}`;
     }
     Index(o, idx) => { return `(${emitExpr(o.get(), enums)})[${emitExpr(idx.get(), enums)}]`; }
-    Borrow(x) => { return emitExpr(x.get(), enums); }   // erase & — the C++ reference param binds to the lvalue
+    Borrow(bm, x) => { return emitExpr(x.get(), enums); }   // erase & — the C++ reference param binds to the lvalue
     ArrLit(elems) => {                          // std::array aggregate needs double braces (recursive for nesting)
       let s: str = "{{ ";
       let ai: u32 = 0;
@@ -1084,7 +1086,7 @@ function emitBlock(body: &Vec<Stmt>, ind: str, enums: &Vec<EnumDef>): str {
 }
 function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
   match s {
-    Let(name, ty, v) => {
+    Let(name, ty, v, isConst) => {
       match v.get() {
         SpawnExpr(fn, sa) => {
           if (ty == "std::thread") { return `${ind}std::thread ${name}(${fn}, ${spawnArgs(&sa, enums)});\n`; }
@@ -1288,7 +1290,7 @@ function checkBodyTypes(body: &Vec<Stmt>): str {   // validate let-binding types
   let i: u32 = 0;
   while (i < body.len) {
     match body[i] {
-      Let(n, t, v) => { let e: str = checkTypeStr(t); if (e != "") { return e; } }
+      Let(n, t, v, c) => { let e: str = checkTypeStr(t); if (e != "") { return e; } }
       If(c, then, els) => { let a: str = checkBodyTypes(&then); if (a != "") { return a; } let b: str = checkBodyTypes(&els); if (b != "") { return b; } }
       While(c, wb) => { let e: str = checkBodyTypes(&wb); if (e != "") { return e; } }
       ForOf(n, it, fb) => { let e: str = checkBodyTypes(&fb); if (e != "") { return e; } }
@@ -1347,6 +1349,44 @@ function isUserStruct(structs: &Vec<StructDef>, ty: str): bool {
   while (i < structs.len) { if (structs[i].name == ty) { return true; } i = i +% 1; }
   return false;
 }
+// The lvalue path of an expression (Var "p", Field "o.a", Index "a[]"), or "" if not a place.
+function lvaluePath(e: &Expr): str {
+  match e {
+    Var(n) => { return n; }
+    Field(o, f) => { let p: str = lvaluePath(o.get()); if (p == "") { return ""; } return p + "." + f; }
+    Index(o, ix) => { let p: str = lvaluePath(o.get()); if (p == "") { return ""; } return p + "[]"; }
+    _ => { return ""; }
+  }
+}
+// In one call, the same place cannot be borrowed &mut twice, nor both & and &mut (disjoint places are OK).
+function checkAliasArgs(args: &Vec<Box<Expr>>): str {
+  let paths: Vec<str> = Vec.new();
+  let muts: Vec<str> = Vec.new();
+  let i: u32 = 0;
+  while (i < args.len) {
+    match args[i].get() {
+      Borrow(bm, inner) => {
+        let p: str = lvaluePath(inner.get());
+        if (p != "") {
+          let j: u32 = 0;
+          while (j < paths.len) {
+            if (paths[j] == p) {
+              let wasMut: bool = (muts[j] == "1");
+              if (wasMut && bm) { return "borrowed as &mut more than once"; }
+              if (wasMut || bm) { return "borrowed both & and &mut"; }
+            }
+            j = j +% 1;
+          }
+          paths.push(p);
+          if (bm) { muts.push("1"); } else { muts.push("0"); }
+        }
+      }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 // Recursively check an expression: a moved value cannot be used; logical operands must be bool; atomics
 // must not be used as plain values; load() may not take a Release/AcqRel order. Recurses everywhere.
 function checkExpr(e: &Expr, env: &Vec<Param>, moved: &Vec<str>): str {
@@ -1373,13 +1413,14 @@ function checkExpr(e: &Expr, env: &Vec<Param>, moved: &Vec<str>): str {
       if (m == "load" && args.len >= 1) {
         match args[0].get() { Var(ord) => { if (ord == "Release" || ord == "AcqRel") { return "load's order must be one of Relaxed, Acquire"; } } _ => { } }
       }
+      let aa: str = checkAliasArgs(&args); if (aa != "") { return aa; }
       let a: str = checkExpr(o.get(), env, moved); if (a != "") { return a; }
       let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; }
     }
-    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
+    Call(n, args) => { let aa: str = checkAliasArgs(&args); if (aa != "") { return aa; } let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
     Field(o, f) => { return checkExpr(o.get(), env, moved); }
     Index(o, ix) => { let a: str = checkExpr(o.get(), env, moved); if (a != "") { return a; } return checkExpr(ix.get(), env, moved); }
-    Borrow(x) => { return checkExpr(x.get(), env, moved); }
+    Borrow(bm, x) => { return checkExpr(x.get(), env, moved); }
     Some(x) => { return checkExpr(x.get(), env, moved); }
     OkE(x) => { return checkExpr(x.get(), env, moved); }
     ErrE(x) => { return checkExpr(x.get(), env, moved); }
@@ -1405,7 +1446,7 @@ function checkStmtsEnv(body: &Vec<Stmt>, env: &mut Vec<Param>, structs: &Vec<Str
   let i: u32 = 0;
   while (i < body.len) {
     match body[i] {
-      Let(n, t, v) => {
+      Let(n, t, v, isConst) => {
         let ce: str = checkExpr(v.get(), env, &moved); if (ce != "") { return ce; }
         if (startsWith(t, "std::optional<")) {                 // no implicit wrap: T? must be init from an optional
           let vt: str = typeOf(v.get(), env);
@@ -1456,15 +1497,15 @@ function checkEscapeBody(body: &Vec<Stmt>, localRefs: &mut Vec<str>): str {
   let i: u32 = 0;
   while (i < body.len) {
     match body[i] {
-      Let(n, t, v) => {
+      Let(n, t, v, c) => {
         let isRef: bool = (t.len > 0 && t[t.len -% 1] == '&');
-        match v.get() { Borrow(b) => { isRef = true; } _ => { } }
+        match v.get() { Borrow(bm, b) => { isRef = true; } _ => { } }
         if (isSliceCall(v.get())) { isRef = true; }
         if (isRef) { localRefs.push(n); }
       }
       Ret(v) => {
         match v.get() {
-          Borrow(b) => { return "reference/slice to local data"; }
+          Borrow(bm, b) => { return "reference/slice to local data"; }
           Var(r) => { if (contains(localRefs, r)) { return "reference/slice to local data"; } }
           _ => { if (isSliceCall(v.get())) { return "reference/slice to local data"; } }
         }
