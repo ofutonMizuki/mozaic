@@ -38,6 +38,11 @@ template <class F> struct DeferGuard {
   ~DeferGuard() { f(); }
 };
 template <class F> DeferGuard<F> defer(F f) { return DeferGuard<F>(f); }
+// MZ_DEFER(stmts...): a uniquely-named defer guard (used by the self-hosted compiler, which has
+// no counter state). __COUNTER__ gives each guard a distinct name; LIFO at enclosing-scope exit.
+#define MZ_DEFER_CAT2(a, b) a##b
+#define MZ_DEFER_CAT(a, b) MZ_DEFER_CAT2(a, b)
+#define MZ_DEFER(...) auto MZ_DEFER_CAT(_mzdef_, __COUNTER__) = mz::defer([&]{ __VA_ARGS__ })
 
 // Monotonic wall-clock in nanoseconds (for `clock.now()` — benchmarking/timing).
 inline uint64_t now_ns() {
