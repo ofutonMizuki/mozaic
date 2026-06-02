@@ -124,6 +124,8 @@ template <class T> struct Box {
 // box_new(v): construct a Box with T deduced from v (used by the self-hosted compiler's emit,
 // which has no type info; the in-language `Box.new(v)` lowers via the type-aware path in emit.ts).
 template <class T> Box<T> box_new(T v) { return Box<T>{ std::make_shared<T>(std::move(v)) }; }
+template <class T> struct Arc;
+template <class T> Arc<T> arc_new(T v);   // defined after Arc (used by the self-hosted compiler's emit)
 
 // Arc<T>: atomically reference-counted shared ownership. clone() hands out another owning handle
 // (refcount++, thread-safe); get() reads the shared, immutable value. Lower than a borrow: an Arc
@@ -133,6 +135,7 @@ template <class T> struct Arc {
   Arc<T> clone() const { return Arc<T>{ p }; }
   const T& get() const { return *p; }
 };
+template <class T> Arc<T> arc_new(T v) { return Arc<T>{ std::make_shared<T>(std::move(v)) }; }
 
 // Mutex<T>: a value guarded by a lock. lock() returns a MutexGuard whose `.val` is the guarded T
 // (read & write under the held lock); the guard releases at scope exit (RAII). Shared by &Mutex<T>.

@@ -211,6 +211,11 @@ struct Parser {
         else if (w == "Box") { r = `mz::Box<${args}>`; }
         else if (w == "Map") { r = `mz::Map<${args}>`; }
         else if (w == "Result") { r = `mz::Result<${args}>`; }
+        else if (w == "Atomic") { r = `std::atomic<${args}>`; }
+        else if (w == "Arc") { r = `mz::Arc<${args}>`; }
+        else if (w == "Mutex") { r = `mz::Mutex<${args}>`; }
+        else if (w == "Channel") { r = `mz::Channel<${args}>`; }
+        else if (w == "Task") { r = `std::future<${args}>`; }
         else { r = `${w}<${args}>`; }
       } else {
         r = mapType(w);
@@ -680,6 +685,11 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     FloatLit(s) => { return s; }
     Var(name) => {
       if (name == "self") { return "(*this)"; }
+      if (name == "Relaxed") { return "std::memory_order_relaxed"; }
+      if (name == "Acquire") { return "std::memory_order_acquire"; }
+      if (name == "Release") { return "std::memory_order_release"; }
+      if (name == "AcqRel") { return "std::memory_order_acq_rel"; }
+      if (name == "SeqCst") { return "std::memory_order_seq_cst"; }
       let vi: VInfo = findVariant(enums, name);
       if (vi.found) { return `${vi.enumName}{ .tag = ${format(vi.tag)} }`; }   // unit variant
       return name;
@@ -754,9 +764,15 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     MethodCall(o, m, args) => {
       let recv: str = varName(o.get());
       if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
+      if (recv == "Arc" && m == "new") { return `mz::arc_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
       if (recv == "clock" && m == "now") { return "mz::now_ns()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
+      if (m == "fetchAdd") { return `(${emitExpr(o.get(), enums)}).fetch_add(${emitExpr(args[0].get(), enums)}, ${emitExpr(args[1].get(), enums)})`; }
+      if (m == "compareExchange") {
+        let ob: str = emitExpr(o.get(), enums);
+        return `([&]{ auto _e = (decltype((${ob}).load(std::memory_order_relaxed)))(${emitExpr(args[0].get(), enums)}); return (${ob}).compare_exchange_strong(_e, ${emitExpr(args[1].get(), enums)}, ${emitExpr(args[2].get(), enums)}, ${emitExpr(args[3].get(), enums)}); }())`;
+      }
       if (m == "unwrap") { return `mz::result_unwrap(${emitExpr(o.get(), enums)})`; }              // Result accessors
       if (m == "unwrapErr") { return `mz::result_unwrap_err(${emitExpr(o.get(), enums)})`; }
       if (m == "isOk") { return `(${emitExpr(o.get(), enums)}).ok`; }
@@ -777,7 +793,15 @@ function emitBlock(body: &Vec<Stmt>, ind: str, enums: &Vec<EnumDef>): str {
 }
 function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
   match s {
-    Let(name, ty, v) => { return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`; }
+    Let(name, ty, v) => {
+      match v.get() {
+        MethodCall(o, m, margs) => {
+          if (varName(o.get()) == "Atomic" && m == "new") { return `${ind}${mapType(ty)} ${name}{ ${emitExpr(margs[0].get(), enums)} };\n`; }   // non-movable: brace-init in place
+        }
+        _ => { }
+      }
+      return `${ind}${mapType(ty)} ${name} = ${emitExpr(v.get(), enums)};\n`;
+    }
     Assign(target, v) => { return `${ind}${emitExpr(target.get(), enums)} = ${emitExpr(v.get(), enums)};\n`; }
     Ret(v) => { return `${ind}return ${emitExpr(v.get(), enums)};\n`; }
     Print(v) => { return `${ind}std::cout << mz::fmt(${emitExpr(v.get(), enums)}) << "\\n";\n`; }   // fmt -> bool/char/str/num uniformly
