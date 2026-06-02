@@ -36,6 +36,11 @@ enum Expr {
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
   MethodCall(Box<Expr>, str, Vec<Box<Expr>>),   // obj.method(args)
   Template(Vec<str>, Vec<Box<Expr>>),           // `lit ${e} lit` ; strings.len == exprs.len + 1
+  Some(Box<Expr>),                              // some(x) -> { x }
+  NoneLit,                                      // none -> {}
+  OkE(Box<Expr>),                               // Ok(x)  -> { true, x }
+  ErrE(Box<Expr>),                              // Err(e) -> { false, {}, e }
+  OrElse(Box<Expr>, Box<Expr>),                 // a ?? b -> (a).value_or(b)
 }
 enum Stmt {
   Let(str, str, Box<Expr>),          // name, mozaic type, value
@@ -130,7 +135,7 @@ function lex(src: str): Vec<Token> {
       // two-character operators first
       let two: str = "";
       if (i +% 1 < n) { two = format(src[i]) + format(src[i +% 1]); }
-      if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>"
+      if (two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>" || two == "??"
           || two == "+%" || two == "-%" || two == "*%" || two == "+|" || two == "-|" || two == "*|") {
         toks.push(Token { kind: KOP, text: two, ival: 0 });
         i = i +% 2;
@@ -163,34 +168,38 @@ struct Parser {
   }
   function word(&mut self): str { let w: str = self.text(); self.adv(); return w; }
   function parseType(&mut self): str {   // returns a C++ type string directly
+    let r: str = "";
     if (self.at("&")) {             // &T -> const T&  /  &mut T -> T&
       self.adv();
       let isMut: bool = false;
       if (self.at("mut")) { self.adv(); isMut = true; }
       let inner: str = self.parseType();
-      if (isMut) { return inner + "&"; }
-      return `const ${inner}&`;
-    }
-    if (self.at("[")) {
+      if (isMut) { r = inner + "&"; } else { r = `const ${inner}&`; }
+    } else if (self.at("[")) {
       self.adv();
       let elem: str = self.parseType();
       self.eat(";");
       let nv: i64 = self.ival(); self.adv();
       self.eat("]");
-      return `std::array<${elem}, ${format(nv)}>`;
+      r = `std::array<${elem}, ${format(nv)}>`;
+    } else {
+      let w: str = self.word();
+      if (self.at("<")) {            // generic: Vec<T> / Box<T> / Map<K,V> / Result<T,E> / user Name<...>
+        self.adv();
+        let args: str = self.parseType();
+        while (self.at(",")) { self.adv(); args = args + ", " + self.parseType(); }
+        self.eat(">");
+        if (w == "Vec") { r = `mz::Vec<${args}>`; }
+        else if (w == "Box") { r = `mz::Box<${args}>`; }
+        else if (w == "Map") { r = `mz::Map<${args}>`; }
+        else if (w == "Result") { r = `mz::Result<${args}>`; }
+        else { r = `${w}<${args}>`; }
+      } else {
+        r = mapType(w);
+      }
     }
-    let w: str = self.word();
-    if (self.at("<")) {              // generic: Vec<T> / Box<T> / Map<K,V> / user Name<...>
-      self.adv();
-      let args: str = self.parseType();
-      while (self.at(",")) { self.adv(); args = args + ", " + self.parseType(); }
-      self.eat(">");
-      if (w == "Vec") { return `mz::Vec<${args}>`; }
-      if (w == "Box") { return `mz::Box<${args}>`; }
-      if (w == "Map") { return `mz::Map<${args}>`; }
-      return `${w}<${args}>`;
-    }
-    return mapType(w);
+    while (self.at("?")) { self.adv(); r = `std::optional<${r}>`; }   // T? -> std::optional<T>
+    return r;
   }
 
   function parsePrimary(&mut self): Box<Expr> {
@@ -212,6 +221,10 @@ struct Parser {
     if (self.kind() == KWORD) {
       if (self.at("true")) { self.adv(); return Box.new(BoolLit(true)); }
       if (self.at("false")) { self.adv(); return Box.new(BoolLit(false)); }
+      if (self.at("none")) { self.adv(); return Box.new(NoneLit); }
+      if (self.at("some")) { self.adv(); self.eat("("); let x: Box<Expr> = self.parseExpr(); self.eat(")"); return Box.new(Some(x)); }
+      if (self.at("Ok")) { self.adv(); self.eat("("); let x: Box<Expr> = self.parseExpr(); self.eat(")"); return Box.new(OkE(x)); }
+      if (self.at("Err")) { self.adv(); self.eat("("); let x: Box<Expr> = self.parseExpr(); self.eat(")"); return Box.new(ErrE(x)); }
       let name: str = self.word();
       if (self.at("(")) {                 // function call / enum-variant construction
         self.adv();
@@ -309,9 +322,14 @@ struct Parser {
     while (self.at("&&")) { self.adv(); let right: Box<Expr> = self.parseCmp(); left = Box.new(Bin("&&", left, right)); }
     return left;
   }
-  function parseExpr(&mut self): Box<Expr> {
+  function parseLogOr(&mut self): Box<Expr> {
     let left: Box<Expr> = self.parseAnd();
     while (self.at("||")) { self.adv(); let right: Box<Expr> = self.parseAnd(); left = Box.new(Bin("||", left, right)); }
+    return left;
+  }
+  function parseExpr(&mut self): Box<Expr> {   // `a ?? b` is the loosest binary
+    let left: Box<Expr> = self.parseLogOr();
+    while (self.at("??")) { self.adv(); let right: Box<Expr> = self.parseLogOr(); left = Box.new(OrElse(left, right)); }
     return left;
   }
 
@@ -639,6 +657,11 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     StrLit(s) => { return `"${cesc(s)}"`; }
     CharLit(cp) => { return `(char32_t)${format(cp)}`; }
     Cast(x, t) => { return `(${t})(${emitExpr(x.get(), enums)})`; }
+    Some(x) => { return `{ ${emitExpr(x.get(), enums)} }`; }
+    NoneLit => { return "{}"; }
+    OkE(x) => { return `{ true, ${emitExpr(x.get(), enums)} }`; }
+    ErrE(x) => { return `{ false, {}, ${emitExpr(x.get(), enums)} }`; }
+    OrElse(a, b) => { return `(${emitExpr(a.get(), enums)}).value_or(${emitExpr(b.get(), enums)})`; }
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
@@ -699,6 +722,10 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
+      if (m == "unwrap") { return `mz::result_unwrap(${emitExpr(o.get(), enums)})`; }              // Result accessors
+      if (m == "unwrapErr") { return `mz::result_unwrap_err(${emitExpr(o.get(), enums)})`; }
+      if (m == "isOk") { return `(${emitExpr(o.get(), enums)}).ok`; }
+      if (m == "isErr") { return `(!(${emitExpr(o.get(), enums)}).ok)`; }
       let s: str = `(${emitExpr(o.get(), enums)}).${m}(`;
       let k: u32 = 0;
       while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + emitExpr(args[k].get(), enums); k = k +% 1; }
