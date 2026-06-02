@@ -192,6 +192,8 @@ function emitExpr(e: Expr): string {
         if (!v) return "{}";
         const ae = ftypes[i] ? atomicElem(ftypes[i]) : null;   // an Atomic field is brace-inited in place (non-movable)
         if (ae !== null && isAtomicNew(v)) return `std::atomic<${cppType(ae)}>{ ${emitExpr((v as Extract<Expr, { kind: "Call" }>).args[0])} }`;
+        // Vec/Map/Channel.new() carry no element type at the call site; use the field type to default-construct.
+        if (ftypes[i] && (isVecNew(v) || isMapNew(v) || isChannelNew(v))) return `${cppType(ftypes[i])}{}`;
         return emitExpr(v);
       });
       return `${cppType(e.ty ?? e.name)}{ ${vals.join(", ")} }`;   // generic -> Name<cppArgs>{...}; plain -> Name{...}

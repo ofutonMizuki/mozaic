@@ -1,5 +1,7 @@
 #include <cstdint>
 #include <iostream>
+#include <string>
+
 
 int64_t inc(int64_t x);
 
