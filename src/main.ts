@@ -69,7 +69,9 @@ function main(): void {
 
   // Compiler + flags are overridable via MZ_CXX / MZ_CXXFLAGS. Default to clang++ on macOS.
   const cxx = process.env.MZ_CXX || (platform() === "darwin" ? "clang++" : "g++");
-  const flags = ["-std=c++20", "-O2", "-I", runtimeDir];
+  // Release builds opt harder (-O3): wrapping overflow has no traps to schedule around and the strict
+  // no-alias/exhaustiveness hints (__restrict / __builtin_unreachable) give -O3 more to work with.
+  const flags = ["-std=c++20", release ? "-O3" : "-O2", "-I", runtimeDir];
   if (release) flags.push("-DMZ_RELEASE");
   if (!metal && platform() !== "darwin") flags.push("-pthread");   // std::thread (spawn) on Linux g++
   if (metal) flags.push("-DMZ_METAL", "-x", "objective-c++", "-fobjc-arc",

@@ -20,6 +20,7 @@ int64_t len(Shape s) {
     int64_t n = _m.Seg_0;
     return n;
   break; }
+  default: __builtin_unreachable();
   } }
   return 0;
 }

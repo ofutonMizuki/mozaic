@@ -378,10 +378,38 @@ template <class T> struct Buffer {
   const T& operator[](uint32_t i) const { return data[i]; }
   uint32_t size() const { return len; }
 };
+// Data-parallel launch: each grid index is an independent invocation (the language's kernel contract —
+// the SAME source runs concurrently on the GPU), so the CPU path runs the index space across all cores.
+// Shared mutable state must go through Atomic; a plain-buffer race here would already race on the GPU.
 template <class F> void launch(Grid g, F fn) {
-  for (uint32_t z = 0; z < g.z; z++)
-    for (uint32_t y = 0; y < g.y; y++)
-      for (uint32_t x = 0; x < g.x; x++) fn(x, y, z);
+  uint64_t total = (uint64_t)g.x * (uint64_t)g.y * (uint64_t)g.z;
+  unsigned nthreads = std::thread::hardware_concurrency();
+  if (nthreads < 2 || total < 8192) {                       // small work: serial (threads aren't worth it)
+    for (uint32_t z = 0; z < g.z; z++)
+      for (uint32_t y = 0; y < g.y; y++)
+        for (uint32_t x = 0; x < g.x; x++) fn(x, y, z);
+    return;
+  }
+  unsigned T = nthreads;
+  if ((uint64_t)T > total) T = (unsigned)total;
+  std::vector<std::thread> ts;
+  ts.reserve(T);
+  if (g.y == 1 && g.z == 1) {                               // 1-D fast path: partition x, no index decode
+    for (unsigned t = 0; t < T; t++) {
+      uint32_t lo = (uint32_t)((uint64_t)g.x * t / T), hi = (uint32_t)((uint64_t)g.x * (t + 1) / T);
+      ts.emplace_back([=]() { for (uint32_t x = lo; x < hi; x++) fn(x, 0u, 0u); });
+    }
+  } else {
+    uint64_t xy = (uint64_t)g.x * (uint64_t)g.y;
+    for (unsigned t = 0; t < T; t++) {
+      uint64_t lo = total * t / T, hi = total * (t + 1) / T;
+      ts.emplace_back([=]() {                                // fn copied; its &-captured buffers stay shared
+        for (uint64_t i = lo; i < hi; i++)
+          fn((uint32_t)(i % g.x), (uint32_t)((i / g.x) % g.y), (uint32_t)(i / xy));
+      });
+    }
+  }
+  for (auto& th : ts) th.join();
 }
 
 // CPU dev.launch runs the loop eagerly, so the Job is already complete; await() is a no-op.

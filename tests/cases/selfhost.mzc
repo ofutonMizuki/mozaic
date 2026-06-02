@@ -788,8 +788,24 @@ function structIsSync(structs: &Vec<StructDef>, name: str): bool {
   }
   return false;
 }
-function paramDecl(ty: str, name: str, structs: &Vec<StructDef>): str {
-  if (isSyncType(ty) || structIsSync(structs, ty)) { return ty + "& " + name; }   // by-ref: shared across threads, never copied
+function isMutRefTy(ty: str): bool {   // explicit &mut T lowers to "T&" (ends with &, not const&)
+  if (ty.len == 0) { return false; }
+  if (ty[ty.len -% 1] != '&') { return false; }
+  return !startsWith(ty, "const ");
+}
+// __restrict tells C++ "no other pointer reaches this object here" — sound where the borrow checker
+// guarantees it. A &mut (non-by-ref) param is exclusive; kernel Buffer params are pairwise-distinct
+// (launch rejects passing one buffer twice). & (shared) and &mut Buffer/Atomic/... are NOT restricted.
+function paramDecl(ty: str, name: str, structs: &Vec<StructDef>, restrictBuf: bool): str {
+  if (isMutRefTy(ty)) {
+    let inner: str = substr(ty, 0, ty.len -% 1);   // drop trailing &
+    if (isSyncType(inner)) { return ty + " " + name; }   // &mut Buffer/Atomic/... may alias a bare arg
+    return ty + " __restrict " + name;                   // &mut non-by-ref: exclusive
+  }
+  if (isSyncType(ty) || structIsSync(structs, ty)) {     // by-ref: shared across threads, never copied
+    if (restrictBuf && startsWith(ty, "mz::Buffer")) { return ty + "& __restrict " + name; }   // kernel buffers: non-aliasing
+    return ty + "& " + name;
+  }
   return ty + " " + name;
 }
 function mapType(t: str): str {
@@ -817,7 +833,7 @@ function mapType(t: str): str {
 function methodParams(m: &Method, structs: &Vec<StructDef>): str {
   let s: str = "";
   let i: u32 = 0;
-  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + paramDecl(m.params[i].ty, m.params[i].name, structs); i = i +% 1; }
+  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + paramDecl(m.params[i].ty, m.params[i].name, structs, false); i = i +% 1; }
   return s;
 }
 function methodRet(m: &Method): str { if (m.ret.len > 0) { return m.ret; } return "void"; }
@@ -1169,6 +1185,11 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
         }
         ai = ai +% 1;
       }
+      // No `_` arm => the checker proved the match exhaustive, so no other tag occurs: tell the optimizer.
+      let hasWild: bool = false;
+      let wi: u32 = 0;
+      while (wi < arms.len) { if (arms[wi].variant == "_") { hasWild = true; } wi = wi +% 1; }
+      if (!hasWild) { out = out + `${ind}default: __builtin_unreachable();\n`; }
       return out + `${ind}} }\n`;
     }
   }
@@ -1179,12 +1200,12 @@ function retType(f: &Func): str {
   if (f.ret.len > 0) { return mapType(f.ret); }
   return "void";
 }
-function paramList(f: &Func, structs: &Vec<StructDef>): str {
+function paramList(f: &Func, structs: &Vec<StructDef>, restrictBuf: bool): str {
   let s: str = "";
   let i: u32 = 0;
   while (i < f.params.len) {
     if (i > 0) { s = s + ", "; }
-    s = s + paramDecl(f.params[i].ty, f.params[i].name, structs);
+    s = s + paramDecl(f.params[i].ty, f.params[i].name, structs, restrictBuf);
     i = i +% 1;
   }
   return s;
@@ -1209,7 +1230,7 @@ function collectShared(body: &Vec<Stmt>): Vec<Param> {   // the `shared` decls i
   return r;
 }
 function kernelSig(f: &Func, structs: &Vec<StructDef>): str {
-  let pl: str = paramList(f, structs);
+  let pl: str = paramList(f, structs, true);   // kernel buffers are non-aliasing -> __restrict
   let shared: Vec<Param> = collectShared(&f.body);
   if (shared.len > 0) {   // workgroup kernel: grid + local + group indices, a barrier, and shared arrays
     let sp: str = "";
@@ -1226,7 +1247,7 @@ function kernelSig(f: &Func, structs: &Vec<StructDef>): str {
 // and per-group shared arrays. Mirrors the serial Metal threadgroup dispatch on the CPU path.
 function emitWgWrapper(f: &Func, structs: &Vec<StructDef>): str {
   let shared: Vec<Param> = collectShared(&f.body);
-  let pl: str = paramList(f, structs);
+  let pl: str = paramList(f, structs, false);
   let userParams: str = "";
   if (pl != "") { userParams = ", " + pl; }
   let out: str = `void _wg_${f.name}(mz::Grid _g${userParams}) {\n`;
@@ -1248,7 +1269,7 @@ function emitWgWrapper(f: &Func, structs: &Vec<StructDef>): str {
 }
 function emitProto(f: &Func, structs: &Vec<StructDef>): str {
   if (f.isKernel) { return kernelSig(f, structs) + ";\n"; }
-  return `${retType(f)} ${f.name}(${paramList(f, structs)});\n`;
+  return `${retType(f)} ${f.name}(${paramList(f, structs, false)});\n`;
 }
 function emitFunc(f: &Func, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str {
   if (f.isKernel) { return kernelSig(f, structs) + ` {\n${emitBlock(&f.body, "  ", enums)}}\n`; }
@@ -1258,7 +1279,7 @@ function emitFunc(f: &Func, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str
     let mbody: str = emitBlock(&f.body, "    ", enums);
     return `int main() {\n  ([&]() -> void {\n${mbody}  })();\n  return 0;\n}\n`;
   }
-  let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f, structs)}) {\n`;
+  let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f, structs, false)}) {\n`;
   let body: str = emitBlock(&f.body, "  ", enums);
   return sig + body + "}\n";
 }
@@ -1829,6 +1850,56 @@ function checkSpawnTasks(body: &Vec<Stmt>, env: &mut Vec<Param>, joined: &Vec<st
   }
   return "";
 }
+// A kernel may not get the same buffer for two parameters (distinct names = distinct objects = no
+// aliasing), which lets the emitter mark every kernel Buffer param __restrict.
+function launchArgName(e: &Expr): str {
+  match e { Borrow(bm, inner) => { return baseVar(inner.get()); } _ => { return baseVar(e); } }
+}
+function launchAliasErr(kname: str, args: &Vec<Box<Expr>>, funcs: &Vec<Func>): str {
+  let kidx: u32 = funcs.len;
+  let ki: u32 = 0;
+  while (ki < funcs.len) { if (funcs[ki].isKernel && funcs[ki].name == kname) { kidx = ki; } ki = ki +% 1; }
+  if (kidx >= funcs.len) { return ""; }
+  let seen: Vec<str> = Vec.new();
+  let k: u32 = 0;
+  while (k < funcs[kidx].params.len && 2 +% k < args.len) {
+    if (startsWith(funcs[kidx].params[k].ty, "mz::Buffer")) {
+      let nm: str = launchArgName(args[2 +% k].get());
+      if (nm != "") {
+        if (contains(&seen, nm)) { return `launch '${kname}': buffer '${nm}' passed for more than one parameter`; }
+        seen.push(nm);
+      }
+    }
+    k = k +% 1;
+  }
+  return "";
+}
+function launchInExpr(e: &Expr, funcs: &Vec<Func>): str {
+  match e {
+    Call(n, args) => { if (n == "launch" && args.len > 0) { return launchAliasErr(varName(args[0].get()), &args, funcs); } }
+    MethodCall(o, m, args) => { if (m == "launch" && args.len > 0) { return launchAliasErr(varName(args[0].get()), &args, funcs); } }
+    _ => { }
+  }
+  return "";
+}
+function checkLaunchStmts(body: &Vec<Stmt>, funcs: &Vec<Func>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v, c) => { let e: str = launchInExpr(v.get(), funcs); if (e != "") { return e; } }
+      ExprS(v) => { let e: str = launchInExpr(v.get(), funcs); if (e != "") { return e; } }
+      If(c, then, els) => { let a: str = checkLaunchStmts(&then, funcs); if (a != "") { return a; } let b: str = checkLaunchStmts(&els, funcs); if (b != "") { return b; } }
+      While(c, wb) => { let a: str = checkLaunchStmts(&wb, funcs); if (a != "") { return a; } }
+      ForOf(n, it, fb) => { let a: str = checkLaunchStmts(&fb, funcs); if (a != "") { return a; } }
+      Scope(sb) => { let a: str = checkLaunchStmts(&sb, funcs); if (a != "") { return a; } }
+      Defer(db) => { let a: str = checkLaunchStmts(&db, funcs); if (a != "") { return a; } }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { let a: str = checkLaunchStmts(&arms[ai].body, funcs); if (a != "") { return a; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<EnumDef>): str {
   let ei: u32 = 0;
   while (ei < enums.len) {                          // Ok/Err are reserved for Result
@@ -1876,6 +1947,8 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     if (st != "") { return st; }
     let bl: str = checkBorrowLiveness(&funcs[fi].body);
     if (bl != "") { return bl; }
+    let le: str = checkLaunchStmts(&funcs[fi].body, funcs);   // kernel buffer args must be distinct (sound __restrict)
+    if (le != "") { return le; }
     let rt: str = funcs[fi].ret;
     if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
       let lr: Vec<str> = Vec.new();
@@ -1924,7 +1997,7 @@ function main() {
   let wp: u32 = 0;
   while (wp < funcs.len) {
     if (funcs[wp].isKernel && collectShared(&funcs[wp].body).len > 0) {
-      let pl: str = paramList(&funcs[wp], &p.structs);
+      let pl: str = paramList(&funcs[wp], &p.structs, false);
       if (pl == "") { out = out + `void _wg_${funcs[wp].name}(mz::Grid);\n`; }
       else { out = out + `void _wg_${funcs[wp].name}(mz::Grid, ${pl});\n`; }
     }
