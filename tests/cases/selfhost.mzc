@@ -192,11 +192,14 @@ struct Parser {
       if (isMut) { r = inner + "&"; } else { r = `const ${inner}&`; }
     } else if (self.at("[")) {
       self.adv();
-      let elem: str = self.parseType();
-      self.eat(";");
-      let nv: i64 = self.ival(); self.adv();
-      self.eat("]");
-      r = `std::array<${elem}, ${format(nv)}>`;
+      if (self.at("]")) { self.adv(); let el: str = self.parseType(); r = `mz::Slice<${el}>`; }   // []T slice
+      else {
+        let elem: str = self.parseType();
+        self.eat(";");
+        let nv: i64 = self.ival(); self.adv();
+        self.eat("]");
+        r = `std::array<${elem}, ${format(nv)}>`;
+      }
     } else {
       let w: str = self.word();
       if (self.at("<")) {            // generic: Vec<T> / Box<T> / Map<K,V> / Result<T,E> / user Name<...>
@@ -697,11 +700,11 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     }
     Index(o, idx) => { return `(${emitExpr(o.get(), enums)})[${emitExpr(idx.get(), enums)}]`; }
     Borrow(x) => { return emitExpr(x.get(), enums); }   // erase & — the C++ reference param binds to the lvalue
-    ArrLit(elems) => {
-      let s: str = "{ ";
+    ArrLit(elems) => {                          // std::array aggregate needs double braces (recursive for nesting)
+      let s: str = "{{ ";
       let ai: u32 = 0;
       while (ai < elems.len) { if (ai > 0) { s = s + ", "; } s = s + emitExpr(elems[ai].get(), enums); ai = ai +% 1; }
-      return s + " }";
+      return s + " }}";
     }
     Bin(op, l, r) => {                          // wrapping/saturating ops lower to native operators
       let a: str = emitExpr(l.get(), enums);
@@ -713,6 +716,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     }
     Call(name, args) => {
       if (name == "format") { return `mz::fmt(${emitExpr(args[0].get(), enums)})`; }
+      if (name == "slice") { return `mz::make_slice(${emitExpr(args[0].get(), enums)})`; }
       if (name == "abort") {
         if (args.len > 0) { return `mz::panic_str(${emitExpr(args[0].get(), enums)})`; }
         return "mz::panic_str(\"aborted\")";

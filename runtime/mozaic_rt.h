@@ -92,7 +92,11 @@ template <class T> struct Slice {
   uint32_t len;
   T& operator[](uint32_t i) { return ptr[i]; }
   const T& operator[](uint32_t i) const { return ptr[i]; }
+  uint32_t size() const { return len; }
 };
+// make_slice(arr): build a Slice over a fixed array, deducing the element type (used by the
+// self-hosted compiler's emit, which has no type info; in-language slice() lowers type-aware in emit.ts).
+template <class T, std::size_t N> Slice<T> make_slice(std::array<T, N>& a) { return Slice<T>{ a.data(), (uint32_t)N }; }
 
 // SIMD vector `<scalar>xN` (e.g. f32x4). A flat, Copy value of N lanes. Lane-wise arithmetic;
 // build via the lane-constructor f32x4(a,b,c,d) or f32x4.splat(s). Indexed by lane: v[i].
