@@ -700,12 +700,25 @@ function startsWith(s: str, pre: str): bool {
   while (i < pre.len) { if (s[i] != pre[i]) { return false; } i = i +% 1; }
   return true;
 }
-// A C++ param type that must be passed by reference (shared, never copied): Buffer/Atomic/Mutex/Channel.
-function isRefParam(ty: str): bool {
+// A C++ type that is Sync/non-copyable, hence passed by reference (shared, never copied).
+function isSyncType(ty: str): bool {
   return startsWith(ty, "mz::Buffer") || startsWith(ty, "std::atomic") || startsWith(ty, "mz::Mutex") || startsWith(ty, "mz::Channel");
 }
-function paramDecl(ty: str, name: str): str {
-  if (isRefParam(ty)) { return ty + "& " + name; }
+// A user struct is Sync if any field is a Sync type (e.g. struct Counter { hits: Atomic<u64> }).
+function structIsSync(structs: &Vec<StructDef>, name: str): bool {
+  let i: u32 = 0;
+  while (i < structs.len) {
+    if (structs[i].name == name) {
+      let fi: u32 = 0;
+      while (fi < structs[i].fields.len) { if (isSyncType(structs[i].fields[fi].ty)) { return true; } fi = fi +% 1; }
+      return false;
+    }
+    i = i +% 1;
+  }
+  return false;
+}
+function paramDecl(ty: str, name: str, structs: &Vec<StructDef>): str {
+  if (isSyncType(ty) || structIsSync(structs, ty)) { return ty + "& " + name; }   // by-ref: shared across threads, never copied
   return ty + " " + name;
 }
 function mapType(t: str): str {
@@ -730,14 +743,14 @@ function mapType(t: str): str {
   if (t == "Job") { return "mz::Job"; }
   return t;   // user struct/enum type names pass through unchanged
 }
-function methodParams(m: &Method): str {
+function methodParams(m: &Method, structs: &Vec<StructDef>): str {
   let s: str = "";
   let i: u32 = 0;
-  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + paramDecl(m.params[i].ty, m.params[i].name); i = i +% 1; }
+  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + paramDecl(m.params[i].ty, m.params[i].name, structs); i = i +% 1; }
   return s;
 }
 function methodRet(m: &Method): str { if (m.ret.len > 0) { return m.ret; } return "void"; }
-function emitStruct(s: &StructDef, enums: &Vec<EnumDef>): str {
+function emitStruct(s: &StructDef, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str {
   let out: str = `${tprefix(&s.tparams)}struct ${s.name} {`;
   let i: u32 = 0;
   while (i < s.fields.len) { out = out + ` ${mapType(s.fields[i].ty)} ${s.fields[i].name};`; i = i +% 1; }
@@ -747,9 +760,9 @@ function emitStruct(s: &StructDef, enums: &Vec<EnumDef>): str {
     let cst: str = "";
     if (!s.methods[mi].isMut) { cst = " const"; }
     if (gen) {                                       // template: method bodies must be inline
-      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}`;
+      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi], structs)})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}`;
     } else {                                         // non-generic: declare here, define out-of-line
-      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst};`;
+      out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi], structs)})${cst};`;
     }
     mi = mi +% 1;
   }
@@ -757,14 +770,14 @@ function emitStruct(s: &StructDef, enums: &Vec<EnumDef>): str {
 }
 // Out-of-line method bodies (after fn prototypes, so a method may call free functions). self -> (*this).
 // Generic structs emit their method bodies inline (in emitStruct), so they are skipped here.
-function emitMethodDefs(s: &StructDef, enums: &Vec<EnumDef>): str {
+function emitMethodDefs(s: &StructDef, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str {
   if (s.tparams.len > 0) { return ""; }
   let out: str = "";
   let mi: u32 = 0;
   while (mi < s.methods.len) {
     let cst: str = "";
     if (!s.methods[mi].isMut) { cst = " const"; }
-    out = out + `${methodRet(&s.methods[mi])} ${s.name}::${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}\n`;
+    out = out + `${methodRet(&s.methods[mi])} ${s.name}::${s.methods[mi].name}(${methodParams(&s.methods[mi], structs)})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}\n`;
     mi = mi +% 1;
   }
   return out;
@@ -1084,12 +1097,12 @@ function retType(f: &Func): str {
   if (f.ret.len > 0) { return mapType(f.ret); }
   return "void";
 }
-function paramList(f: &Func): str {
+function paramList(f: &Func, structs: &Vec<StructDef>): str {
   let s: str = "";
   let i: u32 = 0;
   while (i < f.params.len) {
     if (i > 0) { s = s + ", "; }
-    s = s + paramDecl(f.params[i].ty, f.params[i].name);
+    s = s + paramDecl(f.params[i].ty, f.params[i].name, structs);
     i = i +% 1;
   }
   return s;
@@ -1101,24 +1114,24 @@ function tprefix(tp: &Vec<str>): str {   // "" or "template <class T, class U>\n
   while (i < tp.len) { s = s + ", class " + tp[i]; i = i +% 1; }
   return s + ">\n";
 }
-function kernelSig(f: &Func): str {   // void name(uint32_t grid_x, grid_y, grid_z [, params])
-  let pl: str = paramList(f);
+function kernelSig(f: &Func, structs: &Vec<StructDef>): str {   // void name(uint32_t grid_x, grid_y, grid_z [, params])
+  let pl: str = paramList(f, structs);
   if (pl == "") { return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z)`; }
   return `void ${f.name}(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, ${pl})`;
 }
-function emitProto(f: &Func): str {
-  if (f.isKernel) { return kernelSig(f) + ";\n"; }
-  return `${retType(f)} ${f.name}(${paramList(f)});\n`;
+function emitProto(f: &Func, structs: &Vec<StructDef>): str {
+  if (f.isKernel) { return kernelSig(f, structs) + ";\n"; }
+  return `${retType(f)} ${f.name}(${paramList(f, structs)});\n`;
 }
-function emitFunc(f: &Func, enums: &Vec<EnumDef>): str {
-  if (f.isKernel) { return kernelSig(f) + ` {\n${emitBlock(&f.body, "  ", enums)}}\n`; }
+function emitFunc(f: &Func, enums: &Vec<EnumDef>, structs: &Vec<StructDef>): str {
+  if (f.isKernel) { return kernelSig(f, structs) + ` {\n${emitBlock(&f.body, "  ", enums)}}\n`; }
   // main is `int main()`, but mozaic main is void and may `return;` early — wrap the body in a
   // void IIFE so a bare `return;` exits the lambda, then return 0 from the real main.
   if (f.name == "main") {
     let mbody: str = emitBlock(&f.body, "    ", enums);
     return `int main() {\n  ([&]() -> void {\n${mbody}  })();\n  return 0;\n}\n`;
   }
-  let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f)}) {\n`;
+  let sig: str = `${tprefix(&f.tparams)}${retType(f)} ${f.name}(${paramList(f, structs)}) {\n`;
   let body: str = emitBlock(&f.body, "  ", enums);
   return sig + body + "}\n";
 }
@@ -1138,21 +1151,21 @@ function main() {
   let e: u32 = 0;
   while (e < p.enums.len) { out = out + emitEnum(&p.enums[e]); e = e +% 1; }
   let s: u32 = 0;
-  while (s < p.structs.len) { out = out + emitStruct(&p.structs[s], &p.enums); s = s +% 1; }
+  while (s < p.structs.len) { out = out + emitStruct(&p.structs[s], &p.enums, &p.structs); s = s +% 1; }
   out = out + "\n";
   // non-generic prototypes FIRST, so a comptime const initializer (e.g. const SQ = squares()) can call them.
   let i: u32 = 0;
-  while (i < funcs.len) { if (funcs[i].name != "main" && funcs[i].tparams.len == 0) { out = out + emitProto(&funcs[i]); } i = i +% 1; }
+  while (i < funcs.len) { if (funcs[i].name != "main" && funcs[i].tparams.len == 0) { out = out + emitProto(&funcs[i], &p.structs); } i = i +% 1; }
   out = out + "\n";
   let ci: u32 = 0;
   while (ci < p.consts.len) { out = out + `static const ${p.consts[ci].ty} ${p.consts[ci].name} = ${emitExpr(p.consts[ci].value.get(), &p.enums)};\n`; ci = ci +% 1; }
   out = out + "\n";
   let gj: u32 = 0;
-  while (gj < funcs.len) { if (funcs[gj].tparams.len > 0) { out = out + emitFunc(&funcs[gj], &p.enums); out = out + "\n"; } gj = gj +% 1; }
+  while (gj < funcs.len) { if (funcs[gj].tparams.len > 0) { out = out + emitFunc(&funcs[gj], &p.enums, &p.structs); out = out + "\n"; } gj = gj +% 1; }
   let mj: u32 = 0;
-  while (mj < p.structs.len) { out = out + emitMethodDefs(&p.structs[mj], &p.enums); mj = mj +% 1; }
+  while (mj < p.structs.len) { out = out + emitMethodDefs(&p.structs[mj], &p.enums, &p.structs); mj = mj +% 1; }
   out = out + "\n";
   let j: u32 = 0;
-  while (j < funcs.len) { if (funcs[j].tparams.len == 0) { out = out + emitFunc(&funcs[j], &p.enums); out = out + "\n"; } j = j +% 1; }
+  while (j < funcs.len) { if (funcs[j].tparams.len == 0) { out = out + emitFunc(&funcs[j], &p.enums, &p.structs); out = out + "\n"; } j = j +% 1; }
   stdout.println(out);
 }
