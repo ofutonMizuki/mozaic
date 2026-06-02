@@ -1598,6 +1598,94 @@ function checkEscapeBody(body: &Vec<Stmt>, localRefs: &mut Vec<str>): str {
   }
   return "";
 }
+// A spawn target may not receive a reference to a non-Sync value (it would cross a thread boundary).
+function checkSpawnArgs(args: &Vec<Box<Expr>>, env: &Vec<Param>, structs: &Vec<StructDef>): str {
+  let i: u32 = 0;
+  while (i < args.len) {
+    match args[i].get() {
+      Borrow(bm, inner) => {
+        let ty: str = envType(env, baseVar(inner.get()));
+        if (ty != "" && !isSyncType(ty) && !structIsSync(structs, ty)) { return "cannot cross a thread boundary"; }
+      }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
+function isTaskType(t: str): bool { return t == "std::thread" || startsWith(t, "mz::JoinFuture"); }
+// Collect names of Tasks that are joined — t.join() anywhere in an expression (e.g. `let r = t.join()`).
+function exprJoins(e: &Expr, joined: &mut Vec<str>) {
+  match e {
+    MethodCall(o, m, args) => {
+      if (m == "join") { match o.get() { Var(t) => { joined.push(t); } _ => { } } }
+      exprJoins(o.get(), joined);
+      let i: u32 = 0; while (i < args.len) { exprJoins(args[i].get(), joined); i = i +% 1; }
+    }
+    Bin(op, l, r) => { exprJoins(l.get(), joined); exprJoins(r.get(), joined); }
+    Not(x) => { exprJoins(x.get(), joined); }
+    Field(o, f) => { exprJoins(o.get(), joined); }
+    Index(o, ix) => { exprJoins(o.get(), joined); exprJoins(ix.get(), joined); }
+    Borrow(bm, x) => { exprJoins(x.get(), joined); }
+    Call(n, args) => { let i: u32 = 0; while (i < args.len) { exprJoins(args[i].get(), joined); i = i +% 1; } }
+    Some(x) => { exprJoins(x.get(), joined); }
+    OkE(x) => { exprJoins(x.get(), joined); }
+    ErrE(x) => { exprJoins(x.get(), joined); }
+    OrElse(a, b) => { exprJoins(a.get(), joined); exprJoins(b.get(), joined); }
+    Cast(x, t) => { exprJoins(x.get(), joined); }
+    TryQ(x) => { exprJoins(x.get(), joined); }
+    Template(strs, ex) => { let i: u32 = 0; while (i < ex.len) { exprJoins(ex[i].get(), joined); i = i +% 1; } }
+    _ => { }
+  }
+}
+function collectJoined(body: &Vec<Stmt>, joined: &mut Vec<str>) {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v, c) => { exprJoins(v.get(), joined); }
+      Assign(tg, v) => { exprJoins(v.get(), joined); }
+      Ret(v) => { exprJoins(v.get(), joined); }
+      Print(v) => { exprJoins(v.get(), joined); }
+      ExprS(v) => { exprJoins(v.get(), joined); }
+      If(c, then, els) => { collectJoined(&then, joined); collectJoined(&els, joined); }
+      While(c, wb) => { collectJoined(&wb, joined); }
+      ForOf(n, it, fb) => { collectJoined(&fb, joined); }
+      Scope(sb) => { collectJoined(&sb, joined); }
+      Defer(db) => { collectJoined(&db, joined); }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { collectJoined(&arms[ai].body, joined); ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+}
+// Check spawns: a non-Sync reference may not cross a thread, and a named Task must be joined.
+function checkSpawnTasks(body: &Vec<Stmt>, env: &mut Vec<Param>, joined: &Vec<str>, structs: &Vec<StructDef>): str {
+  let i: u32 = 0;
+  while (i < body.len) {
+    match body[i] {
+      Let(n, t, v, c) => {
+        match v.get() {
+          SpawnExpr(fn, sa) => {
+            let s: str = checkSpawnArgs(&sa, env, structs); if (s != "") { return s; }
+            if (isTaskType(t) && !contains(joined, n)) { return `'${n}' is a Task that was never joined`; }
+          }
+          _ => { }
+        }
+        env.push(Param { name: n, ty: t });
+      }
+      ExprS(v) => { match v.get() { SpawnExpr(fn, sa) => { let s: str = checkSpawnArgs(&sa, env, structs); if (s != "") { return s; } } _ => { } } }
+      If(c, then, els) => { let t1: str = checkSpawnTasks(&then, env, joined, structs); if (t1 != "") { return t1; } let t2: str = checkSpawnTasks(&els, env, joined, structs); if (t2 != "") { return t2; } }
+      While(c, wb) => { let t: str = checkSpawnTasks(&wb, env, joined, structs); if (t != "") { return t; } }
+      ForOf(n, it, fb) => { env.push(Param { name: n, ty: "" }); let t: str = checkSpawnTasks(&fb, env, joined, structs); if (t != "") { return t; } }
+      Scope(sb) => { let t: str = checkSpawnTasks(&sb, env, joined, structs); if (t != "") { return t; } }
+      Defer(db) => { let t: str = checkSpawnTasks(&db, env, joined, structs); if (t != "") { return t; } }
+      Match(sc, arms) => { let ai: u32 = 0; while (ai < arms.len) { let t: str = checkSpawnTasks(&arms[ai].body, env, joined, structs); if (t != "") { return t; } ai = ai +% 1; } }
+      _ => { }
+    }
+    i = i +% 1;
+  }
+  return "";
+}
 function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<EnumDef>): str {
   let ei: u32 = 0;
   while (ei < enums.len) {                          // Ok/Err are reserved for Result
@@ -1636,6 +1724,13 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     let consts: Vec<str> = Vec.new();
     let cm: str = checkConstMut(&funcs[fi].body, &mut ce2, &mut consts, structs);
     if (cm != "") { return cm; }
+    let joined: Vec<str> = Vec.new();
+    collectJoined(&funcs[fi].body, &mut joined);
+    let se: Vec<Param> = Vec.new();
+    let pm: u32 = 0;
+    while (pm < funcs[fi].params.len) { se.push(Param { name: funcs[fi].params[pm].name, ty: funcs[fi].params[pm].ty }); pm = pm +% 1; }
+    let st: str = checkSpawnTasks(&funcs[fi].body, &mut se, &joined, structs);
+    if (st != "") { return st; }
     let rt: str = funcs[fi].ret;
     if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
       let lr: Vec<str> = Vec.new();
