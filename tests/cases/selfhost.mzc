@@ -1308,6 +1308,20 @@ function envType(env: &Vec<Param>, name: str): str {
   while (i > 0) { i = i -% 1; if (env[i].name == name) { return env[i].ty; } }   // innermost binding wins
   return "";
 }
+function envIndex(env: &Vec<Param>, name: str): u32 {   // index of the innermost binding, or env.len if absent
+  let i: u32 = env.len;
+  while (i > 0) { i = i -% 1; if (env[i].name == name) { return i; } }
+  return env.len;
+}
+function isCopy(ty: str): bool {   // scalars copy; structs/strings/containers/optionals move
+  return ty == "int8_t" || ty == "int16_t" || ty == "int32_t" || ty == "int64_t" || ty == "__int128"
+      || ty == "uint8_t" || ty == "uint16_t" || ty == "uint32_t" || ty == "uint64_t" || ty == "unsigned __int128"
+      || ty == "bool" || ty == "char32_t" || ty == "float" || ty == "double" || ty == "_Float16";
+}
+function removeName(v: &mut Vec<str>, name: str) {   // drop name from the moved-set (reassignment revives it)
+  let i: u32 = 0;
+  while (i < v.len) { if (v[i] == name) { v[i] = ""; } i = i +% 1; }   // tombstone (contains() ignores "")
+}
 function typeOf(e: &Expr, env: &Vec<Param>): str {
   match e {
     Num(v) => { return "int32_t"; }
@@ -1328,10 +1342,16 @@ function typeOf(e: &Expr, env: &Vec<Param>): str {
     _ => { return ""; }
   }
 }
-// Recursively check an expression: logical operands must be bool, atomics must not be used as plain
-// values, and load() may not take a Release/AcqRel order. Recurses into every sub-expression.
-function checkExpr(e: &Expr, env: &Vec<Param>): str {
+function isUserStruct(structs: &Vec<StructDef>, ty: str): bool {
+  let i: u32 = 0;
+  while (i < structs.len) { if (structs[i].name == ty) { return true; } i = i +% 1; }
+  return false;
+}
+// Recursively check an expression: a moved value cannot be used; logical operands must be bool; atomics
+// must not be used as plain values; load() may not take a Release/AcqRel order. Recurses everywhere.
+function checkExpr(e: &Expr, env: &Vec<Param>, moved: &Vec<str>): str {
   match e {
+    Var(n) => { if (contains(moved, n)) { return "use of moved value"; } }
     Bin(op, l, r) => {
       if (op == "&&" || op == "||") {
         let lt: str = typeOf(l.get(), env);
@@ -1341,61 +1361,85 @@ function checkExpr(e: &Expr, env: &Vec<Param>): str {
       } else {
         if (startsWith(typeOf(l.get(), env), "std::atomic") || startsWith(typeOf(r.get(), env), "std::atomic")) { return "Atomic can only be accessed via load/store/fetchAdd/compareExchange"; }
       }
-      let a: str = checkExpr(l.get(), env); if (a != "") { return a; }
-      return checkExpr(r.get(), env);
+      let a: str = checkExpr(l.get(), env, moved); if (a != "") { return a; }
+      return checkExpr(r.get(), env, moved);
     }
     Not(x) => {
       let xt: str = typeOf(x.get(), env);
       if (xt != "" && xt != "bool") { return "requires bool operands"; }
-      return checkExpr(x.get(), env);
+      return checkExpr(x.get(), env, moved);
     }
     MethodCall(o, m, args) => {
       if (m == "load" && args.len >= 1) {
         match args[0].get() { Var(ord) => { if (ord == "Release" || ord == "AcqRel") { return "load's order must be one of Relaxed, Acquire"; } } _ => { } }
       }
-      let a: str = checkExpr(o.get(), env); if (a != "") { return a; }
-      let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env); if (z != "") { return z; } i = i +% 1; }
+      let a: str = checkExpr(o.get(), env, moved); if (a != "") { return a; }
+      let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; }
     }
-    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
-    Field(o, f) => { return checkExpr(o.get(), env); }
-    Index(o, ix) => { let a: str = checkExpr(o.get(), env); if (a != "") { return a; } return checkExpr(ix.get(), env); }
-    Borrow(x) => { return checkExpr(x.get(), env); }
-    Some(x) => { return checkExpr(x.get(), env); }
-    OkE(x) => { return checkExpr(x.get(), env); }
-    ErrE(x) => { return checkExpr(x.get(), env); }
-    OrElse(a2, b2) => { let a: str = checkExpr(a2.get(), env); if (a != "") { return a; } return checkExpr(b2.get(), env); }
-    Cast(x, t) => { return checkExpr(x.get(), env); }
-    TryQ(x) => { return checkExpr(x.get(), env); }
-    TryCast(x, t) => { return checkExpr(x.get(), env); }
-    Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkExpr(exprs[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
-    ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkExpr(els[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
-    StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkExpr(vals[i].get(), env); if (z != "") { return z; } i = i +% 1; } }
+    Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkExpr(args[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
+    Field(o, f) => { return checkExpr(o.get(), env, moved); }
+    Index(o, ix) => { let a: str = checkExpr(o.get(), env, moved); if (a != "") { return a; } return checkExpr(ix.get(), env, moved); }
+    Borrow(x) => { return checkExpr(x.get(), env, moved); }
+    Some(x) => { return checkExpr(x.get(), env, moved); }
+    OkE(x) => { return checkExpr(x.get(), env, moved); }
+    ErrE(x) => { return checkExpr(x.get(), env, moved); }
+    OrElse(a2, b2) => { let a: str = checkExpr(a2.get(), env, moved); if (a != "") { return a; } return checkExpr(b2.get(), env, moved); }
+    Cast(x, t) => { return checkExpr(x.get(), env, moved); }
+    TryQ(x) => { return checkExpr(x.get(), env, moved); }
+    TryCast(x, t) => { return checkExpr(x.get(), env, moved); }
+    Template(strs, exprs) => { let i: u32 = 0; while (i < exprs.len) { let z: str = checkExpr(exprs[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
+    ArrLit(els) => { let i: u32 = 0; while (i < els.len) { let z: str = checkExpr(els[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
+    StructLit(n, vals) => { let i: u32 = 0; while (i < vals.len) { let z: str = checkExpr(vals[i].get(), env, moved); if (z != "") { return z; } i = i +% 1; } }
     _ => { }
   }
   return "";
 }
-function checkStmtsEnv(body: &Vec<Stmt>, env: &mut Vec<Param>): str {
+// The bare source variable of an expression that constitutes a move (a plain `let q = p`), else "".
+function moveSourceVar(e: &Expr): str {
+  match e { Var(n) => { return n; } _ => { return ""; } }
+}
+// Walk a statement list maintaining a per-block moved-set; flag use-after-move and moving an outer
+// binding inside a loop. moved-set is local to each block (no leak across branches -> no false positives).
+function checkStmtsEnv(body: &Vec<Stmt>, env: &mut Vec<Param>, structs: &Vec<StructDef>, inLoop: bool, loopStart: u32): str {
+  let moved: Vec<str> = Vec.new();
   let i: u32 = 0;
   while (i < body.len) {
     match body[i] {
       Let(n, t, v) => {
-        let ce: str = checkExpr(v.get(), env); if (ce != "") { return ce; }
+        let ce: str = checkExpr(v.get(), env, &moved); if (ce != "") { return ce; }
         if (startsWith(t, "std::optional<")) {                 // no implicit wrap: T? must be init from an optional
           let vt: str = typeOf(v.get(), env);
           if (vt != "" && vt != "opt") { return "cannot init an optional with a non-optional value"; }
         }
+        let src: str = moveSourceVar(v.get());                 // `let q = p;` moves a user-struct binding p
+        if (src != "" && isUserStruct(structs, envType(env, src))) {
+          if (inLoop && envIndex(env, src) < loopStart) { return `cannot move '${src}' inside a loop`; }
+          moved.push(src);
+        }
         env.push(Param { name: n, ty: t });
       }
-      Assign(tg, v) => { let a: str = checkExpr(tg.get(), env); if (a != "") { return a; } let b: str = checkExpr(v.get(), env); if (b != "") { return b; } }
-      Ret(v) => { return checkExpr(v.get(), env); }
-      Print(v) => { return checkExpr(v.get(), env); }
-      ExprS(v) => { return checkExpr(v.get(), env); }
-      If(c, then, els) => { let a: str = checkExpr(c.get(), env); if (a != "") { return a; } let t1: str = checkStmtsEnv(&then, env); if (t1 != "") { return t1; } return checkStmtsEnv(&els, env); }
-      While(c, wb) => { let a: str = checkExpr(c.get(), env); if (a != "") { return a; } return checkStmtsEnv(&wb, env); }
-      ForOf(n, it, fb) => { env.push(Param { name: n, ty: "" }); return checkStmtsEnv(&fb, env); }
-      Scope(sb) => { return checkStmtsEnv(&sb, env); }
-      Defer(db) => { return checkStmtsEnv(&db, env); }
-      Match(sc, arms) => { let a: str = checkExpr(sc.get(), env); if (a != "") { return a; } let ai: u32 = 0; while (ai < arms.len) { let t: str = checkStmtsEnv(&arms[ai].body, env); if (t != "") { return t; } ai = ai +% 1; } }
+      Assign(tg, v) => {
+        let b: str = checkExpr(v.get(), env, &moved); if (b != "") { return b; }   // RHS reads first (a moved var here is an error)
+        let tn: str = moveSourceVar(tg.get());
+        if (tn != "") { removeName(&mut moved, tn); }                               // `p = ...` is a write; reassigning revives p
+        else { let a: str = checkExpr(tg.get(), env, &moved); if (a != "") { return a; } }   // a[i] / a.f target: its reads still count
+      }
+      Ret(v) => { let a: str = checkExpr(v.get(), env, &moved); if (a != "") { return a; } }
+      Print(v) => { let a: str = checkExpr(v.get(), env, &moved); if (a != "") { return a; } }
+      ExprS(v) => { let a: str = checkExpr(v.get(), env, &moved); if (a != "") { return a; } }
+      If(c, then, els) => {
+        let a: str = checkExpr(c.get(), env, &moved); if (a != "") { return a; }
+        let t1: str = checkStmtsEnv(&then, env, structs, inLoop, loopStart); if (t1 != "") { return t1; }
+        let t2: str = checkStmtsEnv(&els, env, structs, inLoop, loopStart); if (t2 != "") { return t2; }
+      }
+      While(c, wb) => {
+        let a: str = checkExpr(c.get(), env, &moved); if (a != "") { return a; }
+        let t: str = checkStmtsEnv(&wb, env, structs, true, env.len); if (t != "") { return t; }
+      }
+      ForOf(n, it, fb) => { env.push(Param { name: n, ty: "" }); let t: str = checkStmtsEnv(&fb, env, structs, true, env.len); if (t != "") { return t; } }
+      Scope(sb) => { let t: str = checkStmtsEnv(&sb, env, structs, inLoop, loopStart); if (t != "") { return t; } }
+      Defer(db) => { let t: str = checkStmtsEnv(&db, env, structs, inLoop, loopStart); if (t != "") { return t; } }
+      Match(sc, arms) => { let a: str = checkExpr(sc.get(), env, &moved); if (a != "") { return a; } let ai: u32 = 0; while (ai < arms.len) { let t: str = checkStmtsEnv(&arms[ai].body, env, structs, inLoop, loopStart); if (t != "") { return t; } ai = ai +% 1; } }
       _ => { }
     }
     i = i +% 1;
@@ -1466,7 +1510,7 @@ function checkProgram(funcs: &Vec<Func>, structs: &Vec<StructDef>, enums: &Vec<E
     let pe: Vec<Param> = Vec.new();                 // seed the env with the params, then walk the body
     let pj: u32 = 0;
     while (pj < funcs[fi].params.len) { pe.push(Param { name: funcs[fi].params[pj].name, ty: funcs[fi].params[pj].ty }); pj = pj +% 1; }
-    let bce: str = checkStmtsEnv(&funcs[fi].body, &mut pe);
+    let bce: str = checkStmtsEnv(&funcs[fi].body, &mut pe, structs, false, 0);
     if (bce != "") { return bce; }
     let rt: str = funcs[fi].ret;
     if ((rt.len > 0 && rt[rt.len -% 1] == '&') || startsWith(rt, "mz::Slice")) {   // returns a reference/slice
