@@ -29,6 +29,7 @@ enum Expr {
   Index(Box<Expr>, Box<Expr>),       // e[i]
   ArrLit(Vec<Box<Expr>>),            // [a, b, c]  (only as an initializer)
   StructLit(str, Vec<Box<Expr>>),    // Name { f: v, ... } — values in declared field order
+  MethodCall(Box<Expr>, str, Vec<Box<Expr>>),   // obj.method(args)
 }
 enum Stmt {
   Let(str, str, Box<Expr>),          // name, mozaic type, value
@@ -42,8 +43,9 @@ enum Stmt {
 }
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
+struct Method { name: str; isMut: bool; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
 struct Func { name: str; params: Vec<Param>; ret: str; body: Vec<Stmt>; }
-struct StructDef { name: str; fields: Vec<Param>; }
+struct StructDef { name: str; fields: Vec<Param>; methods: Vec<Method>; }
 struct Variant { name: str; payloads: Vec<str>; }   // payload type names ([] = unit variant)
 struct EnumDef { name: str; variants: Vec<Variant>; }
 struct VInfo { found: bool; enumName: str; tag: i32; payloads: Vec<str>; }   // result of a variant lookup
@@ -172,8 +174,23 @@ struct Parser {
   function parsePostfix(&mut self): Box<Expr> {
     let e: Box<Expr> = self.parsePrimary();
     while (self.text() == "." || self.text() == "[") {
-      if (self.text() == ".") { self.adv(); let f: str = self.word(); e = Box.new(Field(e, f)); }
-      else { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
+      if (self.text() == "[") { self.adv(); let idx: Box<Expr> = self.parseExpr(); self.eat("]"); e = Box.new(Index(e, idx)); }
+      else {
+        self.adv();
+        let m: str = self.word();
+        if (self.text() == "(") {                 // method call obj.m(args)
+          self.adv();
+          let args: Vec<Box<Expr>> = Vec.new();
+          if (self.text() != ")") {
+            args.push(self.parseExpr());
+            while (self.text() == ",") { self.adv(); args.push(self.parseExpr()); }
+          }
+          self.eat(")");
+          e = Box.new(MethodCall(e, m, args));
+        } else {
+          e = Box.new(Field(e, m));               // field access obj.f
+        }
+      }
     }
     return e;
   }
@@ -324,17 +341,41 @@ struct Parser {
     let body: Vec<Stmt> = self.parseBlock();
     return Func { name: name, params: params, ret: ret, body: body };
   }
+  function parseMethod(&mut self): Method {
+    self.eat("function");
+    let name: str = self.word();
+    self.eat("(");
+    self.eat("&");
+    let isMut: bool = false;
+    if (self.text() == "mut") { self.adv(); isMut = true; }
+    self.eat("self");
+    let params: Vec<Param> = Vec.new();
+    while (self.text() == ",") {
+      self.adv();
+      let pn: str = self.word(); self.eat(":"); let pt: str = self.parseType();
+      params.push(Param { name: pn, ty: pt });
+    }
+    self.eat(")");
+    let ret: str = "";
+    if (self.text() == ":") { self.adv(); ret = self.parseType(); }
+    let body: Vec<Stmt> = self.parseBlock();
+    return Method { name: name, isMut: isMut, params: params, ret: ret, body: body };
+  }
   function parseStruct(&mut self): StructDef {
     self.eat("struct");
     let name: str = self.word();
     self.eat("{");
     let fields: Vec<Param> = Vec.new();
+    let methods: Vec<Method> = Vec.new();
     while (self.text() != "}") {
-      let fname: str = self.word(); self.eat(":"); let fty: str = self.parseType(); self.eat(";");
-      fields.push(Param { name: fname, ty: fty });
+      if (self.text() == "function") { methods.push(self.parseMethod()); }
+      else {
+        let fname: str = self.word(); self.eat(":"); let fty: str = self.parseType(); self.eat(";");
+        fields.push(Param { name: fname, ty: fty });
+      }
     }
     self.eat("}");
-    return StructDef { name: name, fields: fields };
+    return StructDef { name: name, fields: fields, methods: methods };
   }
   function parseEnum(&mut self): EnumDef {
     self.eat("enum");
@@ -381,11 +422,37 @@ function mapType(t: str): str {
   if (t == "str") { return "std::string"; }
   return t;   // user struct/enum type names pass through unchanged
 }
+function methodParams(m: &Method): str {
+  let s: str = "";
+  let i: u32 = 0;
+  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + m.params[i].ty + " " + m.params[i].name; i = i +% 1; }
+  return s;
+}
+function methodRet(m: &Method): str { if (m.ret.len > 0) { return m.ret; } return "void"; }
 function emitStruct(s: &StructDef): str {
   let out: str = `struct ${s.name} {`;
   let i: u32 = 0;
   while (i < s.fields.len) { out = out + ` ${mapType(s.fields[i].ty)} ${s.fields[i].name};`; i = i +% 1; }
+  let mi: u32 = 0;
+  while (mi < s.methods.len) {                       // method declarations (bodies emitted out-of-line)
+    out = out + ` ${methodRet(&s.methods[mi])} ${s.methods[mi].name}(${methodParams(&s.methods[mi])})`;
+    if (!s.methods[mi].isMut) { out = out + " const"; }
+    out = out + ";";
+    mi = mi +% 1;
+  }
   return out + " };\n";
+}
+// Out-of-line method bodies (after fn prototypes, so a method may call free functions). self -> (*this).
+function emitMethodDefs(s: &StructDef, enums: &Vec<EnumDef>): str {
+  let out: str = "";
+  let mi: u32 = 0;
+  while (mi < s.methods.len) {
+    let cst: str = "";
+    if (!s.methods[mi].isMut) { cst = " const"; }
+    out = out + `${methodRet(&s.methods[mi])} ${s.name}::${s.methods[mi].name}(${methodParams(&s.methods[mi])})${cst} {\n${emitBlock(&s.methods[mi].body, "  ", enums)}}\n`;
+    mi = mi +% 1;
+  }
+  return out;
 }
 // Look up an enum variant by name (so a Call/Var to a variant emits a tagged-union construction).
 function findVariant(enums: &Vec<EnumDef>, name: str): VInfo {
@@ -420,6 +487,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
   match e {
     Num(v) => { return format(v); }
     Var(name) => {
+      if (name == "self") { return "(*this)"; }
       let vi: VInfo = findVariant(enums, name);
       if (vi.found) { return `${vi.enumName}{ .tag = ${format(vi.tag)} }`; }   // unit variant
       return name;
@@ -457,6 +525,12 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       let j: u32 = 0;
       while (j < vals.len) { if (j > 0) { s = s + ", "; } s = s + emitExpr(vals[j].get(), enums); j = j +% 1; }
       return s + " }";
+    }
+    MethodCall(o, m, args) => {
+      let s: str = `(${emitExpr(o.get(), enums)}).${m}(`;
+      let k: u32 = 0;
+      while (k < args.len) { if (k > 0) { s = s + ", "; } s = s + emitExpr(args[k].get(), enums); k = k +% 1; }
+      return s + ")";
     }
   }
   return "0";
@@ -544,6 +618,9 @@ function main() {
   out = out + "\n";
   let i: u32 = 0;
   while (i < funcs.len) { if (funcs[i].name != "main") { out = out + emitProto(&funcs[i]); } i = i +% 1; }
+  out = out + "\n";
+  let mj: u32 = 0;
+  while (mj < p.structs.len) { out = out + emitMethodDefs(&p.structs[mj], &p.enums); mj = mj +% 1; }
   out = out + "\n";
   let j: u32 = 0;
   while (j < funcs.len) { out = out + emitFunc(&funcs[j], &p.enums); out = out + "\n"; j = j +% 1; }
