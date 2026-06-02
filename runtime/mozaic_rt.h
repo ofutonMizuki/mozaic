@@ -480,6 +480,7 @@ template <class T> std::string fmt(const T& x) {
   else if constexpr (std::is_floating_point_v<T>) { std::ostringstream o; o << x; return o.str(); }
   else return std::to_string((long long)(x));
 }
+inline std::string fmt(const char* s) { return std::string(s); }   // non-template overload (avoid pointer->int)
 [[noreturn]] inline void panic_str(const std::string& m) { std::cerr << "mozaic: " << m << "\n"; std::abort(); }
 inline std::string read_all_stdin_str() { std::ostringstream ss; ss << std::cin.rdbuf(); return ss.str(); }
 
