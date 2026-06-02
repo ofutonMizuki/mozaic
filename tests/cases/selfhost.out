@@ -2,15 +2,28 @@
 #include <iostream>
 #include <string>
 
+struct Shape { int tag; int64_t Seg_0; };
+struct Point { int64_t x; int64_t y; };
 
-int64_t inc(int64_t x);
+int64_t len(Shape s);
 
-int64_t inc(int64_t x) {
-  return (x + 1);
+int64_t len(Shape s) {
+  { auto _m = s;
+  switch (_m.tag) {
+  case 0: {
+    return 0;
+  break; }
+  case 1: {
+    int64_t n = _m.Seg_0;
+    return n;
+  break; }
+  } }
+  return 0;
 }
 
 int main() {
-  std::cout << (inc(41)) << "\n";
+  Point p = Point{ 3, 4 };
+  std::cout << (((p).x + len(Shape{ .tag = 1, .Seg_0 = 9 }))) << "\n";
   return 0;
 }
 

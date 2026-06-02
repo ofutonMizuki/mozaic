@@ -1,2 +1,13 @@
-function inc(x: i64): i64 { return x + 1; }
-function main() { stdout.println(inc(41)); }
+struct Point { x: i64; y: i64; }
+enum Shape { Dot, Seg(i64) }
+function len(s: Shape): i64 {
+  match s {
+    Dot => { return 0; }
+    Seg(n) => { return n; }
+  }
+  return 0;
+}
+function main() {
+  let p: Point = Point { x: 3, y: 4 };
+  stdout.println(p.x + len(Seg(9)));
+}
