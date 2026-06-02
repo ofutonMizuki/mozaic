@@ -1,12 +1,12 @@
 // mozc — a mozaic-subset compiler WRITTEN IN MOZAIC (M7 self-host).
 // Reads a mozaic program from stdin, compiles it to standalone C++ on stdout.
-// Subset ("μmozaic"): functions + recursion; scalar int/bool types, str, structs (decl/literal/
-// field access), enums + match (tagged unions), fixed arrays [T;N] (literal/index/.len);
-// let/assign/return/if-else/while; arithmetic (+ - * / %), comparison, logical (&& || !); calls;
-// stdout.println. (Struct-literal fields must be written in declared order.) Pipeline mirrors the
-// real compiler: lex -> parse (Box-recursive AST + Vec lists + struct-method parser) -> emit C++.
-// Verified to compile recursive / struct / string / enum-match / array programs to C++ that builds
-// with clang++ and runs correctly.
+// Subset ("μmozaic"): functions + recursion; int/bool/str/char; structs with methods (&self/
+// &mut self); enums + match (tagged unions); fixed arrays [T;N]; `as` casts; let / assignment to
+// any lvalue (name/field/index) / return / if-else-if / while; arithmetic (+ - * / %), comparison,
+// logical (&& || !); calls; stdout.println. (Struct-literal fields must be written in declared
+// order.) Pipeline mirrors the real compiler: lex -> parse (Box-recursive AST + Vec lists +
+// struct-method parser) -> emit C++. Verified end-to-end (builds with clang++ and runs correctly)
+// on recursive / struct+method / string / char / enum-match / array / mutation programs.
 
 // ---- tokens ----
 const KNUM: i32 = 0;     // integer literal (ival)
