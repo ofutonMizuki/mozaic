@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <fstream>
 #include <barrier>
+#include <thread>
+#include <future>
 
 namespace mz {
 
@@ -142,17 +144,25 @@ template <class T> struct Arc {
 };
 template <class T> Arc<T> arc_new(T v) { return Arc<T>{ std::make_shared<T>(std::move(v)) }; }
 
+// JoinFuture<R>: a result-returning task. join() blocks and returns the value (the self-hosted
+// compiler maps Task<R> here so t.join() is uniform with a void Task's std::thread::join()).
+template <class R> struct JoinFuture {
+  std::future<R> f;
+  R join() { return f.get(); }
+};
+
 // Mutex<T>: a value guarded by a lock. lock() returns a MutexGuard whose `.val` is the guarded T
 // (read & write under the held lock); the guard releases at scope exit (RAII). Shared by &Mutex<T>.
 // std::mutex is non-movable, so a Mutex is constructed in place (like Atomic) and never copied/moved.
 template <class T> struct MutexGuard {
   std::unique_lock<std::mutex> lk;
   T* p;
+  T& val;   // alias of the guarded value (so the self-hosted compiler's `g.val` is a plain field, no type info needed)
 };
 template <class T> struct Mutex {
   std::mutex m;
   T val{};
-  MutexGuard<T> lock() { return MutexGuard<T>{ std::unique_lock<std::mutex>(m), &val }; }
+  MutexGuard<T> lock() { return MutexGuard<T>{ std::unique_lock<std::mutex>(m), &val, val }; }
 };
 
 // Channel<T>: a blocking MPSC queue. send(v) enqueues; recv() blocks until an item is available.
@@ -265,6 +275,7 @@ template <class T> struct Buffer {
   }
   T& operator[](uint32_t i) { return ((T*)buf.contents)[i]; }
   const T& operator[](uint32_t i) const { return ((const T*)buf.contents)[i]; }
+  uint32_t size() const { return len; }
 };
 
 // Device value (kind: 0 = cpu, 1 = gpu). The compute backend is chosen at compile time (--gpu),
@@ -348,6 +359,7 @@ template <class T> struct Buffer {
   Buffer(uint32_t n) : data(n), len(n) {}
   T& operator[](uint32_t i) { return data[i]; }
   const T& operator[](uint32_t i) const { return data[i]; }
+  uint32_t size() const { return len; }
 };
 template <class F> void launch(Grid g, F fn) {
   for (uint32_t z = 0; z < g.z; z++)
@@ -490,6 +502,8 @@ template <class T> std::string fmt(const T& x) {
   else if constexpr (std::is_same_v<T, char>) return std::string(1, x);                      // a byte char -> that character
   else if constexpr (std::is_same_v<T, char32_t>) return encodeUtf8(std::u32string(1, x));    // codepoint -> UTF-8
   else if constexpr (std::is_floating_point_v<T>) { std::ostringstream o; o << x; return o.str(); }
+  else if constexpr (std::is_same_v<T, __int128>) return i128_str(x);                          // 128-bit: no std::to_string
+  else if constexpr (std::is_same_v<T, unsigned __int128>) return u128_str(x);
   else return std::to_string((long long)(x));
 }
 inline std::string fmt(const char* s) { return std::string(s); }   // non-template overload (avoid pointer->int)

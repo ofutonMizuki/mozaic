@@ -43,6 +43,7 @@ enum Expr {
   OkE(Box<Expr>),                               // Ok(x)  -> { true, x }
   ErrE(Box<Expr>),                              // Err(e) -> { false, {}, e }
   OrElse(Box<Expr>, Box<Expr>),                 // a ?? b -> (a).value_or(b)
+  SpawnExpr(str, Vec<Box<Expr>>),               // spawn f(args) — fn name + args (only as a let value)
 }
 enum Stmt {
   Let(str, str, Box<Expr>),          // name, mozaic type, value
@@ -55,6 +56,7 @@ enum Stmt {
   While(Box<Expr>, Vec<Stmt>),
   Match(Box<Expr>, Vec<Arm>),
   Defer(Vec<Stmt>),                  // defer { ... } / defer stmt -> MZ_DEFER(...)
+  Scope(Vec<Stmt>),                  // scope { spawn f(..); ... } -> thread vector, join all at block end
 }
 struct Arm { variant: str; bindings: Vec<str>; body: Vec<Stmt>; }
 struct Param { name: str; ty: str; }
@@ -217,7 +219,8 @@ struct Parser {
         else if (w == "Arc") { r = `mz::Arc<${args}>`; }
         else if (w == "Mutex") { r = `mz::Mutex<${args}>`; }
         else if (w == "Channel") { r = `mz::Channel<${args}>`; }
-        else if (w == "Task") { r = `std::future<${args}>`; }
+        else if (w == "Buffer") { r = `mz::Buffer<${args}>`; }
+        else if (w == "Task") { r = `mz::JoinFuture<${args}>`; }   // Task<R> result-returning task
         else { r = `${w}<${args}>`; }
       } else {
         r = mapType(w);
@@ -247,6 +250,18 @@ struct Parser {
     if (self.kind() == KWORD) {
       if (self.at("true")) { self.adv(); return Box.new(BoolLit(true)); }
       if (self.at("false")) { self.adv(); return Box.new(BoolLit(false)); }
+      if (self.at("spawn")) {                 // spawn f(args)
+        self.adv();
+        let fn: str = self.word();
+        self.eat("(");
+        let sargs: Vec<Box<Expr>> = Vec.new();
+        if (!self.at(")")) {
+          sargs.push(self.parseExpr());
+          while (self.at(",")) { self.adv(); sargs.push(self.parseExpr()); }
+        }
+        self.eat(")");
+        return Box.new(SpawnExpr(fn, sargs));
+      }
       if (self.at("none")) { self.adv(); return Box.new(NoneLit); }
       if (self.at("some")) { self.adv(); self.eat("("); let x: Box<Expr> = self.parseExpr(); self.eat(")"); return Box.new(Some(x)); }
       if (self.at("Ok")) { self.adv(); self.eat("("); let x: Box<Expr> = self.parseExpr(); self.eat(")"); return Box.new(OkE(x)); }
@@ -434,6 +449,11 @@ struct Parser {
       self.eat("}");
       return Match(scrut, arms);
     }
+    if (self.at("scope")) {             // scope { spawn ...; } structured concurrency
+      self.adv();
+      let body: Vec<Stmt> = self.parseBlock();
+      return Scope(body);
+    }
     if (self.at("stdout")) {            // stdout.println(e);
       self.adv(); self.eat("."); self.eat("println"); self.eat("(");
       let e: Box<Expr> = self.parseExpr();
@@ -592,11 +612,27 @@ struct Parser {
 }
 
 // ---- emitter (AST -> C++) ----
+function startsWith(s: str, pre: str): bool {
+  if (pre.len > s.len) { return false; }
+  let i: u32 = 0;
+  while (i < pre.len) { if (s[i] != pre[i]) { return false; } i = i +% 1; }
+  return true;
+}
+// A C++ param type that must be passed by reference (shared, never copied): Buffer/Atomic/Mutex/Channel.
+function isRefParam(ty: str): bool {
+  return startsWith(ty, "mz::Buffer") || startsWith(ty, "std::atomic") || startsWith(ty, "mz::Mutex") || startsWith(ty, "mz::Channel");
+}
+function paramDecl(ty: str, name: str): str {
+  if (isRefParam(ty)) { return ty + "& " + name; }
+  return ty + " " + name;
+}
 function mapType(t: str): str {
   if (t == "i8") { return "int8_t"; }
   if (t == "i16") { return "int16_t"; }
   if (t == "i32") { return "int32_t"; }
   if (t == "i64") { return "int64_t"; }
+  if (t == "i128") { return "__int128"; }
+  if (t == "u128") { return "unsigned __int128"; }
   if (t == "u8") { return "uint8_t"; }
   if (t == "u16") { return "uint16_t"; }
   if (t == "u32") { return "uint32_t"; }
@@ -607,12 +643,13 @@ function mapType(t: str): str {
   if (t == "f16") { return "_Float16"; }
   if (t == "f32") { return "float"; }
   if (t == "f64") { return "double"; }
+  if (t == "Task") { return "std::thread"; }   // void task
   return t;   // user struct/enum type names pass through unchanged
 }
 function methodParams(m: &Method): str {
   let s: str = "";
   let i: u32 = 0;
-  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + m.params[i].ty + " " + m.params[i].name; i = i +% 1; }
+  while (i < m.params.len) { if (i > 0) { s = s + ", "; } s = s + paramDecl(m.params[i].ty, m.params[i].name); i = i +% 1; }
   return s;
 }
 function methodRet(m: &Method): str { if (m.ret.len > 0) { return m.ret; } return "void"; }
@@ -682,6 +719,19 @@ function cesc(s: str): str {
   }
   return out;
 }
+function spawnArgs(args: &Vec<Box<Expr>>, enums: &Vec<EnumDef>): str {   // &x -> std::ref(x) so the thread shares it
+  let s: str = "";
+  let i: u32 = 0;
+  while (i < args.len) {
+    if (i > 0) { s = s + ", "; }
+    match args[i].get() {
+      Borrow(inner) => { s = s + `std::ref(${emitExpr(inner.get(), enums)})`; }
+      _ => { s = s + emitExpr(args[i].get(), enums); }
+    }
+    i = i +% 1;
+  }
+  return s;
+}
 function varName(e: &Expr): str {   // the identifier of a Var expr, else ""
   match e {
     Var(n) => { return n; }
@@ -712,6 +762,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     OkE(x) => { return `{ true, ${emitExpr(x.get(), enums)} }`; }
     ErrE(x) => { return `{ false, {}, ${emitExpr(x.get(), enums)} }`; }
     OrElse(a, b) => { return `(${emitExpr(a.get(), enums)}).value_or(${emitExpr(b.get(), enums)})`; }
+    SpawnExpr(fn, sa) => { return fn; }   // only meaningful as a let value (handled in Let); standalone unused
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
@@ -775,6 +826,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       let recv: str = varName(o.get());
       if (recv == "Box" && m == "new") { return `mz::box_new(${emitExpr(args[0].get(), enums)})`; }
       if (recv == "Arc" && m == "new") { return `mz::arc_new(${emitExpr(args[0].get(), enums)})`; }
+      if (recv == "Atomic" && m == "new") { return emitExpr(args[0].get(), enums); }   // in a struct literal: Atomic.new(0) -> 0 (direct-init the atomic field)
       if (recv == "stdin" && m == "readAll") { return "mz::read_all_stdin_str()"; }
       if (recv == "clock" && m == "now") { return "mz::now_ns()"; }
       if (m == "new" && (recv == "Vec" || recv == "Map" || recv == "Channel")) { return "{}"; }   // default-construct (type from context)
@@ -805,8 +857,15 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
   match s {
     Let(name, ty, v) => {
       match v.get() {
+        SpawnExpr(fn, sa) => {
+          if (ty == "std::thread") { return `${ind}std::thread ${name}(${fn}, ${spawnArgs(&sa, enums)});\n`; }
+          return `${ind}${mapType(ty)} ${name}{ std::async(std::launch::async, ${fn}, ${spawnArgs(&sa, enums)}) };\n`;   // Task<R>
+        }
         MethodCall(o, m, margs) => {
-          if (varName(o.get()) == "Atomic" && m == "new") { return `${ind}${mapType(ty)} ${name}{ ${emitExpr(margs[0].get(), enums)} };\n`; }   // non-movable: brace-init in place
+          let rv: str = varName(o.get());
+          if (rv == "Atomic" && m == "new") { return `${ind}${mapType(ty)} ${name}{ ${emitExpr(margs[0].get(), enums)} };\n`; }   // non-movable: brace-init in place
+          if (rv == "Mutex" && m == "new") { return `${ind}${mapType(ty)} ${name}; ${name}.val = ${emitExpr(margs[0].get(), enums)};\n`; }   // std::mutex non-movable: construct in place, then set
+          if (rv == "Buffer" && m == "shared") { return `${ind}${mapType(ty)} ${name}(${emitExpr(margs[0].get(), enums)});\n`; }
         }
         _ => { }
       }
@@ -828,6 +887,23 @@ function emitStmt(s: &Stmt, ind: str, enums: &Vec<EnumDef>): str {
       return `${ind}while (${emitExpr(c.get(), enums)}) {\n${emitBlock(&body, inner, enums)}${ind}}\n`;
     }
     Defer(body) => { return `${ind}MZ_DEFER(\n${emitBlock(&body, ind + "  ", enums)}${ind});\n`; }
+    Scope(body) => {
+      let out: str = `${ind}{\n${ind}  std::vector<std::thread> _sc;\n`;
+      let i: u32 = 0;
+      while (i < body.len) {
+        match body[i] {
+          ExprS(e) => {
+            match e.get() {
+              SpawnExpr(fn, sa) => { out = out + `${ind}  _sc.emplace_back(${fn}, ${spawnArgs(&sa, enums)});\n`; }
+              _ => { out = out + emitStmt(&body[i], ind + "  ", enums); }
+            }
+          }
+          _ => { out = out + emitStmt(&body[i], ind + "  ", enums); }
+        }
+        i = i +% 1;
+      }
+      return out + `${ind}  for (auto& _t : _sc) _t.join();\n${ind}}\n`;
+    }
     Match(scrut, arms) => {
       let inner: str = ind + "  ";
       let out: str = `${ind}{ auto _m = ${emitExpr(scrut.get(), enums)};\n${ind}switch (_m.tag) {\n`;
@@ -862,7 +938,7 @@ function paramList(f: &Func): str {
   let i: u32 = 0;
   while (i < f.params.len) {
     if (i > 0) { s = s + ", "; }
-    s = s + mapType(f.params[i].ty) + " " + f.params[i].name;
+    s = s + paramDecl(f.params[i].ty, f.params[i].name);
     i = i +% 1;
   }
   return s;
