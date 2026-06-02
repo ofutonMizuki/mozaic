@@ -487,6 +487,13 @@ template <class T> std::string fmt(const T& x) {
 inline std::string fmt(const char* s) { return std::string(s); }   // non-template overload (avoid pointer->int)
 [[noreturn]] inline void panic_str(const std::string& m) { std::cerr << "mozaic: " << m << "\n"; std::abort(); }
 inline std::string read_all_stdin_str() { std::ostringstream ss; ss << std::cin.rdbuf(); return ss.str(); }
+inline std::optional<std::string> read_file_str(const std::string& path) {
+  std::ifstream f(path, std::ios::binary); if (!f) return std::nullopt;
+  std::ostringstream ss; ss << f.rdbuf(); return ss.str();
+}
+inline bool write_file_str(const std::string& path, const std::string& content) {
+  std::ofstream f(path, std::ios::binary); if (!f) return false; f << content; return (bool)f;
+}
 
 } // namespace mz
 
