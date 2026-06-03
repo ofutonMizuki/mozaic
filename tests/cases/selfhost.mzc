@@ -993,7 +993,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       while (ai < elems.len) { if (ai > 0) { s = s + ", "; } s = s + emitExpr(elems[ai].get(), enums); ai = ai +% 1; }
       return s + " }}";
     }
-    Bin(op, l, r) => {                          // wrapping/saturating ops lower to native operators
+    Bin(op, l, r) => {                          // arithmetic lowers to type-deducing runtime helpers
       let a: str = emitExpr(l.get(), enums);
       let b: str = emitExpr(r.get(), enums);
       if (op == "+%") { return `mz::wrap_add(${a}, ${b})`; }   // wrapping (two's complement), left-typed
@@ -1002,7 +1002,13 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (op == "+|") { return `mz::sat_add(${a}, ${b})`; }    // saturating (clamp to type min/max)
       if (op == "-|") { return `mz::sat_sub(${a}, ${b})`; }
       if (op == "*|") { return `mz::sat_mul(${a}, ${b})`; }
-      return `(${a} ${op} ${b})`;
+      // Checked arithmetic: integers trap on overflow in debug / wrap in release; float/str use native op.
+      if (op == "+") { return `mz::chk_add(${a}, ${b})`; }
+      if (op == "-") { return `mz::chk_sub(${a}, ${b})`; }
+      if (op == "*") { return `mz::chk_mul(${a}, ${b})`; }
+      if (op == "/") { return `mz::chk_div(${a}, ${b})`; }
+      if (op == "%") { return `mz::chk_mod(${a}, ${b})`; }
+      return `(${a} ${op} ${b})`;                              // comparisons / logical stay native
     }
     Call(name, args) => {
       let simd: str = simdCpp(name);                 // f32x4(a,b,c,d) lane-constructor

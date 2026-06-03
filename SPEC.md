@@ -1,12 +1,12 @@
 # mozaic 言語仕様書 — v1.0
 
-ステータス: **言語コア完成**(branch `m3-abstraction`、ゴールデン 102/102、セルフホスト不動点到達)。
+ステータス: **言語コア完成**(branch `m3-abstraction`、ゴールデン 105/105、セルフホスト不動点到達)。
 本書は **実装(`src/lexer.ts → parser.ts → check.ts → emit.ts`、ランタイム `runtime/mozaic_rt.h`)の現状に準拠**した
 規範文書である。設計思想は [VISION.md](VISION.md)、到達状況は [ROADMAP.md](ROADMAP.md) を参照。
 
 > 本書は旧 v0.1 草案(M0–M2 対象)を全面改稿し、現に実装されている言語を記述する。実装と乖離していた旧記述
 > (16 進/2 進リテラル `0xFF`/`0b1010`、型接尾辞 `42u8`、`for (c of s.chars())`、三項演算子 `?:` など)は
-> **実装準拠に訂正**した。これらは現状**未実装**である(§16 参照)。
+> **実装準拠に訂正**した。これらは現状**未実装**である(§17 参照)。
 > 変換ターゲットは **C++ 一本**(GPU は Apple Silicon / Metal)。WASM / JS・discrete GPU は長期構想で本書の対象外。
 
 ---
@@ -56,7 +56,8 @@ true  false  as  defer  some  none  comptime  import
 | テンプレート | `` `x=${e}, y=${f}` `` | 補間 `${e}` は各値を `format` で埋め込み、`str` を生成。 |
 
 文字エスケープ: `\n \t \r \0 \' \" \\`。それ以外の `\x` は `x` をそのまま。
-文字列エスケープ: `\n \t \r \" \\`。テンプレートでは `` \` `` `\$` `\\` を解釈。
+文字列エスケープ: `\n \t \r \" \\`。それ以外の `\x` は `x` をそのまま。
+テンプレートのエスケープは `\n \t \r \" \\` に加え、テンプレート固有の `` \` `` と `\$` を解釈(計 7 種)。それ以外の `\x` は `x`。
 
 #### リテラルの型付け
 整数/浮動リテラルは**未確定型**(`intlit` / `floatlit`)として生まれ、文脈の期待型へ適合する(これは*変換ではない*)。
@@ -128,16 +129,19 @@ true  false  as  defer  some  none  comptime  import
 「変換でないもの」は対象外: 数値リテラルの文脈型付け、参照の自動デリファレンス、`&mut T → &T` の縮約。
 
 ### 2.6 キャスト(明示変換)
-| 構文 | 意味 |
-|---|---|
-| `e as T` | スカラ間変換。整数の縮小は切り捨て(ラップ)、浮動→整数は 0 方向丸め、`char`↔`u32` も可。 |
-| `e as? T` | **検査付き**変換 → `T?`(`T` は整数型)。範囲外なら `none`。元は整数/浮動。 |
+| 構文 | ソース | ターゲット | 意味 |
+|---|---|---|---|
+| `e as T` | `int` / `float` / `char` / `bool` | `int` / `float` / `char` | スカラ間変換。整数の縮小は切り捨て(ラップ)、浮動→整数は 0 方向丸め、`char`↔整数、`bool`→整数(`true`=1/`false`=0)も可。 |
+| `e as? T` | `int` / `float` のみ | **`int` のみ** | **検査付き**変換 → `T?`。範囲外なら `none`(`char`/`bool` ソースや非整数ターゲットは不可)。 |
+
+- **`bool` はキャストの*ターゲットにできない***(`x as bool` は不可)。整数→真偽は比較で書く(`n != 0`)。
 
 ```typescript
 const big: i32 = 300;
 stdout.println(big as u8);    // 44(切り捨て)
 stdout.println('A' as u32);   // 65
 stdout.println(66 as char);   // B
+stdout.println(true as i32);  // 1   (bool→int は可)
 let b = 300 as? u8;           // none(範囲外)
 ```
 
@@ -176,8 +180,9 @@ import "modules/mathmod.mzc";
 ```
 
 - メソッド受け手は `self`(ムーブ) / `&self`(共有) / `&mut self`(排他)。
-- 戻り型を省略した関数は値を返さない(ユニット)。`function main()` は値なし必須。
-- 型注釈を省いた `let`/`const` は初期化子から型推論。
+- 戻り型を省略した関数は値を返さない(ユニット)。`function main()` は**引数なし・戻り型なし固定**(本体で `?` は使えない、§17)。
+- **型注釈の規則は宣言位置で異なる**: 関数内の局所 `let`/`const` は注釈を省くと初期化子から推論。
+  一方**トップレベル `const` は型注釈が必須**(`const NAME: T = …;`。§15 の `ConstDecl` を参照)。
 
 ---
 
@@ -222,9 +227,12 @@ function size(s: Shape): f64 {
   return 0.0;
 }
 ```
-- 各アームは `バリアント(束縛, …) => { ブロック }`。束縛は識別子のみ(ネストパターン無し)。
+- 各アームは `バリアント(束縛, …) => { ブロック }`。束縛は識別子のみ(**ネストパターン・整数/`bool` リテラル match は不可**)。
+  `match` は **`enum` 専用**(整数や `bool` の値で分岐するには `if`/`else if` を使う)。
 - `_` をバリアント名に書くとワイルドカード。**網羅性をコンパイル時に検査**(ワイルドカード無しで未カバーのバリアントがあればエラー)。
 - `&Enum` / `&mut Enum` を透過して match できる(自動デリファレンス)。
+- scrutinee の式位置では構造体リテラル `Name { … }` が無効化される(`match foo { … }` を曖昧にしないため)。
+  構造体を判別したいときは一旦 `let s = Name { … };` してから `match s { … }`。
 
 ---
 
@@ -256,11 +264,12 @@ stdout.println(a +| 1);   // 255 (飽和)
 **内部表現は UTF-32**(`char` = 1 コードポイント = 32 ビット固定幅。実装上は `std::u32string`)。
 入出力境界(stdin/stdout/ファイル)でのみ UTF-8 と相互変換する。
 
-- `str` が文字列型。文字列リテラル `"…"` は `str`。
+- **文字列型は `str` 1 つだけ**(別個の `String` 型は存在しない)。文字列リテラル `"…"` は `str`。
 - `.len` は**コードポイント数**(O(1))、`s[i]: char` は O(1) 添字(中間バイト事故が無い)。
 - 連結 `a + b`(新しい文字列)。テンプレート `` `…${e}…` `` は各 `e` を `format` で埋め込む。
 - `format(x): str` — 任意のスカラ/`bool`/`char`/`str` を文字列化する組込み関数。
-- 可変構築: `String.new()` で空文字列、`.push(c: char)` で 1 文字、`.pushStr(s: str)` で連結。
+- 可変構築: `String` は型ではなく**ビルダ API の名前空間**。`String.new()`(型は `str` を返す)で空文字列、
+  `.push(c: char)` で 1 文字追記、`.pushStr(s: str)` で連結。追記には**可変 `let` 束縛が必須**(`const`/共有参照 `&` 越しは不可)。
 - `char` ↔ `u32` は明示キャスト(`c as u32` / `n as char`)。
 
 ```typescript
@@ -281,12 +290,15 @@ stdout.println(s[1]);    // é
 ### 7.1 オプショナル `T?`
 - 生成: `some(v)` / `none`。`none` 単独は文脈型が要る。
 - 既定値: `opt ?? default`(`opt: T?`、結果 `T`)。
-- 失敗伝播: 後置 `?`(`none` なら即 `return none`)。関数の戻り型が `U?` か `Result<U,E>` のとき使える。
+- 失敗伝播: 後置 `?`(`none` なら即 `return none`)。**この `?` は戻り型がオプショナル `U?` の関数でのみ使える**。
+  オプショナルを `Result` 返し関数の中で `?` 伝播することは**できない**(`none → Err` の暗黙変換は無い。
+  `Result` の `?` と optional の `?` は別物で、carrier と関数戻り型が同種でなければエラー)。
 - 比較: `opt == none` / `opt != none`。**`T` を `T?` に暗黙包装しない**(`some(v)` が必要)。
 
 ### 7.2 `Result<T, E>`(組込み `enum Result<T,E> { Ok(T), Err(E) }`)
 - 生成: `Ok(v)` / `Err(e)`。
-- 伝播: 後置 `?`(`Err(e)` なら即 `return Err(e)`)。**暗黙のエラー型変換は無い**(`?` 先と関数の `E` が一致必須)。
+- 伝播: 後置 `?`(`Err(e)` なら即 `return Err(e)`)。**戻り型が同じ `E` の `Result` の関数でのみ使える**。
+  **暗黙のエラー型変換は無い**(carrier の `E` と関数の `E` が一致必須)。
 - 処理: `match`、`.isOk()`/`.isErr()`/`.unwrap()`/`.unwrapErr()`。`unwrap`/`unwrapErr` は不一致時に `abort`。
 
 ```typescript
@@ -301,9 +313,13 @@ function doubleParse(x: i32): Result<i32, str> {
 ```
 
 ### 7.3 回復不能エラー
-- `abort(msg?: str)` / 失敗した `assert(cond: bool, msg?: str)` / 添字範囲外(debug)。
+- `abort(msg?: str)` / 失敗した `assert(cond: bool, msg?: str)`。
 - 即終了(診断は stderr)。**スタック巻き戻しなし** → `abort` 時に `defer`/デストラクタは走らない。
   対して `?` の早期 return は通常の return なので `defer` は走る。
+
+> **境界検査は無い(全ビルド)**: 配列 `[T;N]` / スライス `[]T` / `Buffer<T>` / `Vec<T>` の添字 `[i]` は
+> 生ポインタアクセスで、debug/release を問わず**範囲検査をしない**。範囲外アクセスは**未定義動作 (UB)**。
+> 実行時境界検査は未実装(§17)。安全が要る箇所は呼び出し側で `i < x.len` を確認すること。
 
 ---
 
@@ -438,6 +454,9 @@ function main() {
 - **借用=同期(キーストーン)**: `launch` は引数バッファを借用し `Job` が保持。`await` 前に `&mut` 借用中の
   バッファに CPU が触ると**コンパイルエラー**(`&` 借用は CPU 並走読み可)。
 - 同期 sugar として自由関数 `launch(k, grid, args…)`(即ブロック)もある。
+- **`await` は必須**(`Task.join()` と対称): `Job` がバッファを借用している間、その借用元がスコープを抜ける前に
+  `job.await()` していないと**コンパイルエラー**(`… is still borrowed by job … await/join before it goes out of scope`)。
+  未 await の Job が走ったまま借用元が解放される事態を検査が封じる。
 - `Device.cpu` / `Device.gpu`、実行時選択は `Device.gpu.first() ?? Device.cpu`(`.first(): Device?`)。
 
 ### 10.2 バッファとグリッド
@@ -468,12 +487,18 @@ kernel groupSum(input: Buffer<i32>, output: Buffer<i32>) {
 - **許可**: スカラ/ベクタ演算、`struct`、固定長配列、分岐、有界ループ、`Buffer` 添字、`grid`/`local`/`group`/`barrier`/`shared`。
 - **禁止**: 参照/オプショナル/`Result`/配列・スライスの**引数**(`Buffer<T>` を使う)、`Atomic`、`Mutex`/`Channel`/`Vec`/`Map`/`Box`、
   `spawn`、トップレベル `const` 参照、再帰・動的確保・I/O。
+- **GPU 限界(検査されない落とし穴)**: `i128`/`u128`(および Metal に無い幅)はカーネルでも**検査器に弾かれない**が、
+  `--gpu` では MSL に該当型が無く**コンパイル失敗**しうる。CPU ターゲットでは動く。GPU カーネルでは 32/64bit までに留めること。
 
 ### 10.4 コード生成(CPU / Metal)
 - **CPU**: カーネルは C++ 関数になり、`launch` がグリッドをワーカープールで実行。ワークグループは `std::thread`+`std::barrier` で模倣。
 - **Metal(`--gpu`)**: 同じカーネルを **MSL** に降ろし、`Buffer<T>` を `MTLStorageModeShared` の `MTLBuffer` に。
-  `device` バッファは長さを持たないため `.len` は uniform で別途渡る。`grid.x`→`thread_position_in_grid` 等にマップ。
+  MSL の `device` アドレス空間のバッファポインタ(未実装の `Buffer.device` とは無関係)は長さを持たないため、
+  `.len` は uniform で別途渡る。`grid.x`→`thread_position_in_grid` 等にマップ。
   MSL は実行時 `newLibraryWithSource` でコンパイル(Objective-C++ + システム Metal.framework、metal-cpp 不要)。
+- **数値意味論の差(既知の限界・§0「同格」の明示的例外)**: カーネル既定演算は GPU で**ラップ**(CPU は debug=トラップ)、
+  **ゼロ除算は未定義(UB)**、飽和 `+|`/`-|`/`*|` は**近似**(ネイティブに潰れラップ寄り)になりうる。
+  同名演算が CPU と GPU で結果不一致になりうる点は、§0 の「CPU/GPU 同格」「コスト可視」に対する自覚的な穴で、今後の精緻化対象(§17)。
 
 ---
 
@@ -528,7 +553,7 @@ import "modules/mathmod.mzc";   // インポート元からの相対パス
 | `launch(k, grid, …)` | 同期カーネル起動(§10) |
 
 ### 13.3 型ごとの主なメソッド(再掲)
-- `str`: `.len`、`[i]`、`+`、テンプレート / `String.new()`・`.push(char)`・`.pushStr(str)`。
+- `str`: `.len`、`[i]`、`+`、テンプレート。可変構築は `String.new()`・`.push(char)`・`.pushStr(str)`(`String` は別型でなく `str` のビルダ名前空間、§6)。
 - `Vec<T>`: `.push(v)`、`.pop(): T?`、`.len`、`[i]`。
 - `Map<K,V>`: `.insert(k, v)`、`.get(k): V?`、`.has(k): bool`、`.len`。
 - `Box<T>`: `Box.new(v)`、`.get(): &T`(再帰型のフィールドに使う)。
@@ -549,7 +574,10 @@ import "modules/mathmod.mzc";   // インポート元からの相対パス
 - **並行/デバイス**: `await` 前の `&mut` 借用バッファ参照、`launch` のバッファ別名・引数規約、`spawn` の非 call/非 Sync 参照、`Task` の join 漏れ、裸 `spawn`。
 - **Atomic**: `T` が `u32/i32/u64/i64` 以外、Copy/ムーブ、値として使用、順序不正、`Atomic` を含む型の値返し、`Ok`/`Mutex`/`Arc` への入れ子。
 - **カーネル**: 参照/オプショナル/`Result`/配列・スライスの引数、`Atomic`、`Mutex`/`Channel`/`Vec`/`Map`/`Box`、`spawn`、`shared`/`barrier`/`grid` のカーネル外使用。
-- **その他**: 非網羅 match・未知バリアント・アリティ不一致、予約名(`Ok`/`Err`/ライブラリ総称名)の再定義、`main` の不在/非空シグネチャ、`comptime` でのランタイム値読み・オーバーフロー、テンプレートに非整形可能値、`stdin.lines()` 以外の `for…of`。
+- **その他**: 非網羅 match・未知バリアント・アリティ不一致、予約名の再定義(組込み総称 **7 語** `Arc`/`Mutex`/`Channel`/`MutexGuard`/`Vec`/`Map`/`Box` を `struct`/`enum` 名に使う / `enum` に `Ok`・`Err` バリアントを書く)、`main` の不在・非空シグネチャ、`comptime` でのランタイム値読み・オーバーフロー、テンプレートに非整形可能値、`stdin.lines()` 以外の `for…of`。
+
+> 予約は上記 7 語に限定(§2.4)。`Result`/`Atomic`/`Buffer`/`Task` 等の他の組込み名は型構文で特別扱いされるため、
+> `struct`/`enum` 名としての使用は避けること(再定義ガードの対象外で動作未定義)。
 
 ---
 
@@ -585,16 +613,22 @@ Stmt       = ( "let" | "const" ) Ident [ ":" Type ] "=" Expr ";"
            | "match" Expr "{" { Ident [ "(" Ident { "," Ident } ")" ] "=>" Block } "}"
            | "defer" ( Block | Stmt )
            | "scope" Block
-           | "spawn" Expr ";"
+           | SpawnExpr ";"
            | "shared" Ident ":" Type ";"
            | "break" ";" | "continue" ";"
            | LValue "=" Expr ";"
            | Expr ";" ;
+(* The `match` scrutinee `Expr` is parsed with struct-literals DISABLED (so `match foo { … }`
+   is unambiguous); the same no-struct-literal rule applies to if/while/for head expressions. *)
+SpawnExpr  = "spawn" Ident "(" [ Args ] ")" ;   (* a function call only — no closures *)
 
 Type       = Scalar | Vector | Ident [ "<" Type { "," Type } ">" ]
            | "[" Type ";" Expr "]" | "[" "]" Type
            | "&" [ "mut" ] Type | Type "?" ;
-Vector     = Scalar "x" Int ;
+(* Vector is NOT three tokens: the lexer reads `f32x4` as ONE identifier token, and the
+   type layer recognizes any identifier matching <scalar><"x"><lanes≥2> (e.g. f32x4, i16x8)
+   as a vector type by its spelling. *)
+Vector     = ? identifier of the form <Scalar> "x" <DecimalDigits≥2>, lexed as one token ? ;
 
 Expr       = OrElse ;
 OrElse     = LogicalOr { "??" LogicalOr } ;
@@ -607,10 +641,11 @@ Cast       = Unary { ( "as" | "as?" ) Type } ;
 Unary      = ( "&" [ "mut" ] | "!" | "comptime" ) Unary | Postfix ;
 Postfix    = Primary { "." Ident | "[" Expr "]" | "(" [ Args ] ")" | "?" } ;
 Primary    = Num | Float | Str | Char | Bool | Template
-           | "some" "(" Expr ")" | "none" | Ident "(" Expr ")"   (* Ok/Err *)
-           | "spawn" Ident "(" [ Args ] ")"
+           | "some" "(" Expr ")" | "none"
+           | ( "Ok" | "Err" ) "(" Expr ")"                       (* Result ctors: lexed as ident + call, special-cased *)
+           | SpawnExpr
            | "[" [ Expr { "," Expr } ] "]"
-           | Ident [ "{" { Ident ":" Expr [ "," ] } "}" ]        (* struct literal *)
+           | Ident [ "{" { Ident ":" Expr [ "," ] } "}" ]        (* struct literal; disabled in match/if/while/for heads *)
            | "(" Expr ")" ;
 ```
 
@@ -626,23 +661,52 @@ node src/main.ts build examples/sum.mzc             # build/ に生成
 node src/main.ts run   examples/fib.mzc             # ビルドして実行
 node src/main.ts build x.mzc --release              # 整数オーバーフローを wrap・-O3
 node src/main.ts run   examples/addk_async.mzc --gpu  # Apple Silicon GPU(Metal)
-node tests/run.ts                                   # ゴールデンテスト一式(102/102)
+node tests/run.ts                                   # ゴールデンテスト一式(CPU パス、105/105)
+tests/prove.sh                                      # 3 段証明: CPU + GPU==CPU + 非同期決定性
 ```
 - フラグ: `--release`(最適化・ラップ)、`--gpu`/`--metal`(Metal バックエンド)。
 - 環境変数: `MZ_CXX`(既定 macOS=`clang++`)、`MZ_CXXFLAGS`。
-- ホスト C++ は `-std=c++20`。GPU は Objective-C++ + `-framework Metal -framework Foundation`。
+- ホスト C++ は `-std=c++20`(`__int128`/`_Float16` はコンパイラ拡張に依存。§17)。GPU は Objective-C++ + `-framework Metal -framework Foundation`。
+- 注: `node tests/run.ts` は**常に CPU パスでビルド**する。GPU/Metal の正しさと非同期の決定性は [tests/prove.sh](tests/prove.sh) が別途証明する。
 
 ---
 
-## 17. 未実装 / 将来構想
+## 17. 未実装 / 既知の限界 / 将来構想
 
-本書は実装済みの言語を規範とする。次は**現状未実装**または長期構想:
+本書は実装済みの言語を規範とする。実装の正確な反映として、以下を未実装・既知の限界・長期構想に分けて明記する。
 
+### 17.1 未実装(構文・機能)
+- **ビット演算なし**: `| ^ ~ << >>` は字句にも優先順位表にも無い(`&` は借用専用、`&&`/`||` は論理のみ)。
+  マスク・シフト・ビットパッキングは現状書けない。`Atomic` の RMW も `fetchAdd`/`compareExchange` の 2 つだけで、
+  `fetchSub`/`fetchAnd`/`fetchOr`/`exchange`/`fetchMax` 等は無い。
 - 旧 v0.1 草案にあった構文糖のうち未実装: **16 進/2 進リテラル・型接尾辞**、**三項演算子 `?:`**、
-  `for (c of s.chars())` 等の汎用 `for…of`、`Result` の `.map`/`.map_err`/`.ok` コンビネータ、
-  検査付き算術メソッド(`.checkedAdd` 等)、配列/スライスの実行時境界検査。
-- 借用: 明示 lifetime 注釈構文、多引数間の lifetime 関係(現状は単一引数 provenance + NLL で安全性を担保)。
-- 並行/デバイス: GPU 専有バッファ `Buffer.device`、単一バイナリ内の CPU/GPU 動的切替(現状 `--gpu` でコンパイル時固定)、GPU 上の atomic、MSL の飽和/f64 精緻化。
-- バックエンド: **WASM / JS、discrete GPU(コピーバック)、他社 UMA** — 設計上の方向性として [VISION.md](VISION.md) に保留。
+  `for (c of s.chars())` 等の汎用 `for…of`(現状 `stdin.lines()` 専用)、`Result` の `.map`/`.map_err`/`.ok` コンビネータ、
+  検査付き算術メソッド(`.checkedAdd` 等)、**配列/スライス/`Buffer` の実行時境界検査**(§7.3:現状 OOB は UB)。
+- `enum` 判別子を整数として取り出す/直列化する手段なし(`as` はスカラ限定、暗黙変換禁止)。
+- 数値 Unicode エスケープ `\u{…}` なし(リテラルは実コードポイントを直接書く)。
+- `format` は複合型(`struct`/`enum`/`Vec`/`Map`)非対応(スカラ/`bool`/`char`/`str` のみ)。
+- `gridGroups` は 1D のみ(2D/3D ワークグループは未対応)。
+
+### 17.2 既知の設計上の限界・非対称(実装どおりだが将来見直し候補)
+- **GPU の数値意味論の差**(§10.4): カーネルは GPU でラップ/UB 除算/飽和近似となり、CPU と一致しないことがある
+  → §0「CPU/GPU 同格」「コスト可視」の自覚的な穴。
+- **カーネル内 128bit 未検査**(§10.3): `i128`/`u128` をカーネルで使うと `--gpu` の MSL 生成で破綻しうる。
+- **`[T;N]` が Copy**: 大配列の `let b = a;` が O(N) の暗黙コピーになり、§0「コスト可視」と緊張する。
+  同サイズの `struct` は move なのに固定配列は Copy という非対称(opt-in Copy(`derive` 相当)は無い)。
+- **I/O がエラー哲学と不一致**: §0/§7 は回復可能エラーを `Result` とするが、`readFile` は `str?`、`writeFile` は `bool` で
+  失敗理由を捨てる(`Result<_,E>` を使わない)。
+- **`main()` が unit 固定**: 終了コードもエラーも返せず、本体で `?` を使えない(Rust の `fn main() -> Result<…>` 相当が無い)。
+- **comptime と実行時でオーバーフロー挙動が違う**: comptime はオーバーフローをコンパイルエラーにするが、実行時 release はラップ。
+  同一式を comptime に出し入れすると挙動が変わりうる。
+- **`Arc<Atomic<T>>` 不可**: atomic を `scope` の寿命に縛らず構造体/detached task で共有する手が現状ない。
+  また `Send` 概念は未定義(共有参照の `Sync` のみ規定。所有値を `spawn` に move する側の安全条件は空白)。
+
+### 17.3 借用チェッカの残り
+- 明示 lifetime 注釈構文、多引数間の lifetime 関係(現状は単一引数 provenance + NLL で安全性を担保)。
+
+### 17.4 デバイス/バックエンドの将来構想
+- GPU 専有バッファ `Buffer.device`、単一バイナリ内の CPU/GPU 動的切替(現状 `--gpu` でコンパイル時固定)、
+  GPU 上の atomic、MSL の飽和/f64 精緻化。
+- **WASM / JS、discrete GPU(コピーバック)、他社 UMA** — 設計上の方向性として [VISION.md](VISION.md) に保留。
 - セルフホスト: サブセットで自己ホスト不動点に到達済み([tests/cases/selfhost.mzc](tests/cases/selfhost.mzc))。全機能版コンパイラの mozaic 記述が残課題(§ROADMAP)。
 ```

@@ -1,0 +1,20 @@
+// True 128-bit arithmetic: build values that DO exceed the 64-bit range, exercising
+// i128/u128 add, multiply and the hand-written 128-bit decimal printer.
+// (wide_types only reached 4e13, well inside u64; this one crosses 2^64.)
+function main() {
+  // 2^32 * 2^32 = 2^64 = 18446744073709551616 (one past u64 max 18446744073709551615)
+  let lo: u128 = 4294967296;                   // 2^32
+  let twoP64: u128 = lo *% lo;
+  stdout.println(twoP64);                      // 18446744073709551616
+
+  // 1e10 * 1e10 = 1e20 = 100000000000000000000 (> u64 max ~1.8e19)
+  let a: u128 = 10000000000;
+  let b: u128 = 10000000000;
+  let prod: u128 = a *% b;
+  stdout.println(prod);                        // 100000000000000000000
+
+  // negative i128 beyond i64 min (-9.2e18): -(1e20) = -100000000000000000000
+  let p: i128 = 10000000000;
+  let neg: i128 = 0 - p *% p;
+  stdout.println(neg);                         // -100000000000000000000
+}

@@ -134,7 +134,7 @@ function renderCT(v: CTValue): string {
 function emitExpr(e: Expr): string {
   switch (e.kind) {
     case "Comptime": return renderCT(e.cval!);
-    case "Num": return e.value;
+    case "Num": return renderInt(BigInt(e.value));   // suffix >63-bit / compose >64-bit so clang accepts it
     case "Float": return e.value;
     case "Str": return cstr(e.value);
     case "Char": return `(char32_t)${e.value}`;

@@ -28,7 +28,7 @@ int64_t len(Shape s) {
 int main() {
   ([&]() -> void {
     Point p = Point{ 3, 4 };
-    std::cout << mz::fmt(((p).x + len(Shape{ .tag = 1, .Seg_0 = 9 }))) << "\n";
+    std::cout << mz::fmt(mz::chk_add((p).x, len(Shape{ .tag = 1, .Seg_0 = 9 }))) << "\n";
   })();
   return 0;
 }

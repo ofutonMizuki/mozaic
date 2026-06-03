@@ -1,0 +1,11 @@
+// Direct >2^64 integer literals: C++ has no literal token for these, so the compiler must
+// compose them as ((hi << 64) | lo). (mozc's subset builds 128-bit values via arithmetic
+// instead — see wide128 — so this case is reference-only; mozc-coverage skips it.)
+function main() {
+  let a: u128 = 340282366920938463463374607431768211455;   // 2^128 - 1 (u128 max)
+  stdout.println(a);
+  let b: i128 = 170141183460469231731687303715884105727;   // 2^127 - 1 (i128 max)
+  stdout.println(b);
+  let c: u64 = 18446744073709551615;                        // 2^64 - 1 (u64 max)
+  stdout.println(c);
+}

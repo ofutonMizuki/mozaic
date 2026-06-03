@@ -1,0 +1,24 @@
+// 3-D launch grid: grid3(w,h,d). Each thread sees grid.x/.y/.z and writes a value
+// encoding its 3-D position into a flattened buffer. Builds/runs identically on CPU
+// (nested loops) and GPU --gpu (3-D dispatchThreads): proves the grid3 path end to end.
+kernel fill3(out: Buffer<u32>, w: u32, h: u32) {
+  let x: u32 = grid.x;
+  let y: u32 = grid.y;
+  let z: u32 = grid.z;
+  let idx: u32 = (z *% h +% y) *% w +% x;
+  if (idx < out.len) {
+    out[idx] = x *% 100 +% y *% 10 +% z;   // distinct per (x,y,z)
+  }
+}
+function main() {
+  let w: u32 = 2;
+  let h: u32 = 2;
+  let d: u32 = 2;
+  let n: u32 = w *% h *% d;                 // 8
+  let out: Buffer<u32> = Buffer.shared(n);
+  let dev: Device = Device.gpu.first() ?? Device.cpu;
+  let job: Job = dev.launch(fill3, grid3(w, h, d), &mut out, w, h);
+  job.await();
+  let i: u32 = 0;
+  while (i < n) { stdout.println(out[i]); i = i +% 1; }
+}

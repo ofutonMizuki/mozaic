@@ -100,6 +100,58 @@ template <class T, class U> T sat_add(T a, U b) { return sadd<T>(a, (T)b); }
 template <class T, class U> T sat_sub(T a, U b) { return ssub<T>(a, (T)b); }
 template <class T, class U> T sat_mul(T a, U b) { return smul<T>(a, (T)b); }
 
+// Checked arithmetic with operand types deduced from BOTH sides, for the self-hosted compiler (mozc),
+// which lacks per-expression type info. The result type is decltype(a OP b) — exactly C++'s usual
+// arithmetic conversions, so e.g. `0 - p` with an i128 `p` checks in i128 (left-typed deduction would
+// wrongly truncate to int). Integral T traps on overflow in debug / wraps in release (matching the
+// reference compiler's add/sub/mul). Non-integral T (float / String / SIMD vector) uses the native op.
+template <class A, class B> auto chk_add(const A& a, const B& b) {
+  using T = decltype(a + b);
+  if constexpr (std::is_integral_v<T>) { T r; bool o = __builtin_add_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+    if (o) panic("integer overflow in '+'");
+#else
+    (void)o;
+#endif
+    return r; } else return a + b;
+}
+template <class A, class B> auto chk_sub(const A& a, const B& b) {
+  using T = decltype(a - b);
+  if constexpr (std::is_integral_v<T>) { T r; bool o = __builtin_sub_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+    if (o) panic("integer overflow in '-'");
+#else
+    (void)o;
+#endif
+    return r; } else return a - b;
+}
+template <class A, class B> auto chk_mul(const A& a, const B& b) {
+  using T = decltype(a * b);
+  if constexpr (std::is_integral_v<T>) { T r; bool o = __builtin_mul_overflow(a, b, &r);
+#ifndef MZ_RELEASE
+    if (o) panic("integer overflow in '*'");
+#else
+    (void)o;
+#endif
+    return r; } else return a * b;
+}
+template <class A, class B> auto chk_div(const A& a, const B& b) {
+  using T = decltype(a / b);
+  if constexpr (std::is_integral_v<T>) {
+    if (b == 0) panic("division by zero");
+    if (std::numeric_limits<T>::is_signed && b == (B)(-1) && a == std::numeric_limits<T>::min()) panic("integer overflow in '/'");
+    return (T)(a / b);
+  } else return a / b;
+}
+template <class A, class B> auto chk_mod(const A& a, const B& b) {
+  using T = decltype(a % b);   // ill-formed for float/String (rejected, as the reference's native % is)
+  if constexpr (std::is_integral_v<T>) {
+    if (b == 0) panic("remainder by zero");
+    if (std::numeric_limits<T>::is_signed && b == (B)(-1) && a == std::numeric_limits<T>::min()) return (T)0;
+    return (T)(a % b);
+  } else return a % b;
+}
+
 // `[]T` slice: a {ptr, len} view (no ownership). Built from a fixed array via slice(arr).
 // Lifetimes are not yet checked (M5), so a slice must not outlive its backing storage.
 template <class T> struct Slice {

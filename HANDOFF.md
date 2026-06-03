@@ -1,7 +1,8 @@
 # HANDOFF
 
 > **最新状況は [ROADMAP.md](ROADMAP.md) 「現在地」を参照**(本ファイル以下は M1/M2 当時の歴史メモ)。
-> 2026-06-02 時点: **M3・M4 完了・M5 ほぼ完了・M6 完了・M7 bootstrap 実証**(branch `m3-abstraction`, ゴールデン **102/102**)。
+> 2026-06-03 時点: **M3・M4 完了・M5 ほぼ完了・M6 完了・M7 bootstrap 実証**(branch `m3-abstraction`, ゴールデン **107/107**; GPU/非同期/オーバーフロー trap/**mozc≡参照の忠実性**は `tests/prove.sh`(5 フェーズ)で別途証明)。
+> 健全性ハードニング(2026-06-03): 差分テストで実装漏れ 2 件を修正 — 参照の **>2^64 リテラル**(`renderInt` 合成)と **mozc の検査付き算術**(`mz::chk_*`、debug trap/release wrap で参照に一致・符号付き UB 解消)。詳細は ROADMAP「現在地」。
 > 追加実装: 総称型 / SIMD `f32x4` / `comptime`+`const` / `Task<R>` / `Arc`・`Mutex`・`Channel` / `SeqCst` /
 > `Vec<T>` / `Map<K,V>` / 可変 `String` / `readFile`/`writeFile` / `stdin.readAll` / 論理 `&& || !` / `else if` /
 > `import` / disjoint-field 借用 / **格納参照 + NLL** / `Send`/`Sync` 規則 / **`Box<T>` 再帰型** /

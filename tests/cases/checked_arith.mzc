@@ -1,0 +1,13 @@
+// Plain + - * / % are overflow-checked: trap on overflow in debug, wrap in release. These
+// values do not overflow, so the result is the ordinary one; the .emit assertion proves the
+// reference lowers them to the checked mz::add/sub/mul/divi/modi helpers (not raw operators).
+function main() {
+  let a: i32 = 1000000;
+  let b: i32 = 2000;
+  stdout.println(a + b);    // 1002000
+  stdout.println(a - b);    // 998000
+  stdout.println(b * 1000); // 2000000
+  let c: i32 = 100;
+  stdout.println(c / 7);    // 14
+  stdout.println(c % 7);    // 2
+}

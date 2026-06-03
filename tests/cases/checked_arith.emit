@@ -1,0 +1,5 @@
+mz::add<int32_t>
+mz::sub<int32_t>
+mz::mul<int32_t>
+mz::divi<int32_t>
+mz::modi<int32_t>
