@@ -211,6 +211,11 @@ function emitExpr(e: Expr): string {
       if (e.op === "+" && e.left.ty === "str") return `(${l} + ${r})`;   // String concatenation
       const fn = ARITH_FN[e.op];
       if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;
+      // f32/f16: cast operands to the result type so a `double` literal (`1.5`, no `f` suffix) doesn't
+      // promote the whole op to double — that silently computes f32 math in f64 (wrong precision AND
+      // ~3-4x slower on CPU). `(float)(literal)` folds to a float constant; `(float)(f32var)` is a no-op.
+      if ((e.ty === "f32" || e.ty === "f16") && (e.op === "+" || e.op === "-" || e.op === "*" || e.op === "/"))
+        return `((${cppType(e.ty)})(${l}) ${e.op} (${cppType(e.ty)})(${r}))`;
       return `(${l} ${e.op} ${r})`;
     }
     case "Call": {

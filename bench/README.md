@@ -1,11 +1,28 @@
-# mozaic ベンチマーク — CPU vs GPU、UMA の効果
+# mozaic ベンチマーク — ネイティブ C++ vs mozaic CPU vs GPU、UMA の効果
 
-2 系統のベンチを用意。**どちらも Apple Silicon 前提**。
+**どれも Apple Silicon 前提**。
 
-| ベンチ | 何を測るか | カーネルの出所 |
+| ベンチ | 何を測るか | 比較対象 |
 |---|---|---|
-| `run-mozaic.sh` | **mozaic がコンパイルした**カーネルの CPU vs GPU(1 launch あたり時間) | mozaic(`bench/*.mzc`) |
-| `bench.mm` | CPU / GPU-UMA(shared) / GPU-private(コピー有) の比較 = **UMA の効果** | 手書き MSL(mozaic の shared パスと同形) |
+| **`compare.sh`** | **多面ワンショット比較**(下の「総合比較」) | ネイティブ C++(手書き)/ mozaic CPU(並列)/ mozaic GPU(Metal)/ スカラ整数 / front-end 速度 |
+| `run-mozaic.sh` | mozaic がコンパイルしたカーネルの CPU vs GPU(1 launch 時間) | mozaic(`bench/*.mzc`) |
+| `bench.mm`(`run.sh`) | CPU / GPU-UMA(shared) / GPU-private(コピー有) = **UMA の効果** | 手書き MSL(mozaic の shared パスと同形) |
+| `native.cpp` / `scalar_native.cpp` | `compare.sh` が使う**手書きネイティブ C++ の双子**(heavy/vadd/スカラ、真の f32) | — |
+
+## 総合比較（Apple M4・10 スレッド、`sh bench/compare.sh` 実測）
+
+| ワークロード | ネイティブ C++ | mozaic CPU | mozaic GPU | 備考 |
+|---|---|---|---|---|
+| **heavy**(計算律速 f32, 1M×256) | 33,821 µs(並列) / 153,604(逐次) | **33,250 µs**(並列) | **1,402 µs** | mozaic CPU は手書き並列とほぼ同速。GPU は CPU 比 23.7× |
+| **vadd**(メモリ律速 f32, 16M) | 2,194 µs | 2,637 µs | 2,286 µs | 全経路ほぼ同速(帯域律速)。GPU は僅差で勝ち |
+| **scalar**(整数 LCG, 20M×40, release) | 20.5 ms/rep | **20.9 ms/rep** | — | **チェックサム一致**・1.02× = 検査付き算術は release でネイティブ同等(ゼロオーバヘッド) |
+
+**f32 コード生成の修正(2026-06-03)**:従来 `f32` 変数 × `double` リテラル(`1.0000001`、`f` 接尾辞なし)が
+式全体を `double` へ昇格させ、CPU で f32 演算を f64 で計算していた(精度も誤り・約 3 倍遅い)。
+emit を「`f32`/`f16` の算術はオペランドを結果型へキャスト」するよう修正し、`heavy` の mozaic CPU が
+**91,178 → 33,250 µs(2.9× 高速)** になり手書きネイティブ C++ 並列と同速に。ゴールデン 107/107・忠実性 64/64 とも不変。
+(GPU/MSL 経路は元々ネイティブ float なので影響なし。mozc 自己ホスト側は型情報を持たないため f32 リテラルは従来どおり
+double 昇格 — 128bit リテラルと同じ既知の subset 限界。)
 
 `bench.mm` を手書きにしているのは、**private バッファ(discrete GPU 相当のコピー経路)が言語からは作れない**ため(mozaic の `Buffer.shared` は常に UMA)。UMA が省いているコストを定量化するには、敢えてコピーする経路と並べる必要がある。
 
@@ -31,7 +48,9 @@ vadd    | CPU     2103.1  us | GPU      2214.4 us |     0.9x
 
 - **計算律速(heavy)**:GPU 圧勝(数百倍)。GPU の launch オーバーヘッドを償却できるだけの演算量があれば、データ並列は GPU の独擅場。
 - **メモリ律速(vadd, 16M)**:ほぼ互角(~1x)。1 回の流し読み程度では、M4 の広い CPU メモリ帯域 + GPU の launch オーバーヘッドで相殺される。
-- **注意(mozaic 現状の癖)**:`heavy` の CPU が遅いのは、**f32 リテラルが C++ の `double` として出力され二重昇格**するため(`1.0000001` に `f` 接尾辞が付かない)。手書き C++ 比で約 4 倍遅い。codegen 改善候補(リテラルへ期待型を伝播)。
+- **(2026-06-03 修正済)** 以前は `heavy` の CPU が遅かった: **f32 リテラルが C++ の `double` で出力され二重昇格**
+  していた(`1.0000001` に `f` 接尾辞なし → 手書き C++ 比で約 4 倍遅い)。emit を「f32/f16 算術はオペランドを結果型へ
+  キャスト」するよう修正し、手書きネイティブ C++ と同速になった。上の「総合比較」を参照。
 
 ---
 

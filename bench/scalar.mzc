@@ -1,0 +1,23 @@
+// Scalar integer benchmark, COMPILED BY MOZAIC: a dependent LCG chain (wrapping u64 mul+add) that
+// can't be vectorized or folded away. Tests scalar codegen quality vs hand-written C++ (and that the
+// overflow-checked '+' '*' optimize to plain ops under --release). Output: ns/rep, then a checksum.
+function main() {
+  let reps: u64 = 40;
+  let n: u64 = 20000000;
+  let t0: u64 = clock.now();
+  let sink: u64 = 0;
+  let r: u64 = 0;
+  while (r < reps) {
+    let h: u64 = 1234567 +% r;
+    let i: u64 = 0;
+    while (i < n) {
+      h = h *% 6364136223846793005 +% 1442695040888963407;   // LCG, wrapping
+      i = i +% 1;
+    }
+    sink = sink +% h;
+    r = r +% 1;
+  }
+  let t1: u64 = clock.now();
+  stdout.println((t1 - t0) / reps);
+  stdout.println(sink);
+}
