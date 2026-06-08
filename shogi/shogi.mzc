@@ -1619,6 +1619,21 @@ function parseIntStr(s: &str): i32 {
   return v;
 }
 
+// 符号付き整数(重みの固定小数 ×1e6)をパース。
+function parseSignedInt(s: &str): i32 {
+  let neg: bool = false;
+  let i: u32 = 0;
+  if (s.len > 0 && s[0] == '-') { neg = true; i = 1; }
+  let v: i32 = 0;
+  while (i < s.len) {
+    let c: char = s[i];
+    if (c >= '0' && c <= '9') { v = v * 10 + (((c as u32) - ('0' as u32)) as i32); }
+    i = i + 1;
+  }
+  if (neg) { return 0 - v; }
+  return v;
+}
+
 // SFEN(toks[start]=盤面, +1=手番, +2=持ち駒, +3=手数)から局面を構築。
 function parseSfen(toks: &Vec<str>, start: u32): Board {
   let b: Board = emptyBoard();
@@ -1829,6 +1844,29 @@ function main() {
     } else if (toks[0] == "train") {
       trainCNN(&cnv, &cnb, &dnw, &dnb);                   // 重みをその場学習(以後の go が使う)
       stdout.flush();
+    } else if (toks[0] == "dumpweights") {
+      // 重みを固定小数(×1e6)1 行で出力。外部ラッパーがファイル保存する。
+      let total: u32 = CONVW_SZ + NCH + NCH + 1;
+      let out: str = `weights ${total}`;
+      let wi: u32 = 0;
+      while (wi < CONVW_SZ) { out = out + ` ${(cnv[wi] * 1000000.0) as i32}`; wi = wi + 1; }
+      let wj: u32 = 0;
+      while (wj < NCH) { out = out + ` ${(cnb[wj] * 1000000.0) as i32}`; wj = wj + 1; }
+      let wk: u32 = 0;
+      while (wk < NCH) { out = out + ` ${(dnw[wk] * 1000000.0) as i32}`; wk = wk + 1; }
+      out = out + ` ${(dnb[0] * 1000000.0) as i32}`;
+      stdout.println(out);
+      stdout.flush();
+    } else if (toks[0] == "loadweights") {
+      // 外部ラッパーがファイルから渡す重みを読み込む(toks[1..] = 固定小数 ×1e6)。
+      let ti: u32 = 1;
+      let li: u32 = 0;
+      while (li < CONVW_SZ && ti < toks.len) { cnv[li] = (parseSignedInt(&toks[ti]) as f32) / 1000000.0; li = li + 1; ti = ti + 1; }
+      let lj: u32 = 0;
+      while (lj < NCH && ti < toks.len) { cnb[lj] = (parseSignedInt(&toks[ti]) as f32) / 1000000.0; lj = lj + 1; ti = ti + 1; }
+      let lk: u32 = 0;
+      while (lk < NCH && ti < toks.len) { dnw[lk] = (parseSignedInt(&toks[ti]) as f32) / 1000000.0; lk = lk + 1; ti = ti + 1; }
+      if (ti < toks.len) { dnb[0] = (parseSignedInt(&toks[ti]) as f32) / 1000000.0; }
     } else if (toks[0] == "quit") {
       break;
     }

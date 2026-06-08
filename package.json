@@ -7,6 +7,9 @@
     "emit:echo": "node --disable-warning=ExperimentalWarning src/main.ts emit examples/echo.mzc",
     "build:echo": "node --disable-warning=ExperimentalWarning src/main.ts build examples/echo.mzc",
     "run:echo": "node --disable-warning=ExperimentalWarning src/main.ts run examples/echo.mzc",
+    "build:shogi": "node --disable-warning=ExperimentalWarning src/main.ts build shogi/shogi.mzc --release",
+    "build:shogi:gpu": "node --disable-warning=ExperimentalWarning src/main.ts build shogi/shogi.mzc --metal",
+    "build:usi": "sh shogi/build-wrap.sh",
     "test": "node --disable-warning=ExperimentalWarning tests/run.ts"
   }
 }
