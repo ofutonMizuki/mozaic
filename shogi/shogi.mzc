@@ -222,7 +222,7 @@ struct Board {
     }
   }
 
-  // 駒打ちの可否(二歩・行きどころのない駒を禁止。打ち歩詰めは未対応)。
+  // 駒打ちの可否(二歩・行きどころのない駒を禁止。打ち歩詰めは legalMove で別途排除)。
   function canDrop(&self, t: i32, r: i32, f: i32, me: i32): bool {
     if (t == PAWN) {
       if (me == SENTE && r == 0) { return false; }
@@ -335,6 +335,76 @@ struct Board {
       let bt: i32 = baseType(typeOf(cap));
       if (bt <= 7) { self.hand[me * 8 + bt] = self.hand[me * 8 + bt] - 1; }
     }
+  }
+
+  // ============================================================================
+  //  合法性(反則回避): 王手放置・自殺手・打ち歩詰めを排除する。
+  //  探索内部は「玉を取れたら MATE」方式のままで、実際に指す手(ルート)だけを
+  //  ここで厳密に合法手へ絞る。
+  // ============================================================================
+
+  // owner 側の玉のマス(盤上に無ければ -1)。
+  function kingSq(&self, owner: i32): i32 {
+    let s: i32 = 0;
+    while (s < 81) {
+      let p: i32 = self.sq[s];
+      if (p != 0 && colorOf(p) == owner && typeOf(p) == KING) { return s; }
+      s = s + 1;
+    }
+    return 0 - 1;
+  }
+
+  // owner の玉が相手の利きに晒されているか(= 次に取られるか)。self.side は復元する。
+  function kingAttacked(&mut self, owner: i32): bool {
+    let ks: i32 = self.kingSq(owner);
+    if (ks < 0) { return true; }                  // 玉不在は取られている扱い
+    let save: i32 = self.side;
+    self.side = 1 - owner;                         // 相手の手番で「取る手」を生成
+    let caps: Vec<i32> = self.gen(true);
+    self.side = save;
+    let n: u32 = caps.len;
+    let i: u32 = 0;
+    while (i < n) {
+      if ((caps[i] & 127) == ks) { return true; }  // 玉のマスへ届く手 = 王手
+      i = i + 1;
+    }
+    return false;
+  }
+
+  // m を指した後に自玉が取られないか(王手放置・自殺手でないか)。
+  function kingSafeAfter(&mut self, m: i32): bool {
+    let mover: i32 = self.side;
+    let cap: i32 = self.doMove(m);
+    let bad: bool = self.kingAttacked(mover);
+    self.undoMove(m, cap);
+    return !bad;
+  }
+
+  // 手番側に合法手が一手でもあるか(詰み判定用)。
+  function hasLegalMove(&mut self): bool {
+    let moves: Vec<i32> = self.gen(false);
+    let n: u32 = moves.len;
+    let i: u32 = 0;
+    while (i < n) {
+      if (self.kingSafeAfter(moves[i] & 65535)) { return true; }
+      i = i + 1;
+    }
+    return false;
+  }
+
+  // m が反則でない合法手か。王手放置・自殺手に加え、打ち歩詰め(歩打ちで即詰み)を排除。
+  function legalMove(&mut self, m: i32): bool {
+    let mover: i32 = self.side;
+    let from: i32 = (m >> 7) & 127;
+    let pawnDrop: bool = (from > 80) && ((from - 80) == PAWN);
+    let cap: i32 = self.doMove(m);
+    let bad: bool = self.kingAttacked(mover);      // 自玉を取られる手は反則
+    if (!bad && pawnDrop) {                         // 打ち歩詰め: 歩を打って相手が王手かつ応手なし
+      let opp: i32 = self.side;
+      if (self.kingAttacked(opp) && !self.hasLegalMove()) { bad = true; }
+    }
+    self.undoMove(m, cap);
+    return !bad;
   }
 
   // 評価(先手視点)。+ が先手有利。
@@ -527,6 +597,7 @@ function rootSearch(b: &mut Board, depth: i32): Best {
     let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
 
     let m: i32 = moves[i] & 65535;
+    if (!b.legalMove(m)) { i = i + 1; continue; }           // 反則手(王手放置・自殺手・打ち歩詰め)は指さない
     let cap: i32 = b.doMove(m);
     let score: i32 = 0;
     if (typeOf(cap) == KING) { score = MATE - 1; }
@@ -608,11 +679,32 @@ function runBench() {
   stdout.println(`king-capture: best=${moveStr(t2.mv)} eval=${t2.score}`);
   assert(t2.score > 900000, "engine must see the king capture as a win");
 
+  // (3) 反則回避: 先手玉が後手飛に王手されている。玉が同じ筋に留まる手は反則、
+  //     筋を外す手は合法。エンジンは必ず合法手を選ぶ。
+  let ck: Board = emptyBoard();
+  ck.sq[8 * 9 + 4] = KING;           // 先手玉 (76)
+  ck.sq[0 * 9 + 4] = ROOK | 16;      // 後手飛が同じ筋(file4)で王手
+  ck.side = SENTE;
+  let stayInCheck: i32 = (7 * 9 + 4) | ((8 * 9 + 4) << 7);   // 76->67: 筋に留まる(王手継続) = 反則
+  let escape: i32      = (8 * 9 + 5) | ((8 * 9 + 4) << 7);   // 76->77: 筋を外す = 合法
+  assert(!ck.legalMove(stayInCheck), "leaving the king in check must be illegal");
+  assert(ck.legalMove(escape), "escaping check must be legal");
+  let cr: Best = rootSearch(&mut ck, 3);
+  assert(cr.mv >= 0, "engine must find a legal reply to check");
+  assert(ck.legalMove(cr.mv), "engine must only ever play a legal move");
+  stdout.println(`under-check: best=${moveStr(cr.mv)} eval=${cr.score} (legal)`);
+
   stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
   let ply: i32 = 0;
   while (ply < MAXPLY) {
     let best: Best = rootSearch(&mut b, DEPTH);
-    if (best.mv < 0) { stdout.println("no legal move -- game over"); break; }
+    if (best.mv < 0) {                                       // 合法手なし = 詰み(反則を犯さず投了)
+      let loser: str = "S";
+      let winner: str = "G";
+      if (b.side == GOTE) { loser = "G"; winner = "S"; }
+      stdout.println(`${loser} is checkmated (no legal move) -- ${winner} wins`);
+      break;
+    }
     let m: i32 = best.mv;
     let sideStr: str = "S";
     if (b.side == GOTE) { sideStr = "G"; }
