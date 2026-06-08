@@ -134,6 +134,7 @@ struct Board {
   sq: Vec<i32>;     // 81 マス。index = rank*9 + file (rank0=上端, file0=左端)
   hand: Vec<i32>;   // 持ち駒。index = me*8 + 駒種(1..7)。size 16。
   side: i32;        // 手番
+  hash: u64;        // Zobrist ハッシュ(置換表用。Search が差分更新/再計算する)
 
   // 1 マスへの着手を試す。戻り値: 0=不可で停止 / 1=空(着手し継続) / 2=取り(着手し停止)
   function tryTo(&self, moves: &mut Vec<i32>, from: i32, tr: i32, tf: i32, t: i32, me: i32, capsOnly: bool): i32 {
@@ -514,100 +515,330 @@ function perft(b: &mut Board, depth: i32): i64 {
 }
 
 // ============================================================================
-//  探索: ネガマックス αβ + 静止探索
+//  探索: 反復深化 ネガマックス αβ + 静止探索 + 置換表(TT) + 時間制御
 // ============================================================================
 
 struct Best { mv: i32; score: i32; }
 
-// 静止探索: 駒を取り合う手だけを読み、局面が落ち着いてから評価する。
-function qsearch(b: &mut Board, alpha: i32, beta: i32, ply: i32): i32 {
-  let stand: i32 = b.evalToMove();
-  if (stand >= beta) { return beta; }
-  let a: i32 = alpha;
-  if (stand > a) { a = stand; }
+const TT_SIZE: i32 = 1048576;       // 置換表エントリ数 (2^20)
+const TT_MASK: u64 = 1048575;       // TT_SIZE - 1 (索引マスク)
+const F_EXACT: i32 = 1;             // TT 種別: 正確値
+const F_LOWER: i32 = 2;             // TT 種別: 下界 (βカット)
+const F_UPPER: i32 = 3;             // TT 種別: 上界 (α更新なし)
+const MAXDEPTH: i32 = 32;           // 反復深化の上限
+const NS_PER_MS: u64 = 1000000;
 
-  let moves: Vec<i32> = b.gen(true);
-  let n: u32 = moves.len;
-  let i: u32 = 0;
-  while (i < n) {
-    // 残りからキー最大の手を選ぶ(遅延セレクションソート)。
-    let bi: u32 = i;
-    let j: u32 = i + 1;
-    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
-    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
-
-    let m: i32 = moves[i] & 65535;
-    let cap: i32 = b.doMove(m);
-    let score: i32 = 0;
-    if (typeOf(cap) == KING) { score = MATE - ply; }
-    else { score = 0 - qsearch(b, 0 - beta, 0 - a, ply + 1); }
-    b.undoMove(m, cap);
-
-    if (score >= beta) { return beta; }
-    if (score > a) { a = score; }
-    i = i + 1;
-  }
-  return a;
+// 詰みスコアは「ルートからの手数」依存なので、TT に格納する時は ply を加味して
+// 局面固有の値に正規化し、取り出す時に元へ戻す。
+function toTT(score: i32, ply: i32): i32 {
+  if (score > MATE - 1000) { return score + ply; }
+  if (score < (0 - MATE) + 1000) { return score - ply; }
+  return score;
+}
+function fromTT(score: i32, ply: i32): i32 {
+  if (score > MATE - 1000) { return score - ply; }
+  if (score < (0 - MATE) + 1000) { return score + ply; }
+  return score;
 }
 
-function search(b: &mut Board, depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
-  if (depth <= 0) { return qsearch(b, alpha, beta, ply); }
-  let moves: Vec<i32> = b.gen(false);
-  let n: u32 = moves.len;
-  if (n == 0) { return (0 - MATE) + ply; }                  // 指す手なし = 負け
+struct Search {
+  key: Vec<u64>;     // TT: 局面の Zobrist キー
+  ttmv: Vec<i32>;    // TT: 最善手 (16bit)
+  ttsc: Vec<i32>;    // TT: スコア (toTT 済み)
+  ttdp: Vec<i32>;    // TT: 探索深さ
+  ttfl: Vec<i32>;    // TT: 種別 (0=空 / EXACT / LOWER / UPPER)
+  zsq: Vec<u64>;     // Zobrist: マス*32 + 駒コード
+  zhand: Vec<u64>;   // Zobrist: 駒台スロット*32 + 枚数
+  zside: u64;        // Zobrist: 後手番
+  seed: u64;         // 乱数状態 (xorshift64)
+  deadline: u64;     // 思考打ち切り時刻 (ns)。0 = 無制限
+  nodes: i64;        // 探索ノード数
+  stop: bool;        // 時間切れフラグ
 
-  let best: i32 = 0 - INF;
-  let a: i32 = alpha;
-  let i: u32 = 0;
-  while (i < n) {
-    let bi: u32 = i;
-    let j: u32 = i + 1;
-    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
-    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+  // xorshift64 乱数。
+  function rnd(&mut self): u64 {
+    let x: u64 = self.seed;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    self.seed = x;
+    return x;
+  }
 
-    let m: i32 = moves[i] & 65535;
-    let cap: i32 = b.doMove(m);
-    let score: i32 = 0;
-    if (typeOf(cap) == KING) { score = MATE - ply; }        // 玉を取れたら即勝ち
-    else { score = 0 - search(b, depth - 1, 0 - beta, 0 - a, ply + 1); }
-    b.undoMove(m, cap);
-
-    if (score > best) {
-      best = score;
-      if (score > a) { a = score; }
+  // 局面の Zobrist ハッシュを一から計算。
+  function computeHash(&self, b: &Board): u64 {
+    let h: u64 = 0;
+    let s: i32 = 0;
+    while (s < 81) {
+      let p: i32 = b.sq[s];
+      if (p != 0) { h = h ^ self.zsq[s * 32 + p]; }
+      s = s + 1;
     }
-    if (a >= beta) { break; }                               // βカット
-    i = i + 1;
+    let slot: i32 = 0;
+    while (slot < 16) {
+      h = h ^ self.zhand[slot * 32 + b.hand[slot]];
+      slot = slot + 1;
+    }
+    if (b.side == GOTE) { h = h ^ self.zside; }
+    return h;
   }
-  return best;
+
+  // doMove と同じ更新を Zobrist ハッシュに差分適用してから指す。undo 側は
+  // 探索ループが b.hash を保存/復元するので専用関数は要らない。
+  function doMoveH(&self, b: &mut Board, m: i32): i32 {
+    let me: i32 = b.side;
+    let to: i32 = m & 127;
+    let from: i32 = (m >> 7) & 127;
+    let h: u64 = b.hash;
+    if (from > 80) {                                        // 打ち
+      let t: i32 = from - 80;
+      h = h ^ self.zsq[to * 32 + pieceCode(me, t)];
+      let slot: i32 = me * 8 + t;
+      let c: i32 = b.hand[slot];
+      h = h ^ self.zhand[slot * 32 + c] ^ self.zhand[slot * 32 + (c - 1)];
+      h = h ^ self.zside;
+      let cap: i32 = b.doMove(m);
+      b.hash = h;
+      return cap;
+    }
+    let promo: i32 = (m >> 14) & 1;
+    let p: i32 = b.sq[from];
+    let placed: i32 = p;
+    if (promo == 1) { placed = p + 8; }
+    let capPiece: i32 = b.sq[to];
+    h = h ^ self.zsq[from * 32 + p];                        // 移動元から除去
+    h = h ^ self.zsq[to * 32 + placed];                     // 移動先へ配置(成りも反映)
+    if (capPiece != 0) {
+      h = h ^ self.zsq[to * 32 + capPiece];                 // 取られた駒を除去
+      let bt: i32 = baseType(typeOf(capPiece));
+      if (bt <= 7) {
+        let slot: i32 = me * 8 + bt;
+        let c: i32 = b.hand[slot];
+        h = h ^ self.zhand[slot * 32 + c] ^ self.zhand[slot * 32 + (c + 1)];
+      }
+    }
+    h = h ^ self.zside;
+    let cap: i32 = b.doMove(m);
+    b.hash = h;
+    return cap;
+  }
+
+  // 時間切れ判定 (2048 ノードごと)。
+  function checkTime(&mut self) {
+    if (self.deadline != 0 && (self.nodes & 2047) == 0) {
+      if (clock.now() >= self.deadline) { self.stop = true; }
+    }
+  }
+
+  // 静止探索: 取り合いだけ読む。末端の軽い探索なので TT は引かない。
+  function qsearch(&mut self, b: &mut Board, alpha: i32, beta: i32, ply: i32): i32 {
+    self.nodes = self.nodes + 1;
+    self.checkTime();
+    if (self.stop) { return 0; }
+    let stand: i32 = b.evalToMove();
+    if (stand >= beta) { return beta; }
+    let a: i32 = alpha;
+    if (stand > a) { a = stand; }
+
+    let moves: Vec<i32> = b.gen(true);
+    let n: u32 = moves.len;
+    let i: u32 = 0;
+    while (i < n) {
+      let bi: u32 = i;
+      let j: u32 = i + 1;
+      while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+      let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+      let m: i32 = moves[i] & 65535;
+      let cap: i32 = b.doMove(m);
+      let score: i32 = 0;
+      if (typeOf(cap) == KING) { score = MATE - ply; }
+      else { score = 0 - self.qsearch(b, 0 - beta, 0 - a, ply + 1); }
+      b.undoMove(m, cap);
+      if (self.stop) { return 0; }
+      if (score >= beta) { return beta; }
+      if (score > a) { a = score; }
+      i = i + 1;
+    }
+    return a;
+  }
+
+  // ネガマックス αβ + 置換表。
+  function search(&mut self, b: &mut Board, depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
+    self.nodes = self.nodes + 1;
+    self.checkTime();
+    if (self.stop) { return 0; }
+    if (depth <= 0) { return self.qsearch(b, alpha, beta, ply); }
+
+    let idx: i32 = (b.hash & TT_MASK) as i32;               // TT 参照
+    let ttMove: i32 = 0;
+    if (self.ttfl[idx] != 0 && self.key[idx] == b.hash) {
+      let ts: i32 = fromTT(self.ttsc[idx], ply);
+      let tf: i32 = self.ttfl[idx];
+      if (self.ttdp[idx] >= depth) {
+        if (tf == F_EXACT) { return ts; }
+        if (tf == F_LOWER && ts >= beta) { return ts; }
+        if (tf == F_UPPER && ts <= alpha) { return ts; }
+      }
+      ttMove = self.ttmv[idx];                              // 深さ不足でも手は並べ替えに使う
+    }
+
+    let moves: Vec<i32> = b.gen(false);
+    let n: u32 = moves.len;
+    if (n == 0) { return (0 - MATE) + ply; }                // 指す手なし = 負け
+    if (ttMove != 0) {                                      // TT の手を最優先キーに
+      let k: u32 = 0;
+      while (k < n) { if ((moves[k] & 65535) == ttMove) { moves[k] = (moves[k] & 65535) | (2000 << 16); } k = k + 1; }
+    }
+
+    let best: i32 = 0 - INF;
+    let bestMv: i32 = 0;
+    let a: i32 = alpha;
+    let i: u32 = 0;
+    while (i < n) {
+      let bi: u32 = i;
+      let j: u32 = i + 1;
+      while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+      let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+      let m: i32 = moves[i] & 65535;
+      let saved: u64 = b.hash;
+      let cap: i32 = self.doMoveH(b, m);
+      let score: i32 = 0;
+      if (typeOf(cap) == KING) { score = MATE - ply; }      // 玉を取れたら即勝ち
+      else { score = 0 - self.search(b, depth - 1, 0 - beta, 0 - a, ply + 1); }
+      b.undoMove(m, cap);
+      b.hash = saved;
+      if (self.stop) { return 0; }
+
+      if (score > best) {
+        best = score;
+        bestMv = m;
+        if (score > a) { a = score; }
+      }
+      if (a >= beta) { break; }                             // βカット
+      i = i + 1;
+    }
+
+    let flag: i32 = F_EXACT;                                // TT 格納
+    if (best <= alpha) { flag = F_UPPER; }
+    else if (best >= beta) { flag = F_LOWER; }
+    self.key[idx] = b.hash;
+    self.ttmv[idx] = bestMv;
+    self.ttsc[idx] = toTT(best, ply);
+    self.ttdp[idx] = depth;
+    self.ttfl[idx] = flag;
+    return best;
+  }
+
+  // ルート探索: 合法手のみを指し、最善手を返す。
+  function rootSearch(&mut self, b: &mut Board, depth: i32): Best {
+    let moves: Vec<i32> = b.gen(false);
+    let n: u32 = moves.len;
+    let idx: i32 = (b.hash & TT_MASK) as i32;
+    let ttMove: i32 = 0;
+    if (self.ttfl[idx] != 0 && self.key[idx] == b.hash) { ttMove = self.ttmv[idx]; }
+    if (ttMove != 0) {
+      let k: u32 = 0;
+      while (k < n) { if ((moves[k] & 65535) == ttMove) { moves[k] = (moves[k] & 65535) | (2000 << 16); } k = k + 1; }
+    }
+    let bestMv: i32 = 0 - 1;
+    let bestScore: i32 = 0 - INF;
+    let a: i32 = 0 - INF;
+    let i: u32 = 0;
+    while (i < n) {
+      let bi: u32 = i;
+      let j: u32 = i + 1;
+      while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+      let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+      let m: i32 = moves[i] & 65535;
+      if (!b.legalMove(m)) { i = i + 1; continue; }         // 反則手(王手放置・自殺手・打ち歩詰め)は指さない
+      let saved: u64 = b.hash;
+      let cap: i32 = self.doMoveH(b, m);
+      let score: i32 = 0;
+      if (typeOf(cap) == KING) { score = MATE - 1; }
+      else { score = 0 - self.search(b, depth - 1, 0 - INF, 0 - a, 1); }
+      b.undoMove(m, cap);
+      b.hash = saved;
+      if (self.stop) { break; }                             // 中断: この反復は think 側で破棄
+      if (score > bestScore) { bestScore = score; bestMv = m; if (score > a) { a = score; } }
+      i = i + 1;
+    }
+    return Best { mv: bestMv, score: bestScore };
+  }
+
+  // 固定深さで一発探索(自己検証・自己対局用。info 出力なし)。
+  function bestMove(&mut self, b: &mut Board, depth: i32): Best {
+    self.stop = false;
+    self.nodes = 0;
+    self.deadline = 0;
+    b.hash = self.computeHash(b);
+    return self.rootSearch(b, depth);
+  }
+
+  // 反復深化 + 時間制御。timeMs<=0 なら時間無制限(maxDepth まで)。
+  function think(&mut self, b: &mut Board, maxDepth: i32, timeMs: i32): Best {
+    self.stop = false;
+    self.nodes = 0;
+    if (timeMs > 0) { self.deadline = clock.now() + ((timeMs as u64) * NS_PER_MS); }
+    else { self.deadline = 0; }
+    b.hash = self.computeHash(b);
+
+    let bestMv: i32 = 0 - 1;
+    let bestScore: i32 = 0;
+    let d: i32 = 1;
+    while (d <= maxDepth) {
+      let res: Best = self.rootSearch(b, d);
+      if (self.stop) { break; }                             // 時間切れ: 未完の反復は捨てる
+      if (res.mv < 0) { bestMv = 0 - 1; break; }            // 合法手なし = 詰み
+      bestMv = res.mv;
+      bestScore = res.score;
+      stdout.println(`info depth ${d} nodes ${self.nodes} score ${scoreStr(bestScore)} pv ${moveStr(bestMv)}`);
+      stdout.flush();
+      if (bestScore > MATE - 1000 || bestScore < (0 - MATE) + 1000) { break; }  // 詰み発見で打ち切り
+      if (self.deadline != 0 && clock.now() >= self.deadline) { break; }        // 残時間僅少なら次反復へ進まない
+      d = d + 1;
+    }
+    return Best { mv: bestMv, score: bestScore };
+  }
 }
 
-// ルート探索: 最善手と評価値を返す。
-function rootSearch(b: &mut Board, depth: i32): Best {
+// Search を生成(TT 確保 + Zobrist 表を乱数で初期化)。
+function newSearch(): Search {
+  let s: Search = Search {
+    key: zeros64(TT_SIZE), ttmv: zeros(TT_SIZE), ttsc: zeros(TT_SIZE),
+    ttdp: zeros(TT_SIZE), ttfl: zeros(TT_SIZE),
+    zsq: Vec.new(), zhand: Vec.new(), zside: 0,
+    seed: 1234567891, deadline: 0, nodes: 0, stop: false
+  };
+  let w: i32 = 0;
+  while (w < 8) { let warm: u64 = s.rnd(); w = w + 1; }     // 乱数のウォームアップ
+  let i: i32 = 0;
+  while (i < 81 * 32) { let r: u64 = s.rnd(); s.zsq.push(r); i = i + 1; }
+  let j: i32 = 0;
+  while (j < 16 * 32) { let r: u64 = s.rnd(); s.zhand.push(r); j = j + 1; }
+  s.zside = s.rnd();
+  return s;
+}
+
+// Zobrist 差分更新が一から計算と一致するか、全擬似合法手を depth まで辿って検証。
+function hashWalk(engine: &Search, b: &mut Board, depth: i32): bool {
+  if (depth == 0) { return true; }
   let moves: Vec<i32> = b.gen(false);
   let n: u32 = moves.len;
-  let bestMv: i32 = 0 - 1;
-  let bestScore: i32 = 0 - INF;
-  let a: i32 = 0 - INF;
   let i: u32 = 0;
   while (i < n) {
-    let bi: u32 = i;
-    let j: u32 = i + 1;
-    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
-    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
-
     let m: i32 = moves[i] & 65535;
-    if (!b.legalMove(m)) { i = i + 1; continue; }           // 反則手(王手放置・自殺手・打ち歩詰め)は指さない
-    let cap: i32 = b.doMove(m);
-    let score: i32 = 0;
-    if (typeOf(cap) == KING) { score = MATE - 1; }
-    else { score = 0 - search(b, depth - 1, 0 - INF, 0 - a, 1); }
+    let saved: u64 = b.hash;
+    let cap: i32 = engine.doMoveH(b, m);
+    if (b.hash != engine.computeHash(b)) { return false; }
+    if (!hashWalk(engine, b, depth - 1)) { return false; }
     b.undoMove(m, cap);
-
-    if (score > bestScore) { bestScore = score; bestMv = m; if (score > a) { a = score; } }
+    b.hash = saved;
     i = i + 1;
   }
-  return Best { mv: bestMv, score: bestScore };
+  return true;
 }
 
 // ============================================================================
@@ -621,12 +852,19 @@ function zeros(n: i32): Vec<i32> {
   return v;
 }
 
+function zeros64(n: i32): Vec<u64> {
+  let v: Vec<u64> = Vec.new();
+  let i: i32 = 0;
+  while (i < n) { v.push(0); i = i + 1; }
+  return v;
+}
+
 function emptyBoard(): Board {
-  return Board { sq: zeros(81), hand: zeros(16), side: SENTE };
+  return Board { sq: zeros(81), hand: zeros(16), side: SENTE, hash: 0 };
 }
 
 function initBoard(): Board {
-  let b: Board = Board { sq: zeros(81), hand: zeros(16), side: SENTE };
+  let b: Board = Board { sq: zeros(81), hand: zeros(16), side: SENTE, hash: 0 };
   let back: [i32; 9] = [LANCE, KNIGHT, SILVER, GOLD, KING, GOLD, SILVER, KNIGHT, LANCE];
   let f: i32 = 0;
   while (f < 9) {
@@ -648,6 +886,7 @@ function initBoard(): Board {
 // ============================================================================
 
 function runBench() {
+  let engine: Search = newSearch();
   let b: Board = initBoard();
   stdout.println("=== initial position (uppercase=Sente, lowercase=Gote) ===");
   b.show();
@@ -664,7 +903,7 @@ function runBench() {
   tac.sq[0 * 9 + 8] = KING | 16;     // 後手玉(飛の利きの外に置く)
   tac.sq[4 * 9 + 4] = ROOK;          // 先手飛(中央)
   tac.sq[4 * 9 + 0] = GOLD | 16;     // 浮いた後手金(同じ段)
-  let t1: Best = rootSearch(&mut tac, 4);
+  let t1: Best = engine.bestMove(&mut tac, 4);
   let goldSq: i32 = t1.mv & 127;
   stdout.println(`free-capture: best=${moveStr(t1.mv)} eval=${t1.score}`);
   assert(typeOf(tac.sq[goldSq]) == GOLD, "engine must capture the hanging gold");
@@ -675,7 +914,7 @@ function runBench() {
   mt.sq[8 * 9 + 4] = KING;           // 先手玉
   mt.sq[4 * 9 + 4] = KING | 16;      // 取れる後手玉
   mt.sq[4 * 9 + 0] = ROOK;           // 先手飛が同じ段で王を狙う
-  let t2: Best = rootSearch(&mut mt, 2);
+  let t2: Best = engine.bestMove(&mut mt, 2);
   stdout.println(`king-capture: best=${moveStr(t2.mv)} eval=${t2.score}`);
   assert(t2.score > 900000, "engine must see the king capture as a win");
 
@@ -689,15 +928,28 @@ function runBench() {
   let escape: i32      = (8 * 9 + 5) | ((8 * 9 + 4) << 7);   // 76->77: 筋を外す = 合法
   assert(!ck.legalMove(stayInCheck), "leaving the king in check must be illegal");
   assert(ck.legalMove(escape), "escaping check must be legal");
-  let cr: Best = rootSearch(&mut ck, 3);
+  let cr: Best = engine.bestMove(&mut ck, 3);
   assert(cr.mv >= 0, "engine must find a legal reply to check");
   assert(ck.legalMove(cr.mv), "engine must only ever play a legal move");
   stdout.println(`under-check: best=${moveStr(cr.mv)} eval=${cr.score} (legal)`);
 
+  // (4) Zobrist 差分更新の検証: 取り・成り・打ちを含む局面を全手 3 手先まで辿り、
+  //     差分ハッシュが毎ノードで再計算と一致することを確認。
+  let zb: Board = emptyBoard();
+  zb.sq[8 * 9 + 4] = KING;           // 先手玉
+  zb.sq[0 * 9 + 4] = KING | 16;      // 後手玉
+  zb.sq[2 * 9 + 4] = ROOK;           // 敵陣の先手飛(成れる/後手金を取れる)
+  zb.sq[1 * 9 + 4] = GOLD | 16;      // 取られる後手金
+  zb.hand[SENTE * 8 + PAWN] = 1;     // 先手の持ち歩(打ちを発生させる)
+  zb.side = SENTE;
+  zb.hash = engine.computeHash(&zb);
+  assert(hashWalk(&engine, &mut zb, 3), "incremental Zobrist must match full recompute");
+  stdout.println("zobrist: incremental update == full recompute (ok)");
+
   stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
   let ply: i32 = 0;
   while (ply < MAXPLY) {
-    let best: Best = rootSearch(&mut b, DEPTH);
+    let best: Best = engine.bestMove(&mut b, DEPTH);
     if (best.mv < 0) {                                       // 合法手なし = 詰み(反則を犯さず投了)
       let loser: str = "S";
       let winner: str = "G";
@@ -719,7 +971,9 @@ function runBench() {
 // ============================================================================
 //  USI プロトコル
 //  対応コマンド: usi / isready / usinewgame / position (startpos|sfen) [moves..] /
-//                go [depth N] / quit、加えて独自の bench・d(盤表示)。
+//                go [depth N | movetime MS | btime/wtime/byoyomi/binc/winc | infinite] /
+//                quit、加えて独自の bench・d(盤表示)。
+//  探索は反復深化 + 置換表 + 時間制御。go に時間が来れば clock で打ち切る。
 //  指し手は USI 表記(7g7f / 7g7f+ / P*5e)で入出力する。
 // ============================================================================
 
@@ -868,6 +1122,7 @@ function scoreStr(score: i32): str {                        // USI score: cp か
 
 function main() {
   let game: Board = initBoard();
+  let engine: Search = newSearch();
   while (true) {
     let lo: str? = stdin.readLine();
     if (lo == none) { break; }
@@ -888,17 +1143,47 @@ function main() {
     } else if (toks[0] == "position") {
       game = parsePosition(&toks);
     } else if (toks[0] == "go") {
-      let depth: i32 = DEPTH;
+      // go [depth N] | [movetime MS] | [btime W wtime B byoyomi T binc.. winc..] | [infinite]
+      let fixedDepth: i32 = 0;
+      let movetime: i32 = 0;
+      let btime: i32 = 0;
+      let wtime: i32 = 0;
+      let byo: i32 = 0;
+      let binc: i32 = 0;
+      let winc: i32 = 0;
+      let infinite: bool = false;
       let gi: u32 = 1;
       while (gi < toks.len) {
-        if (toks[gi] == "depth" && gi + 1 < toks.len) { depth = parseIntStr(&toks[gi + 1]); }
+        if (toks[gi] == "depth" && gi + 1 < toks.len) { fixedDepth = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "movetime" && gi + 1 < toks.len) { movetime = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "btime" && gi + 1 < toks.len) { btime = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "wtime" && gi + 1 < toks.len) { wtime = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "byoyomi" && gi + 1 < toks.len) { byo = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "binc" && gi + 1 < toks.len) { binc = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "winc" && gi + 1 < toks.len) { winc = parseIntStr(&toks[gi + 1]); }
+        else if (toks[gi] == "infinite") { infinite = true; }
         gi = gi + 1;
       }
-      let best: Best = rootSearch(&mut game, depth);
+      let maxDepth: i32 = MAXDEPTH;
+      let timeMs: i32 = 0;
+      if (fixedDepth > 0) {
+        maxDepth = fixedDepth;                              // 固定深さ(時間無制限)
+      } else if (infinite) {
+        timeMs = 8000;                                      // stop 非対応なので上限を設ける
+      } else if (movetime > 0) {
+        timeMs = movetime - 30;
+      } else {
+        let myt: i32 = btime;
+        let myi: i32 = binc;
+        if (game.side == GOTE) { myt = wtime; myi = winc; }
+        timeMs = myt / 25 + myi + byo - 50;                 // 持ち時間の 1/25 + 加算 + 秒読み - 余裕
+        if (timeMs < byo - 30) { timeMs = byo - 30; }       // 秒読みは使い切ってよい
+      }
+      if (fixedDepth <= 0 && timeMs < 10) { timeMs = 10; }  // 最低 10ms は読む
+      let best: Best = engine.think(&mut game, maxDepth, timeMs);
       if (best.mv < 0) {
         stdout.println("bestmove resign");
       } else {
-        stdout.println(`info depth ${depth} score ${scoreStr(best.score)} pv ${moveStr(best.mv)}`);
         stdout.println(`bestmove ${moveStr(best.mv)}`);
       }
       stdout.flush();
