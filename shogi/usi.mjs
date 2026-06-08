@@ -50,12 +50,20 @@ if (existsSync(WEIGHTS)) {
   log(`no weights file (${WEIGHTS}); engine starts from its built-in init — run 'train' to create one`);
 }
 
-// GUI -> engine. Pass everything through; after a `train`, ask the engine to dump
-// its weights so the pump above persists them.
+// GUI -> engine. Pass through; after train/selfplay, ask the engine to dump its weights.
+// selfplay needs a FRESH RNG seed each round (the engine is pure-stdio, no clock) — inject one
+// here, else every round replays identical games and final_mse freezes at a fixed point.
+let seedCtr = 0;
 createInterface({ input: process.stdin }).on("line", (line) => {
-  send(line);
   const c = line.trim();
-  if (c === "train" || c === "selfplay") send("dumpweights");   // persist learned weights
+  if (c === "selfplay") {
+    const seed = ((Date.now() * 1000003 + (seedCtr++)) >>> 0) & 0x7fffffff;   // 時刻+カウンタ, i32 範囲
+    send("selfplay " + seed);
+    send("dumpweights");
+  } else {
+    send(line);
+    if (c === "train") send("dumpweights");   // persist learned weights
+  }
 });
 
 eng.on("exit", (code) => process.exit(code ?? 0));

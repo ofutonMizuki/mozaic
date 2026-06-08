@@ -1339,7 +1339,9 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
 // CNN 評価で 1 手読み(+ε探索)の自己対局を打ち、各局面に最終結果(先手視点 勝=+1/負=-1/分=0)を
 // ラベル付けして価値を回帰。生成→学習を ITERS 回繰り返す(方策が改善するほど対局も改善)。
 // 評価はエンジン同様 CNN のみ。事前に train で初期化しておくと立ち上がりが速い。
-function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
+// seed0: 探索(ε)の乱数種。ラウンドごとに変えないと毎回同一の対局を再生し、データが更新されず
+// final_mse が固定点で凍る(外部ラッパーが時刻由来の種を渡す)。
+function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, seed0: u64) {
   let ITERS: i32 = 4;
   let NPOS: u32 = 160;
   let MAXPLY: i32 = 70;
@@ -1352,7 +1354,8 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
   let ppB: Buffer<f32> = Buffer.shared(MBATCH * NCH);       // GAP 出力(バッチ)
   let vals: Buffer<f32> = Buffer.shared(MBATCH);            // 子局面の評価値(先手視点)
   let mvb: Buffer<i32> = Buffer.shared(MBATCH);             // 各スロットの指し手
-  let seed: u64 = 987654321;
+  let seed: u64 = seed0 ^ 987654321;                  // ラウンドごとに異なる種(ラッパーが供給)
+  if (seed == 0) { seed = 987654321; }                // xorshift は 0 を吸い込むので回避
   let wu: i32 = 0;
   while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
 
@@ -2378,7 +2381,9 @@ function main() {
       trainCNN(&cnv, &cnb, &headW);                   // 物量回帰で初期化(以後の go が使う)
       stdout.flush();
     } else if (toks[0] == "selfplay") {
-      selfplayTrain(&cnv, &cnb, &headW);              // 自己対局の勝敗から価値を強化学習
+      let sd: u64 = 987654321;                        // 省略時は決定的(直接実行/テスト用)
+      if (toks.len > 1) { sd = parseIntStr(&toks[1]) as u64; }   // ラッパーが時刻由来の種を渡す
+      selfplayTrain(&cnv, &cnb, &headW, sd);          // 自己対局の勝敗から価値を強化学習
       stdout.flush();
     } else if (toks[0] == "dumpweights") {
       // 重みを固定小数(×1e6)1 行で出力。外部ラッパーがファイル保存する。

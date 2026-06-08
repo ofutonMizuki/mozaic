@@ -24,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <ctime>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -90,13 +91,22 @@ int main() {
     free(line);
   });
 
-  // GUI -> engine (main thread). Pass through; after `train`, request a dump so the pump persists it.
+  // GUI -> engine (main thread). Pass through; after train/selfplay, request a dump so the pump persists it.
+  // selfplay needs a FRESH RNG seed each round — the engine is pure-stdio (no clock), so we inject one here.
+  // Without it every round replays identical games and final_mse freezes at a fixed point.
   {
+    unsigned long long seedCtr = 0;
     char* line = nullptr; size_t cap = 0; ssize_t n;
     while ((n = getline(&line, &cap, stdin)) >= 0) {
       std::string s(line, (size_t)n); rstrip(s);
-      sendLine(s);
-      if (s == "train" || s == "selfplay") sendLine("dumpweights");   // persist learned weights
+      if (s == "selfplay") {                          // 時刻+カウンタ由来の種を i32 範囲で注入
+        unsigned long long seed = ((unsigned long long)time(nullptr) * 1000003ULL + (seedCtr++)) & 0x7fffffffULL;
+        sendLine("selfplay " + std::to_string(seed));
+        sendLine("dumpweights");
+      } else {
+        sendLine(s);
+        if (s == "train") sendLine("dumpweights");     // persist learned weights
+      }
       if (s == "quit") break;
     }
     free(line);
