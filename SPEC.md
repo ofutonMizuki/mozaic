@@ -67,7 +67,8 @@ true  false  as  defer  some  none  comptime  import
 
 ### 1.5 演算子・記号トークン
 2 文字: `==  !=  <=  >=  =>  ??  &&  ||  +%  -%  *%  +|  -|  *|`
-1 文字: `( ) { } [ ] ; : , . = + - * / % < > & ? !`
+1 文字: `( ) { } [ ] ; : , . = + - * / % < > & ? ! | ^ ~`
+シフト `<<` / `>>` は隣接する 2 つの `<` / `>` から構成する(入れ子総称 `Vec<Box<T>>` を壊さないため字句では分けたまま)。
 
 ---
 
@@ -194,14 +195,20 @@ import "modules/mathmod.mzc";
 | 1 | `??`(オプショナルの既定値) | 左 |
 | 2 | `\|\|` | 左 |
 | 3 | `&&` | 左 |
-| 4 | `== != < <= > >=` | 左 |
-| 5 | `+ -`、`+% -%`(ラップ)、`+\| -\|`(飽和) | 左 |
-| 6 | `* / %`、`*%`(ラップ)、`*\|`(飽和) | 左 |
-| 7 | `as` / `as?`(キャスト) | 左 |
-| 8 | 前置 `! & &mut comptime` | 右 |
-| 9 | 後置 `.field` `[i]` `f(...)` `?`(失敗伝播) | 左 |
+| 4 | `\|`(ビット OR) | 左 |
+| 5 | `^`(ビット XOR) | 左 |
+| 6 | `&`(ビット AND;前置 `&` は借用) | 左 |
+| 7 | `== != < <= > >=` | 左 |
+| 8 | `<< >>`(シフト) | 左 |
+| 9 | `+ -`、`+% -%`(ラップ)、`+\| -\|`(飽和) | 左 |
+| 10 | `* / %`、`*%`(ラップ)、`*\|`(飽和) | 左 |
+| 11 | `as` / `as?`(キャスト) | 左 |
+| 12 | 前置 `! ~ & &mut comptime` | 右 |
+| 13 | 後置 `.field` `[i]` `f(...)` `?`(失敗伝播) | 左 |
 
 論理 `&& \|\| !` は短絡評価で、オペランドは `bool` 必須。**三項演算子 `?:` は無い**(`if`/`match` を使う)。
+**ビット演算**(C と同じ優先順位):`& | ^`(整数のみ・両辺同型)、前置 `~`(補数)、`<< >>`(シフト)。
+シフトは**検査付き**(デバッグはシフト量が幅以上/負で trap、`--release` は幅でマスクして定義動作)。符号付き `>>` は算術シフト。`bool` への `& | ^`、浮動小数のシフト量は型エラー。
 
 ### 4.2 文
 - `let` / `const` 束縛、式文、代入(`lhs = rhs;`、lhs は識別子/フィールド/添字)。
@@ -535,9 +542,11 @@ import "modules/mathmod.mzc";   // インポート元からの相対パス
 ### 13.1 入出力
 | API | 型 | 意味 |
 |---|---|---|
-| `stdin.lines()` | 反復(`for…of` 専用) | 行を UTF-32 で読み、`str` を産む |
+| `stdin.lines()` | 反復(`for…of` 専用) | 行を UTF-32 で読み、`str` を産む(**EOF まで全行を先読み**してから反復) |
 | `stdin.readAll()` | `str` | 標準入力全体を UTF-32 で読む |
+| `stdin.readLine()` | `str?` | 1 行を UTF-32 で読む(EOF で `none`)。`lines()` と違い**EOF を待たずストリーミング**するので、要求/応答型の対話プロトコル(例: USI 将棋エンジン)に使える |
 | `stdout.println(x)` | — | スカラ/`bool`/`char`/`str` を 1 行出力 |
+| `stdout.flush()` | — | 標準出力をフラッシュ。`println` はフラッシュしない(パイプ先へはブロックバッファ)ため、対話エンジンは応答ごとに必須 |
 | `readFile(path: str)` | `str?` | ファイル全体を読む(失敗で `none`) |
 | `writeFile(path: str, content: str)` | `bool` | 書き込み(成功で `true`) |
 
@@ -633,12 +642,16 @@ Vector     = ? identifier of the form <Scalar> "x" <DecimalDigits≥2>, lexed as
 Expr       = OrElse ;
 OrElse     = LogicalOr { "??" LogicalOr } ;
 LogicalOr  = LogicalAnd { "||" LogicalAnd } ;
-LogicalAnd = Comparison { "&&" Comparison } ;
-Comparison = Additive { ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) Additive } ;
+LogicalAnd = BitOr { "&&" BitOr } ;
+BitOr      = BitXor { "|" BitXor } ;
+BitXor     = BitAnd { "^" BitAnd } ;
+BitAnd     = Comparison { "&" Comparison } ;          (* infix & ; prefix & is a borrow *)
+Comparison = Shift { ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) Shift } ;
+Shift      = Additive { ( "<<" | ">>" ) Additive } ;  (* << / >> = two adjacent < / > tokens *)
 Additive   = Mul { ( "+" | "-" | "+%" | "-%" | "+|" | "-|" ) Mul } ;
 Mul        = Cast { ( "*" | "/" | "%" | "*%" | "*|" ) Cast } ;
 Cast       = Unary { ( "as" | "as?" ) Type } ;
-Unary      = ( "&" [ "mut" ] | "!" | "comptime" ) Unary | Postfix ;
+Unary      = ( "&" [ "mut" ] | "!" | "~" | "comptime" ) Unary | Postfix ;
 Postfix    = Primary { "." Ident | "[" Expr "]" | "(" [ Args ] ")" | "?" } ;
 Primary    = Num | Float | Str | Char | Bool | Template
            | "some" "(" Expr ")" | "none"
@@ -676,9 +689,9 @@ tests/prove.sh                                      # 3 段証明: CPU + GPU==CP
 本書は実装済みの言語を規範とする。実装の正確な反映として、以下を未実装・既知の限界・長期構想に分けて明記する。
 
 ### 17.1 未実装(構文・機能)
-- **ビット演算なし**: `| ^ ~ << >>` は字句にも優先順位表にも無い(`&` は借用専用、`&&`/`||` は論理のみ)。
-  マスク・シフト・ビットパッキングは現状書けない。`Atomic` の RMW も `fetchAdd`/`compareExchange` の 2 つだけで、
-  `fetchSub`/`fetchAnd`/`fetchOr`/`exchange`/`fetchMax` 等は無い。
+- **ビット演算は実装済み**(2026-06-04): `& | ^`(整数のみ)・前置 `~`・`<< >>`(検査付きシフト)を §4.1 の優先順位で
+  サポート(host C++ / `comptime` 折込み / GPU カーネル MSL すべて)。残るのは `Atomic` の RMW の不足:
+  `fetchAdd`/`compareExchange` のみで `fetchSub`/`fetchAnd`/`fetchOr`/`exchange`/`fetchMax` 等は無い。
 - 旧 v0.1 草案にあった構文糖のうち未実装: **16 進/2 進リテラル・型接尾辞**、**三項演算子 `?:`**、
   `for (c of s.chars())` 等の汎用 `for…of`(現状 `stdin.lines()` 専用)、`Result` の `.map`/`.map_err`/`.ok` コンビネータ、
   検査付き算術メソッド(`.checkedAdd` 等)、**配列/スライス/`Buffer` の実行時境界検査**(§7.3:現状 OOB は UB)。

@@ -101,7 +101,12 @@ export class Comptime {
         throw new CompileError(`comptime: cannot read .${e.prop}`);
       }
       case "Cast": return this.cast(this.eval(e.expr, env), e.toTy, e.opt);
-      case "Unary": { const v = this.eval(e.expr, env); if (v.k !== "bool") throw new CompileError("comptime: '!' needs a bool"); return { k: "bool", v: !v.v }; }
+      case "Unary": {
+        const v = this.eval(e.expr, env);
+        if (e.op === "~") { if (v.k !== "int") throw new CompileError("comptime: '~' needs an integer"); const ty = e.ty && WIDTH[e.ty] ? e.ty : "i32"; return { k: "int", v: wrapInt(~v.v, ty) }; }
+        if (v.k !== "bool") throw new CompileError("comptime: '!' needs a bool");
+        return { k: "bool", v: !v.v };
+      }
       case "Binary": return this.binary(e, env);
       case "Call": return this.call(e, env);
       default: throw new CompileError(`comptime: '${e.kind}' is not allowed in a compile-time expression`);
@@ -158,6 +163,14 @@ export class Comptime {
       case "+|": return { k: "int", v: this.sat(a + b, ty) }; case "-|": return { k: "int", v: this.sat(a - b, ty) }; case "*|": return { k: "int", v: this.sat(a * b, ty) };
       case "/": { if (b === 0n) throw new CompileError("comptime: division by zero"); return this.checked(this.tdiv(a, b), ty); }
       case "%": { if (b === 0n) throw new CompileError("comptime: remainder by zero"); return { k: "int", v: a % b }; }
+      case "&": return { k: "int", v: wrapInt(a & b, ty) };
+      case "|": return { k: "int", v: wrapInt(a | b, ty) };
+      case "^": return { k: "int", v: wrapInt(a ^ b, ty) };
+      case "<<": case ">>": {
+        const w = BigInt(WIDTH[ty] ?? 32);
+        if (b < 0n || b >= w) throw new CompileError(`comptime: shift count ${b} out of range for ${ty}`);
+        return { k: "int", v: wrapInt(op === "<<" ? a << b : a >> b, ty) };
+      }
       default: throw new CompileError(`comptime: operator '${op}' not allowed`);
     }
   }

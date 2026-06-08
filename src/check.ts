@@ -1038,11 +1038,13 @@ class Checker {
           if (recv === "String" && m === "new") { if (e.args.length) this.err("String.new() takes no arguments"); e.ty = "str"; return e.ty; }
           if (recv === "stdin" && m === "lines") { e.ty = "str-iter"; return e.ty; }
           if (recv === "stdin" && m === "readAll") { if (e.args.length) this.err("stdin.readAll() takes no arguments"); e.ty = "str"; return e.ty; }
+          if (recv === "stdin" && m === "readLine") { if (e.args.length) this.err("stdin.readLine() takes no arguments"); e.ty = "str?"; return e.ty; }
           if (recv === "stdout" && m === "println") {
             const at = e.args.length === 1 ? this.checkExpr(e.args[0]) : "unit";
             if (!(at === "str" || at === "bool" || at === "char" || isInt(at) || isFloat(at))) this.err(`stdout.println: cannot print ${at}`);
             e.ty = "unit"; return e.ty;
           }
+          if (recv === "stdout" && m === "flush") { if (e.args.length) this.err("stdout.flush() takes no arguments"); e.ty = "unit"; return e.ty; }
         }
         // atomic methods on an Atomic<T> receiver (load/store/fetchAdd/compareExchange), task.join(),
         // and user struct methods (recv.method(args), auto-deref through &T).
@@ -1189,8 +1191,12 @@ class Checker {
         e.ty = ret ? `Task<${ret}>` : "Task";   // a value-returning fn yields Task<R>; join() gives R back
         return e.ty;
       }
-      case "Unary": {   // prefix !x — logical not
+      case "Unary": {   // prefix !x (logical not) / ~x (bitwise complement)
         const it = this.checkExpr(e.expr);
+        if (e.op === "~") {
+          if (!isInt(it)) this.err(`'~' requires an integer operand (got ${it})`);
+          e.ty = it; return e.ty;   // keeps the operand's integer type (intlit stays intlit, adapts to context)
+        }
         if (it !== "bool") this.err(`'!' requires a bool operand (got ${it})`);
         e.ty = "bool"; return e.ty;
       }
@@ -1209,6 +1215,19 @@ class Checker {
         if (e.op === "&&" || e.op === "||") {   // logical: both operands bool, result bool
           if (lt !== "bool" || rt !== "bool") this.err(`'${e.op}' requires bool operands (got ${lt}, ${rt})`);
           e.ty = "bool"; return e.ty;
+        }
+        if (e.op === "&" || e.op === "|" || e.op === "^") {   // bitwise AND/OR/XOR: integer-only, matching types
+          if (!isInt(lt) || !isInt(rt)) this.err(`'${e.op}' requires integer operands (got ${lt}, ${rt})`);
+          const u = unifyInt(lt, rt);
+          if (u === null) { this.err(`'${e.op}' requires matching integer types (got ${lt}, ${rt})`); e.ty = "i32"; }
+          else e.ty = u;
+          return e.ty;
+        }
+        if (e.op === "<<" || e.op === ">>") {   // shifts: integer left (result type) shifted by integer count
+          if (!isInt(lt)) this.err(`'${e.op}' requires an integer left operand (got ${lt})`);
+          if (!isInt(rt)) this.err(`'${e.op}' shift count must be an integer (got ${rt})`);
+          e.ty = lt;   // result type = left operand type (count type is independent)
+          return e.ty;
         }
         if (e.op === "+" && lt === "str" && rt === "str") { e.ty = "str"; return e.ty; }   // string concatenation
         if (ARITH_OPS.includes(e.op)) {

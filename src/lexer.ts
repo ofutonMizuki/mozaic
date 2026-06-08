@@ -98,7 +98,9 @@ export function lex(src: string): Tok[] {
         two === "+%" || two === "-%" || two === "*%" || two === "+|" || two === "-|" || two === "*|") {
       toks.push({ t: two, v: two, pos: i }); i += 2; continue;
     }
-    if ("(){}[];:,.=+-*/%<>&?!".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
+    // single-char tokens. `| ^ ~` added for bitwise OR/XOR/NOT (`&` is shared with borrow; `<<`/`>>`
+    // are formed from two adjacent `<`/`>` in the parser, so generic `Vec<Box<T>>` keeps working).
+    if ("(){}[];:,.=+-*/%<>&?!|^~".includes(c)) { toks.push({ t: c, v: c, pos: i }); i++; continue; }
     throw new Error(`lex error: unexpected '${c}' at ${i}`);
   }
   toks.push({ t: "eof", v: "", pos: n });

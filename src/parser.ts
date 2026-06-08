@@ -285,15 +285,43 @@ export class Parser {
     return left;
   }
   parseLogicalAnd(): Expr {
+    let left = this.parseBitOr();
+    while (this.at("&&")) { this.next(); left = { kind: "Binary", op: "&&", left, right: this.parseBitOr() }; }
+    return left;
+  }
+  // Bitwise precedence (C order, all tighter than && and looser than comparison): | < ^ < &.
+  parseBitOr(): Expr {
+    let left = this.parseBitXor();
+    while (this.at("|")) { this.next(); left = { kind: "Binary", op: "|", left, right: this.parseBitXor() }; }
+    return left;
+  }
+  parseBitXor(): Expr {
+    let left = this.parseBitAnd();
+    while (this.at("^")) { this.next(); left = { kind: "Binary", op: "^", left, right: this.parseBitAnd() }; }
+    return left;
+  }
+  parseBitAnd(): Expr {   // infix `&` (a prefix `&` is a borrow, parsed in parseUnary — position disambiguates)
     let left = this.parseComparison();
-    while (this.at("&&")) { this.next(); left = { kind: "Binary", op: "&&", left, right: this.parseComparison() }; }
+    while (this.at("&")) { this.next(); left = { kind: "Binary", op: "&", left, right: this.parseComparison() }; }
     return left;
   }
   parseComparison(): Expr {
-    let left = this.parseAdditive();
+    let left = this.parseShift();
     while (this.at("==") || this.at("!=") || this.at("<") || this.at("<=") || this.at(">") || this.at(">=")) {
       const op = this.next().t;
-      left = { kind: "Binary", op, left, right: this.parseAdditive() };
+      left = { kind: "Binary", op, left, right: this.parseShift() };
+    }
+    return left;
+  }
+  // Shifts `<< >>` are formed from two ADJACENT `<`/`>` tokens (consecutive source positions), so the
+  // type grammar's `Vec<Box<T>>` (which lexes as separate `<`/`>`) is untouched. Tighter than comparison.
+  parseShift(): Expr {
+    let left = this.parseAdditive();
+    for (;;) {
+      const a = this.peek(), b = this.toks[this.i + 1];
+      if (a.t === "<" && b?.t === "<" && b.pos === a.pos + 1) { this.next(); this.next(); left = { kind: "Binary", op: "<<", left, right: this.parseAdditive() }; }
+      else if (a.t === ">" && b?.t === ">" && b.pos === a.pos + 1) { this.next(); this.next(); left = { kind: "Binary", op: ">>", left, right: this.parseAdditive() }; }
+      else break;
     }
     return left;
   }
@@ -332,6 +360,7 @@ export class Parser {
     }
     if (this.at("comptime")) { this.next(); return { kind: "Comptime", expr: this.parseUnary() }; }
     if (this.at("!")) { this.next(); return { kind: "Unary", op: "!", expr: this.parseUnary() }; }
+    if (this.at("~")) { this.next(); return { kind: "Unary", op: "~", expr: this.parseUnary() }; }   // bitwise complement
     return this.parsePostfix();
   }
   parsePostfix(): Expr {

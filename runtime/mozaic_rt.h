@@ -152,6 +152,28 @@ template <class A, class B> auto chk_mod(const A& a, const B& b) {
   } else return a % b;
 }
 
+// ---- bit shifts (checked) ----
+// Trap on an out-of-range / negative shift count in debug; in release, mask the count to [0,width) so the
+// result is always defined (raw `a << b` is UB for b >= width or b < 0). Result type T = left operand.
+template <class T, class U> T shl(T a, U b) {
+  static_assert(std::is_integral_v<T> && std::is_integral_v<U>, "shift operands must be integers");
+  constexpr unsigned W = (unsigned)(sizeof(T) * 8);
+#ifndef MZ_RELEASE
+  if constexpr (std::is_signed_v<U>) { if (b < 0) panic("negative shift count in '<<'"); }
+  if ((unsigned long long)b >= W) panic("shift count out of range in '<<'");
+#endif
+  return (T)(a << ((unsigned)b & (W - 1)));   // C++20: left shift of any integer is well-defined (mod 2^W)
+}
+template <class T, class U> T shr(T a, U b) {
+  static_assert(std::is_integral_v<T> && std::is_integral_v<U>, "shift operands must be integers");
+  constexpr unsigned W = (unsigned)(sizeof(T) * 8);
+#ifndef MZ_RELEASE
+  if constexpr (std::is_signed_v<U>) { if (b < 0) panic("negative shift count in '>>'"); }
+  if ((unsigned long long)b >= W) panic("shift count out of range in '>>'");
+#endif
+  return (T)(a >> ((unsigned)b & (W - 1)));   // signed `a` -> arithmetic (sign-extending) shift
+}
+
 // `[]T` slice: a {ptr, len} view (no ownership). Built from a fixed array via slice(arr).
 // Lifetimes are not yet checked (M5), so a slice must not outlive its backing storage.
 template <class T> struct Slice {
@@ -551,6 +573,15 @@ inline std::vector<String> stdin_lines() {
   }
   return lines;
 }
+// Read ONE line from stdin, blocking (UTF-8 -> UTF-32). Returns none at EOF. Unlike
+// stdin_lines() this does NOT buffer to EOF first, so it supports interactive,
+// request/response protocols (e.g. a USI shogi engine talking to a GUI).
+inline std::optional<String> read_line() {
+  std::string line;
+  if (!std::getline(std::cin, line)) return std::nullopt;
+  if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF
+  return decodeUtf8(line);
+}
 // std::string (byte) variant for the self-hosted compiler, whose str == std::string.
 inline std::vector<std::string> stdin_lines_str() {
   std::vector<std::string> lines;
@@ -580,6 +611,9 @@ inline void println(long long v)             { std::cout << v << "\n"; }
 inline void println(unsigned long long v)    { std::cout << v << "\n"; }
 inline void println(double v)                { std::cout << v << "\n"; }
 inline void println(bool v)                  { std::cout << (v ? "true" : "false") << "\n"; }
+// Flush stdout. println() does not flush (cout is block-buffered to a pipe), so an
+// interactive engine must flush after each response or a waiting GUI never sees it.
+inline void flush_stdout()                   { std::cout.flush(); }
 
 inline bool eq(const String& a, const char* b) { return a == decodeUtf8(std::string(b)); }
 inline bool eq(const String& a, const String& b) { return a == b; }

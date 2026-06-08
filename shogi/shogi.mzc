@@ -1,0 +1,824 @@
+// ============================================================================
+//  shogi.mzc — 将棋エンジン (αβ探索 + 評価関数) を mozaic で実装
+// ----------------------------------------------------------------------------
+//  ・盤面 9x9 = 81 マス。駒は i32 コード(下位4bit=駒種, bit4=後手フラグ)。
+//  ・持ち駒(駒台)・成り・打ち・二歩・行きどころのない駒 を扱う。
+//  ・指し手は擬似合法手を生成し、「玉を取れたら勝ち(MATE)」とすることで
+//    王手放置を探索が自然に回避する(将棋/チェス系エンジンの定番簡略化)。
+//  ・探索: ネガマックス αβ + 静止探索(quiescence) + 駒得優先ムーブオーダリング。
+//  ・評価: 駒得(盤上+持ち駒) + 軽い位置評価。
+//
+//  指し手のパッキング(i32 1個に詰める。Copy 型になり Vec<i32> 操作が楽):
+//    bit  0.. 6 : to   (0..80)
+//    bit  7..13 : from (0..80 が盤上手, 81..87 は打ち = 80+駒種)
+//    bit 14     : promo(成りなら 1)
+//  ムーブオーダリング用に「評価キー」を bit16 以上に載せて Vec へ push する。
+// ============================================================================
+
+// ---- 手番 ----
+const SENTE: i32 = 0;     // 先手(下手・盤の下側、上=rank0 方向へ進む)
+const GOTE: i32  = 1;     // 後手(上手・盤の上側、下=rank8 方向へ進む)
+
+// ---- 駒種(基本 1..8、成り = 基本+8 で 9..14) ----
+const PAWN: i32   = 1;    // 歩
+const LANCE: i32  = 2;    // 香
+const KNIGHT: i32 = 3;    // 桂
+const SILVER: i32 = 4;    // 銀
+const BISHOP: i32 = 5;    // 角
+const ROOK: i32   = 6;    // 飛
+const GOLD: i32   = 7;    // 金 (成れない)
+const KING: i32   = 8;    // 玉 (成れない)
+const PPAWN: i32   = 9;   // と
+const PLANCE: i32  = 10;  // 成香
+const PKNIGHT: i32 = 11;  // 成桂
+const PSILVER: i32 = 12;  // 成銀
+const PBISHOP: i32 = 13;  // 馬
+const PROOK: i32   = 14;  // 龍
+
+// ---- 探索定数 ----
+const INF: i32  = 2000000;
+const MATE: i32 = 1000000;
+const DEPTH: i32  = 4;    // 自己対局の探索深さ
+const MAXPLY: i32 = 24;   // 自己対局の最大手数
+
+// ============================================================================
+//  駒コードの小道具
+// ============================================================================
+
+function typeOf(p: i32): i32 { return p & 15; }              // 駒種(1..14)
+function colorOf(p: i32): i32 {                              // p != 0 のときのみ有効
+  if ((p & 16) != 0) { return GOTE; }
+  return SENTE;
+}
+function pieceCode(me: i32, t: i32): i32 {                   // 手番+駒種 -> 盤コード
+  if (me == GOTE) { return t | 16; }
+  return t;
+}
+function baseType(t: i32): i32 {                             // 成駒 -> 元の駒種(取って持ち駒にする時)
+  if (t > 8) { return t - 8; }
+  return t;
+}
+function inZone(r: i32, me: i32): bool {                     // 成れる段(敵陣)か
+  if (me == SENTE) { return r <= 2; }
+  return r >= 6;
+}
+
+function pieceValue(t: i32): i32 {                           // 駒の価値(評価/オーダリング用)
+  if (t == PAWN)    { return 100; }
+  if (t == LANCE)   { return 430; }
+  if (t == KNIGHT)  { return 450; }
+  if (t == SILVER)  { return 640; }
+  if (t == GOLD)    { return 690; }
+  if (t == BISHOP)  { return 890; }
+  if (t == ROOK)    { return 1040; }
+  if (t == KING)    { return 15000; }
+  if (t == PPAWN)   { return 420; }
+  if (t == PLANCE)  { return 480; }
+  if (t == PKNIGHT) { return 510; }
+  if (t == PSILVER) { return 540; }
+  if (t == PBISHOP) { return 1150; }
+  if (t == PROOK)   { return 1300; }
+  return 0;
+}
+
+// 軽い位置評価: 玉は自陣深くで安全、攻め駒は前進で加点(微小)。
+function posBonus(t: i32, r: i32, c: i32): i32 {
+  if (t == KING) {
+    if (c == SENTE) { return r * 3; }       // r 大(盤下)=安全
+    return (8 - r) * 3;
+  }
+  let adv: i32 = 0;
+  if (c == SENTE) { adv = 8 - r; } else { adv = r; }   // 敵陣へ近いほど大
+  if (t == PAWN || t == PPAWN) { return adv * 2; }
+  return adv * 4;
+}
+
+// ---- 指し手パック ----
+function pushMove(moves: &mut Vec<i32>, from: i32, to: i32, promo: i32, key: i32) {
+  let mv: i32 = to | (from << 7) | (promo << 14);
+  moves.push((key << 16) | mv);
+}
+
+// 1 マスへの着手を生成(成り/不成・駒打ち禁則は emit が判断)。target は移動先の駒(0=空)。
+function emit(moves: &mut Vec<i32>, from: i32, to: i32, tr: i32, t: i32, me: i32, target: i32, capsOnly: bool) {
+  let key: i32 = 0;
+  let isCap: bool = false;
+  if (target != 0) { isCap = true; key = pieceValue(typeOf(target)); }
+
+  let fr: i32 = from / 9;
+  let promotable: bool = (t <= 6) && (inZone(fr, me) || inZone(tr, me));
+
+  // 行きどころのない駒は成り強制
+  let must: bool = false;
+  if (t == PAWN || t == LANCE) {
+    if ((me == SENTE && tr == 0) || (me == GOTE && tr == 8)) { must = true; }
+  } else if (t == KNIGHT) {
+    if ((me == SENTE && tr <= 1) || (me == GOTE && tr >= 7)) { must = true; }
+  }
+
+  if (promotable) {
+    pushMove(moves, from, to, 1, key + 50);             // 成る手
+    if (!must && !capsOnly) {
+      pushMove(moves, from, to, 0, key);                // 不成(静止探索では省略)
+    }
+  } else {
+    pushMove(moves, from, to, 0, key);
+  }
+}
+
+// ============================================================================
+//  盤面
+// ============================================================================
+
+struct Board {
+  sq: Vec<i32>;     // 81 マス。index = rank*9 + file (rank0=上端, file0=左端)
+  hand: Vec<i32>;   // 持ち駒。index = me*8 + 駒種(1..7)。size 16。
+  side: i32;        // 手番
+
+  // 1 マスへの着手を試す。戻り値: 0=不可で停止 / 1=空(着手し継続) / 2=取り(着手し停止)
+  function tryTo(&self, moves: &mut Vec<i32>, from: i32, tr: i32, tf: i32, t: i32, me: i32, capsOnly: bool): i32 {
+    if (tr < 0 || tr >= 9 || tf < 0 || tf >= 9) { return 0; }
+    let to: i32 = tr * 9 + tf;
+    let target: i32 = self.sq[to];
+    if (target != 0 && colorOf(target) == me) { return 0; }   // 自駒で塞がれる
+    if (capsOnly && target == 0) { return 1; }                // 静止探索: 空マスは飛ばすが滑走は継続
+    emit(moves, from, to, tr, t, me, target, capsOnly);
+    if (target != 0) { return 2; }                            // 取り: 停止
+    return 1;                                                  // 空: 継続
+  }
+
+  // 滑走駒(香・角・飛・馬・龍)の一方向。
+  function slide(&self, moves: &mut Vec<i32>, from: i32, r: i32, f: i32, dr: i32, df: i32, t: i32, me: i32, capsOnly: bool) {
+    let rr: i32 = r + dr;
+    let ff: i32 = f + df;
+    let cont: bool = true;
+    while (cont) {
+      let st: i32 = self.tryTo(moves, from, rr, ff, t, me, capsOnly);
+      if (st != 1) { cont = false; } else { rr = rr + dr; ff = ff + df; }
+    }
+  }
+
+  // 1 個の駒(r,f に居る駒種 t)の指し手。fwd = 前進方向の rank 差(先手 -1 / 後手 +1)。
+  function genPiece(&self, moves: &mut Vec<i32>, t: i32, r: i32, f: i32, fwd: i32, me: i32, capsOnly: bool) {
+    let from: i32 = r * 9 + f;
+    let back: i32 = 0 - fwd;
+    if (t == PAWN) {
+      self.tryTo(moves, from, r + fwd, f, t, me, capsOnly);
+    } else if (t == LANCE) {
+      self.slide(moves, from, r, f, fwd, 0, t, me, capsOnly);
+    } else if (t == KNIGHT) {
+      self.tryTo(moves, from, r + fwd + fwd, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + fwd + fwd, f + 1, t, me, capsOnly);
+    } else if (t == SILVER) {
+      self.tryTo(moves, from, r + fwd, f, t, me, capsOnly);
+      self.tryTo(moves, from, r + fwd, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + fwd, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + back, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + back, f + 1, t, me, capsOnly);
+    } else if (t == GOLD || (t >= 9 && t <= 12)) {           // 金 / と・成香・成桂・成銀
+      self.tryTo(moves, from, r + fwd, f, t, me, capsOnly);
+      self.tryTo(moves, from, r + fwd, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + fwd, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + back, f, t, me, capsOnly);
+    } else if (t == KING) {
+      self.tryTo(moves, from, r - 1, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r - 1, f, t, me, capsOnly);
+      self.tryTo(moves, from, r - 1, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f + 1, t, me, capsOnly);
+    } else if (t == BISHOP) {
+      self.slide(moves, from, r, f, 1, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 1, 0 - 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 0 - 1, t, me, capsOnly);
+    } else if (t == ROOK) {
+      self.slide(moves, from, r, f, 1, 0, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 0, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0, 0 - 1, t, me, capsOnly);
+    } else if (t == PBISHOP) {                               // 馬 = 角 + 王の縦横一歩
+      self.slide(moves, from, r, f, 1, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 1, 0 - 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 0 - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r - 1, f, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f, t, me, capsOnly);
+      self.tryTo(moves, from, r, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r, f + 1, t, me, capsOnly);
+    } else if (t == PROOK) {                                 // 龍 = 飛 + 王の斜め一歩
+      self.slide(moves, from, r, f, 1, 0, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0 - 1, 0, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0, 1, t, me, capsOnly);
+      self.slide(moves, from, r, f, 0, 0 - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r - 1, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r - 1, f + 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f - 1, t, me, capsOnly);
+      self.tryTo(moves, from, r + 1, f + 1, t, me, capsOnly);
+    }
+  }
+
+  // 駒打ちの可否(二歩・行きどころのない駒を禁止。打ち歩詰めは未対応)。
+  function canDrop(&self, t: i32, r: i32, f: i32, me: i32): bool {
+    if (t == PAWN) {
+      if (me == SENTE && r == 0) { return false; }
+      if (me == GOTE && r == 8) { return false; }
+      let rr: i32 = 0;                                       // 二歩チェック
+      while (rr < 9) {
+        let q: i32 = self.sq[rr * 9 + f];
+        if (q != 0 && colorOf(q) == me && typeOf(q) == PAWN) { return false; }
+        rr = rr + 1;
+      }
+      return true;
+    }
+    if (t == LANCE) {
+      if (me == SENTE && r == 0) { return false; }
+      if (me == GOTE && r == 8) { return false; }
+      return true;
+    }
+    if (t == KNIGHT) {
+      if (me == SENTE && r <= 1) { return false; }
+      if (me == GOTE && r >= 7) { return false; }
+      return true;
+    }
+    return true;
+  }
+
+  function genDrops(&self, moves: &mut Vec<i32>, me: i32) {
+    let t: i32 = 1;
+    while (t <= 7) {
+      let cnt: i32 = self.hand[me * 8 + t];
+      if (cnt > 0) {
+        let s: i32 = 0;
+        while (s < 81) {
+          if (self.sq[s] == 0) {
+            let r: i32 = s / 9;
+            let f: i32 = s % 9;
+            if (self.canDrop(t, r, f, me)) {
+              pushMove(moves, 80 + t, s, 0, 0);             // from = 80+駒種 で打ちを表す
+            }
+          }
+          s = s + 1;
+        }
+      }
+      t = t + 1;
+    }
+  }
+
+  // 手番側の全(擬似合法)指し手。capsOnly=true なら駒を取る手のみ(静止探索用)。
+  function gen(&self, capsOnly: bool): Vec<i32> {
+    let moves: Vec<i32> = Vec.new();
+    let me: i32 = self.side;
+    let fwd: i32 = 1;
+    if (me == SENTE) { fwd = 0 - 1; }
+    let s: i32 = 0;
+    while (s < 81) {
+      let p: i32 = self.sq[s];
+      if (p != 0 && colorOf(p) == me) {
+        self.genPiece(&mut moves, typeOf(p), s / 9, s % 9, fwd, me, capsOnly);
+      }
+      s = s + 1;
+    }
+    if (!capsOnly) { self.genDrops(&mut moves, me); }
+    return moves;
+  }
+
+  // 指す(取った駒コードを返す。undo に渡す)。m は 16bit に詰めた指し手。
+  function doMove(&mut self, m: i32): i32 {
+    let me: i32 = self.side;
+    let to: i32 = m & 127;
+    let from: i32 = (m >> 7) & 127;
+    if (from > 80) {                                        // 打ち
+      let t: i32 = from - 80;
+      self.sq[to] = pieceCode(me, t);
+      self.hand[me * 8 + t] = self.hand[me * 8 + t] - 1;
+      self.side = 1 - me;
+      return 0;
+    }
+    let promo: i32 = (m >> 14) & 1;
+    let cap: i32 = self.sq[to];
+    let p: i32 = self.sq[from];
+    self.sq[from] = 0;
+    let placed: i32 = p;
+    if (promo == 1) { placed = p + 8; }
+    self.sq[to] = placed;
+    if (cap != 0) {
+      let bt: i32 = baseType(typeOf(cap));
+      if (bt <= 7) { self.hand[me * 8 + bt] = self.hand[me * 8 + bt] + 1; }   // 玉(8)は持ち駒にしない
+    }
+    self.side = 1 - me;
+    return cap;
+  }
+
+  function undoMove(&mut self, m: i32, cap: i32) {
+    let me: i32 = 1 - self.side;                            // 指した側
+    self.side = me;
+    let to: i32 = m & 127;
+    let from: i32 = (m >> 7) & 127;
+    if (from > 80) {
+      let t: i32 = from - 80;
+      self.sq[to] = 0;
+      self.hand[me * 8 + t] = self.hand[me * 8 + t] + 1;
+      return;
+    }
+    let promo: i32 = (m >> 14) & 1;
+    let placed: i32 = self.sq[to];
+    let orig: i32 = placed;
+    if (promo == 1) { orig = placed - 8; }
+    self.sq[from] = orig;
+    self.sq[to] = cap;
+    if (cap != 0) {
+      let bt: i32 = baseType(typeOf(cap));
+      if (bt <= 7) { self.hand[me * 8 + bt] = self.hand[me * 8 + bt] - 1; }
+    }
+  }
+
+  // 評価(先手視点)。+ が先手有利。
+  function eval(&self): i32 {
+    let score: i32 = 0;
+    let s: i32 = 0;
+    while (s < 81) {
+      let p: i32 = self.sq[s];
+      if (p != 0) {
+        let t: i32 = typeOf(p);
+        let c: i32 = colorOf(p);
+        let v: i32 = pieceValue(t) + posBonus(t, s / 9, c);
+        if (c == SENTE) { score = score + v; } else { score = score - v; }
+      }
+      s = s + 1;
+    }
+    let t2: i32 = 1;
+    while (t2 <= 7) {
+      score = score + self.hand[t2] * pieceValue(t2);        // 先手の持ち駒
+      score = score - self.hand[8 + t2] * pieceValue(t2);    // 後手の持ち駒
+      t2 = t2 + 1;
+    }
+    return score;
+  }
+
+  // 手番側視点の評価(ネガマックス用)。
+  function evalToMove(&self): i32 {
+    let s: i32 = self.eval();
+    if (self.side == GOTE) { return 0 - s; }
+    return s;
+  }
+
+  function show(&self) {
+    let r: i32 = 0;
+    while (r < 9) {
+      let line: str = "";
+      let f: i32 = 0;
+      while (f < 9) {
+        line = line + glyph(self.sq[r * 9 + f]);
+        f = f + 1;
+      }
+      stdout.println(line);
+      r = r + 1;
+    }
+    stdout.println(`S hand: P${self.hand[1]} L${self.hand[2]} N${self.hand[3]} S${self.hand[4]} G${self.hand[7]} B${self.hand[5]} R${self.hand[6]}`);
+    stdout.println(`G hand: P${self.hand[9]} L${self.hand[10]} N${self.hand[11]} S${self.hand[12]} G${self.hand[15]} B${self.hand[13]} R${self.hand[14]}`);
+  }
+}
+
+// ============================================================================
+//  指し手の文字列化(USI 風: 7g7f / P*5e / 7g7f+)・盤表示
+// ============================================================================
+
+function fileChar(f: i32): char { return ((9 - f) as u32 + ('0' as u32)) as char; }  // USI筋 = 9-f
+function rankChar(r: i32): char { return (('a' as u32) + (r as u32)) as char; }       // a..i
+function sqStr(s: i32): str { return `${fileChar(s % 9)}${rankChar(s / 9)}`; }
+
+function pieceLetter(t: i32): char {
+  if (t == PAWN)   { return 'P'; }
+  if (t == LANCE)  { return 'L'; }
+  if (t == KNIGHT) { return 'N'; }
+  if (t == SILVER) { return 'S'; }
+  if (t == BISHOP) { return 'B'; }
+  if (t == ROOK)   { return 'R'; }
+  if (t == GOLD)   { return 'G'; }
+  if (t == KING)   { return 'K'; }
+  return '?';
+}
+
+function moveStr(m: i32): str {
+  let to: i32 = m & 127;
+  let from: i32 = (m >> 7) & 127;
+  if (from > 80) { return `${pieceLetter(from - 80)}*${sqStr(to)}`; }
+  let promo: i32 = (m >> 14) & 1;
+  if (promo == 1) { return `${sqStr(from)}${sqStr(to)}+`; }
+  return `${sqStr(from)}${sqStr(to)}`;
+}
+
+function glyph(p: i32): str {
+  if (p == 0) { return " ."; }
+  let t: i32 = typeOf(p);
+  let ch: char = pieceLetter(baseType(t));
+  let pre: str = " ";
+  if (t > 8) { pre = "+"; }
+  if (colorOf(p) == GOTE) { ch = ((ch as u32) + 32) as char; }   // 後手は小文字
+  return `${pre}${ch}`;
+}
+
+// ============================================================================
+//  perft(指し手生成の検証用: 葉ノード数を数える)
+// ============================================================================
+
+function perft(b: &mut Board, depth: i32): i64 {
+  if (depth == 0) { return 1; }
+  let moves: Vec<i32> = b.gen(false);
+  let n: u32 = moves.len;
+  let total: i64 = 0;
+  let i: u32 = 0;
+  while (i < n) {
+    let m: i32 = moves[i] & 65535;
+    let cap: i32 = b.doMove(m);
+    total = total + perft(b, depth - 1);
+    b.undoMove(m, cap);
+    i = i + 1;
+  }
+  return total;
+}
+
+// ============================================================================
+//  探索: ネガマックス αβ + 静止探索
+// ============================================================================
+
+struct Best { mv: i32; score: i32; }
+
+// 静止探索: 駒を取り合う手だけを読み、局面が落ち着いてから評価する。
+function qsearch(b: &mut Board, alpha: i32, beta: i32, ply: i32): i32 {
+  let stand: i32 = b.evalToMove();
+  if (stand >= beta) { return beta; }
+  let a: i32 = alpha;
+  if (stand > a) { a = stand; }
+
+  let moves: Vec<i32> = b.gen(true);
+  let n: u32 = moves.len;
+  let i: u32 = 0;
+  while (i < n) {
+    // 残りからキー最大の手を選ぶ(遅延セレクションソート)。
+    let bi: u32 = i;
+    let j: u32 = i + 1;
+    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+    let m: i32 = moves[i] & 65535;
+    let cap: i32 = b.doMove(m);
+    let score: i32 = 0;
+    if (typeOf(cap) == KING) { score = MATE - ply; }
+    else { score = 0 - qsearch(b, 0 - beta, 0 - a, ply + 1); }
+    b.undoMove(m, cap);
+
+    if (score >= beta) { return beta; }
+    if (score > a) { a = score; }
+    i = i + 1;
+  }
+  return a;
+}
+
+function search(b: &mut Board, depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
+  if (depth <= 0) { return qsearch(b, alpha, beta, ply); }
+  let moves: Vec<i32> = b.gen(false);
+  let n: u32 = moves.len;
+  if (n == 0) { return (0 - MATE) + ply; }                  // 指す手なし = 負け
+
+  let best: i32 = 0 - INF;
+  let a: i32 = alpha;
+  let i: u32 = 0;
+  while (i < n) {
+    let bi: u32 = i;
+    let j: u32 = i + 1;
+    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+    let m: i32 = moves[i] & 65535;
+    let cap: i32 = b.doMove(m);
+    let score: i32 = 0;
+    if (typeOf(cap) == KING) { score = MATE - ply; }        // 玉を取れたら即勝ち
+    else { score = 0 - search(b, depth - 1, 0 - beta, 0 - a, ply + 1); }
+    b.undoMove(m, cap);
+
+    if (score > best) {
+      best = score;
+      if (score > a) { a = score; }
+    }
+    if (a >= beta) { break; }                               // βカット
+    i = i + 1;
+  }
+  return best;
+}
+
+// ルート探索: 最善手と評価値を返す。
+function rootSearch(b: &mut Board, depth: i32): Best {
+  let moves: Vec<i32> = b.gen(false);
+  let n: u32 = moves.len;
+  let bestMv: i32 = 0 - 1;
+  let bestScore: i32 = 0 - INF;
+  let a: i32 = 0 - INF;
+  let i: u32 = 0;
+  while (i < n) {
+    let bi: u32 = i;
+    let j: u32 = i + 1;
+    while (j < n) { if ((moves[j] >> 16) > (moves[bi] >> 16)) { bi = j; } j = j + 1; }
+    let tmp: i32 = moves[i]; moves[i] = moves[bi]; moves[bi] = tmp;
+
+    let m: i32 = moves[i] & 65535;
+    let cap: i32 = b.doMove(m);
+    let score: i32 = 0;
+    if (typeOf(cap) == KING) { score = MATE - 1; }
+    else { score = 0 - search(b, depth - 1, 0 - INF, 0 - a, 1); }
+    b.undoMove(m, cap);
+
+    if (score > bestScore) { bestScore = score; bestMv = m; if (score > a) { a = score; } }
+    i = i + 1;
+  }
+  return Best { mv: bestMv, score: bestScore };
+}
+
+// ============================================================================
+//  初期局面
+// ============================================================================
+
+function zeros(n: i32): Vec<i32> {
+  let v: Vec<i32> = Vec.new();
+  let i: i32 = 0;
+  while (i < n) { v.push(0); i = i + 1; }
+  return v;
+}
+
+function emptyBoard(): Board {
+  return Board { sq: zeros(81), hand: zeros(16), side: SENTE };
+}
+
+function initBoard(): Board {
+  let b: Board = Board { sq: zeros(81), hand: zeros(16), side: SENTE };
+  let back: [i32; 9] = [LANCE, KNIGHT, SILVER, GOLD, KING, GOLD, SILVER, KNIGHT, LANCE];
+  let f: i32 = 0;
+  while (f < 9) {
+    b.sq[f] = back[f] | 16;             // 後手 最奥段 (r=0)
+    b.sq[2 * 9 + f] = PAWN | 16;        // 後手 歩 (r=2)
+    b.sq[6 * 9 + f] = PAWN;             // 先手 歩 (r=6)
+    b.sq[8 * 9 + f] = back[f];          // 先手 最奥段 (r=8)
+    f = f + 1;
+  }
+  b.sq[1 * 9 + 1] = ROOK | 16;          // 後手 飛 (8b)
+  b.sq[1 * 9 + 7] = BISHOP | 16;        // 後手 角 (2b)
+  b.sq[7 * 9 + 1] = BISHOP;             // 先手 角 (8h)
+  b.sq[7 * 9 + 7] = ROOK;               // 先手 飛 (2h)
+  return b;
+}
+
+// ============================================================================
+//  自己検証 (perft + 戦術 + 自己対局)。USI の `bench` コマンドで起動する。
+// ============================================================================
+
+function runBench() {
+  let b: Board = initBoard();
+  stdout.println("=== initial position (uppercase=Sente, lowercase=Gote) ===");
+  b.show();
+
+  stdout.println("=== perft (move-generation sanity; expect 30 / 900 / 25470) ===");
+  stdout.println(perft(&mut b, 1));
+  stdout.println(perft(&mut b, 2));
+  stdout.println(perft(&mut b, 3));
+
+  stdout.println("=== tactics self-test ===");
+  // (1) タダ取り: 先手飛が同じ段の浮いている後手金を取れる -> 取るのが最善のはず。
+  let tac: Board = emptyBoard();
+  tac.sq[8 * 9 + 4] = KING;          // 先手玉
+  tac.sq[0 * 9 + 8] = KING | 16;     // 後手玉(飛の利きの外に置く)
+  tac.sq[4 * 9 + 4] = ROOK;          // 先手飛(中央)
+  tac.sq[4 * 9 + 0] = GOLD | 16;     // 浮いた後手金(同じ段)
+  let t1: Best = rootSearch(&mut tac, 4);
+  let goldSq: i32 = t1.mv & 127;
+  stdout.println(`free-capture: best=${moveStr(t1.mv)} eval=${t1.score}`);
+  assert(typeOf(tac.sq[goldSq]) == GOLD, "engine must capture the hanging gold");
+  assert(t1.score > 400, "engine must be winning material");
+
+  // (2) 玉を取れる(詰みの一歩手前)局面の認識: 後手玉が取れる -> MATE 級の評価。
+  let mt: Board = emptyBoard();
+  mt.sq[8 * 9 + 4] = KING;           // 先手玉
+  mt.sq[4 * 9 + 4] = KING | 16;      // 取れる後手玉
+  mt.sq[4 * 9 + 0] = ROOK;           // 先手飛が同じ段で王を狙う
+  let t2: Best = rootSearch(&mut mt, 2);
+  stdout.println(`king-capture: best=${moveStr(t2.mv)} eval=${t2.score}`);
+  assert(t2.score > 900000, "engine must see the king capture as a win");
+
+  stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
+  let ply: i32 = 0;
+  while (ply < MAXPLY) {
+    let best: Best = rootSearch(&mut b, DEPTH);
+    if (best.mv < 0) { stdout.println("no legal move -- game over"); break; }
+    let m: i32 = best.mv;
+    let sideStr: str = "S";
+    if (b.side == GOTE) { sideStr = "G"; }
+    let cap: i32 = b.sq[m & 127];
+    stdout.println(`${ply + 1} ${sideStr} ${moveStr(m)}  eval=${best.score}`);
+    b.doMove(m);
+    if (cap != 0 && typeOf(cap) == KING) { stdout.println(`${sideStr} captures the KING -- win!`); break; }
+    ply = ply + 1;
+  }
+}
+
+// ============================================================================
+//  USI プロトコル
+//  対応コマンド: usi / isready / usinewgame / position (startpos|sfen) [moves..] /
+//                go [depth N] / quit、加えて独自の bench・d(盤表示)。
+//  指し手は USI 表記(7g7f / 7g7f+ / P*5e)で入出力する。
+// ============================================================================
+
+function copyStr(s: &str): str {                            // str をコピー(Vec 要素を所有値として取り出す)
+  let out: str = String.new();
+  let i: u32 = 0;
+  while (i < s.len) { out.push(s[i]); i = i + 1; }
+  return out;
+}
+
+function split(s: &str): Vec<str> {                         // 空白区切りでトークン化
+  let out: Vec<str> = Vec.new();
+  let i: u32 = 0;
+  let n: u32 = s.len;
+  while (i < n) {
+    while (i < n && s[i] == ' ') { i = i + 1; }
+    if (i < n) {
+      let tok: str = String.new();
+      while (i < n && s[i] != ' ') { tok.push(s[i]); i = i + 1; }
+      out.push(tok);
+    }
+  }
+  return out;
+}
+
+function letterToType(c: char): i32 {                       // 駒文字 -> 駒種 (P L N S B R G K)
+  if (c == 'P') { return PAWN; }
+  if (c == 'L') { return LANCE; }
+  if (c == 'N') { return KNIGHT; }
+  if (c == 'S') { return SILVER; }
+  if (c == 'B') { return BISHOP; }
+  if (c == 'R') { return ROOK; }
+  if (c == 'G') { return GOLD; }
+  if (c == 'K') { return KING; }
+  return 0;
+}
+
+function toUpper(c: char): char {
+  if (c >= 'a' && c <= 'z') { return ((c as u32) - 32) as char; }
+  return c;
+}
+
+function usiSquare(fc: char, rc: char): i32 {              // "5e" 等 -> 内部マス
+  let usiFile: i32 = ((fc as u32) - ('0' as u32)) as i32;  // 1..9
+  let f: i32 = 9 - usiFile;                                 // 内部 file 0..8
+  let r: i32 = ((rc as u32) - ('a' as u32)) as i32;        // 0..8
+  return r * 9 + f;
+}
+
+function parseUsiMove(s: &str): i32 {                       // USI 指し手 -> 16bit パック
+  if (s[1] == '*') {                                        // 打ち: P*5e
+    let t: i32 = letterToType(s[0]);
+    let to: i32 = usiSquare(s[2], s[3]);
+    return to | ((80 + t) << 7);
+  }
+  let from: i32 = usiSquare(s[0], s[1]);
+  let to: i32 = usiSquare(s[2], s[3]);
+  let promo: i32 = 0;
+  if (s.len >= 5 && s[4] == '+') { promo = 1; }
+  return to | (from << 7) | (promo << 14);
+}
+
+function parseIntStr(s: &str): i32 {
+  let v: i32 = 0;
+  let i: u32 = 0;
+  while (i < s.len) {
+    let c: char = s[i];
+    if (c >= '0' && c <= '9') { v = v * 10 + (((c as u32) - ('0' as u32)) as i32); }
+    i = i + 1;
+  }
+  return v;
+}
+
+// SFEN(toks[start]=盤面, +1=手番, +2=持ち駒, +3=手数)から局面を構築。
+function parseSfen(toks: &Vec<str>, start: u32): Board {
+  let b: Board = emptyBoard();
+  let board: str = copyStr(&toks[start]);
+  let r: i32 = 0;
+  let f: i32 = 0;
+  let i: u32 = 0;
+  let n: u32 = board.len;
+  let promo: bool = false;
+  while (i < n) {
+    let c: char = board[i];
+    if (c == '/') { r = r + 1; f = 0; }
+    else if (c >= '1' && c <= '9') { f = f + (((c as u32) - ('0' as u32)) as i32); }
+    else if (c == '+') { promo = true; }
+    else {
+      let col: i32 = GOTE;
+      if (c >= 'A' && c <= 'Z') { col = SENTE; }
+      let t: i32 = letterToType(toUpper(c));
+      if (promo) { t = t + 8; }
+      b.sq[r * 9 + f] = pieceCode(col, t);
+      f = f + 1;
+      promo = false;
+    }
+    i = i + 1;
+  }
+  let side: str = copyStr(&toks[start + 1]);
+  if (side == "w") { b.side = GOTE; } else { b.side = SENTE; }
+  let hand: str = copyStr(&toks[start + 2]);
+  if (!(hand == "-")) {
+    let cnt: i32 = 0;
+    let hi: u32 = 0;
+    let hn: u32 = hand.len;
+    while (hi < hn) {
+      let hc: char = hand[hi];
+      if (hc >= '0' && hc <= '9') { cnt = cnt * 10 + (((hc as u32) - ('0' as u32)) as i32); }
+      else {
+        let col: i32 = GOTE;
+        if (hc >= 'A' && hc <= 'Z') { col = SENTE; }
+        let t: i32 = letterToType(toUpper(hc));
+        let add: i32 = cnt;
+        if (add == 0) { add = 1; }
+        b.hand[col * 8 + t] = b.hand[col * 8 + t] + add;
+        cnt = 0;
+      }
+      hi = hi + 1;
+    }
+  }
+  return b;
+}
+
+function parsePosition(toks: &Vec<str>): Board {
+  let b: Board = initBoard();
+  let movesIdx: u32 = 2;
+  if (toks.len >= 2 && toks[1] == "sfen") {
+    b = parseSfen(toks, 2);
+    movesIdx = 6;
+  }
+  if (toks.len > movesIdx && toks[movesIdx] == "moves") {
+    let k: u32 = movesIdx + 1;
+    while (k < toks.len) {
+      b.doMove(parseUsiMove(&toks[k]));
+      k = k + 1;
+    }
+  }
+  return b;
+}
+
+function scoreStr(score: i32): str {                        // USI score: cp か mate
+  if (score > MATE - 1000) { return `mate ${MATE - score}`; }
+  if (score < (0 - MATE) + 1000) { return `mate -${score + MATE}`; }
+  return `cp ${score}`;
+}
+
+function main() {
+  let game: Board = initBoard();
+  while (true) {
+    let lo: str? = stdin.readLine();
+    if (lo == none) { break; }
+    let line: str = lo ?? "";
+    let toks: Vec<str> = split(&line);
+    if (toks.len == 0) { continue; }
+
+    if (toks[0] == "usi") {
+      stdout.println("id name mozaic-shogi");
+      stdout.println("id author mozaic");
+      stdout.println("usiok");
+      stdout.flush();
+    } else if (toks[0] == "isready") {
+      stdout.println("readyok");
+      stdout.flush();
+    } else if (toks[0] == "usinewgame") {
+      game = initBoard();
+    } else if (toks[0] == "position") {
+      game = parsePosition(&toks);
+    } else if (toks[0] == "go") {
+      let depth: i32 = DEPTH;
+      let gi: u32 = 1;
+      while (gi < toks.len) {
+        if (toks[gi] == "depth" && gi + 1 < toks.len) { depth = parseIntStr(&toks[gi + 1]); }
+        gi = gi + 1;
+      }
+      let best: Best = rootSearch(&mut game, depth);
+      if (best.mv < 0) {
+        stdout.println("bestmove resign");
+      } else {
+        stdout.println(`info depth ${depth} score ${scoreStr(best.score)} pv ${moveStr(best.mv)}`);
+        stdout.println(`bestmove ${moveStr(best.mv)}`);
+      }
+      stdout.flush();
+    } else if (toks[0] == "d" || toks[0] == "board") {
+      game.show();
+      stdout.flush();
+    } else if (toks[0] == "bench") {
+      runBench();
+      stdout.flush();
+    } else if (toks[0] == "quit") {
+      break;
+    }
+    // 無視: setoption / ponderhit / gameover / stop など
+  }
+}

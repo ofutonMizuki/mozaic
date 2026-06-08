@@ -179,7 +179,7 @@ function emitExpr(e: Expr): string {
       // MutexGuard.val -> the guarded value through the held lock (*guard.p)
       if (e.prop === "val" && genericArgs(refInner(e.obj.ty ?? "") ?? e.obj.ty ?? "")?.base === "MutexGuard") return `(*(${emitExpr(e.obj)}).p)`;
       return `${emitExpr(e.obj)}.${e.prop}`;
-    case "Unary": return `(!${emitExpr(e.expr)})`;
+    case "Unary": return `(${e.op}${emitExpr(e.expr)})`;   // !x (logical) / ~x (bitwise complement)
     case "Borrow": return emitExpr(e.expr);   // a borrow lowers to the buffer itself
     case "Index": return `${emitExpr(e.obj)}[${emitExpr(e.index)}]`;
     case "SpawnExpr": throw new Error("spawn must be a statement, or `let t: Task = spawn f(...)`");
@@ -209,8 +209,11 @@ function emitExpr(e: Expr): string {
       if (e.op === "==") return e.left.ty === "str" ? `mz::eq(${l}, ${r})` : `(${l} == ${r})`;
       if (e.op === "!=") return e.left.ty === "str" ? `(!mz::eq(${l}, ${r}))` : `(${l} != ${r})`;
       if (e.op === "+" && e.left.ty === "str") return `(${l} + ${r})`;   // String concatenation
+      // bit shifts: checked (trap on out-of-range count in debug, mask in release). Result type = left (e.ty).
+      if (e.op === "<<" || e.op === ">>") return `mz::${e.op === "<<" ? "shl" : "shr"}<${cppType(e.ty!)}>(${l}, ${r})`;
       const fn = ARITH_FN[e.op];
       if (fn && isInt(e.ty ?? "")) return `mz::${fn}<${cppType(e.ty!)}>(${l}, ${r})`;
+      // bitwise & | ^ fall through to the native operator below (no overflow/UB possible).
       // f32/f16: cast operands to the result type so a `double` literal (`1.5`, no `f` suffix) doesn't
       // promote the whole op to double — that silently computes f32 math in f64 (wrong precision AND
       // ~3-4x slower on CPU). `(float)(literal)` folds to a float constant; `(float)(f32var)` is a no-op.
@@ -285,6 +288,7 @@ function emitExpr(e: Expr): string {
         if (recv === "String" && m === "new") return `mz::String{}`;
         if (recv === "stdin" && m === "lines") return `mz::stdin_lines()`;
         if (recv === "stdin" && m === "readAll") return `mz::read_all_stdin()`;
+        if (recv === "stdin" && m === "readLine") return `mz::read_line()`;
         if (recv === "stdout" && m === "println") {
           const a = e.args[0];
           const at = a.ty ?? "unit";
@@ -296,6 +300,7 @@ function emitExpr(e: Expr): string {
           if (isFloat(at)) return `mz::println((double)(${emitExpr(a)}))`;
           return `mz::println(${emitExpr(a)})`;
         }
+        if (recv === "stdout" && m === "flush") return `mz::flush_stdout()`;
       }
       // Result<T,E> terminal accessors (the checker stamped obj.ty).
       if (e.callee.kind === "Member" && e.callee.obj.ty && resultArgs(e.callee.obj.ty) !== null) {
@@ -557,7 +562,7 @@ function emitMslExpr(e: Expr, bufs: Set<string>): string {
       if (e.obj.kind === "Ident" && bufs.has(e.obj.name) && e.prop === "len") return `${e.obj.name}_len`;
       return `${emitMslExpr(e.obj, bufs)}.${e.prop}`;
     case "Index": return `${emitMslExpr(e.obj, bufs)}[${emitMslExpr(e.index, bufs)}]`;
-    case "Unary": return `(!${emitMslExpr(e.expr, bufs)})`;
+    case "Unary": return `(${e.op}${emitMslExpr(e.expr, bufs)})`;   // !x (logical) / ~x (bitwise complement) — both native MSL
     case "Binary": {
       const l = emitMslExpr(e.left, bufs), r = emitMslExpr(e.right, bufs);
       return `(${l} ${MSL_OP[e.op] ?? e.op} ${r})`;

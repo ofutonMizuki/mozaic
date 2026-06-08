@@ -22,7 +22,7 @@ rc=0
 
 # Cases that launch a kernel and have a .out (CPU≡GPU expected). Negative kernel cases
 # (atomic_in_kernel, kernel_array_param, kernel_buf_alias) are covered by Phase 1.
-GPU_CASES="addk addk_async matadd group_reduce device_select grid3_basic"
+GPU_CASES="addk addk_async matadd group_reduce device_select grid3_basic bit_kernel"
 # Cases that exercise threads/atomics/channels/mutex and must be deterministic.
 ASYNC_CASES="spawn_join task_result atomic_counter atomic_seqcst atomic_struct atomic_buffer mutex_counter channel_mpsc arc_shared"
 

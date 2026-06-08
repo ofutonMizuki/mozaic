@@ -24,8 +24,9 @@ enum Expr {
   Num(i64),
   FloatLit(str),                     // 3.9 / 1e9 (emitted verbatim)
   Var(str),
-  Bin(str, Box<Expr>, Box<Expr>),   // operator text, left, right
+  Bin(str, Box<Expr>, Box<Expr>),   // operator text, left, right (incl. bitwise & | ^ << >>)
   Not(Box<Expr>),
+  BitNot(Box<Expr>),                // ~e (bitwise complement)
   Call(str, Vec<Box<Expr>>),         // function call, OR enum-variant construction (resolved at emit)
   StrLit(str),                       // "..."
   CharLit(i64),                      // 'a' -> codepoint
@@ -191,6 +192,11 @@ struct Parser {
     if (self.at(t)) { self.adv(); } else { abort(`parse: expected '${t}'`); }
   }
   function word(&mut self): str { let w: str = self.text(); self.adv(); return w; }
+  function nextIs(&self, t: str): bool {   // the token AFTER the current one is operator `t` (for << / >>)
+    let p: u32 = self.pos +% 1;
+    if (p >= self.toks.len) { return false; }
+    return self.toks[p].kind == KOP && self.toks[p].text == t;
+  }
   function parseType(&mut self): str {   // returns a C++ type string directly
     let r: str = "";
     if (self.at("&")) {             // &T -> const T&  /  &mut T -> T&
@@ -326,6 +332,7 @@ struct Parser {
   function parseUnary(&mut self): Box<Expr> {
     if (self.at("comptime")) { self.adv(); return Box.new(Comptime(self.parseUnary())); }   // build-time eval (emit is a no-op; checker forbids reading runtime values)
     if (self.at("!")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(Not(e)); }
+    if (self.at("~")) { self.adv(); let e: Box<Expr> = self.parseUnary(); return Box.new(BitNot(e)); }   // bitwise complement
     if (self.at("&")) {   // &e / &mut e -> Borrow (erased in emit)
       self.adv();
       let isMut: bool = false;
@@ -364,18 +371,42 @@ struct Parser {
     }
     return left;
   }
-  function parseCmp(&mut self): Box<Expr> {
+  function parseShift(&mut self): Box<Expr> {   // << >> formed from two adjacent < / > tokens (generics stay separate)
     let left: Box<Expr> = self.parseAdd();
+    while ((self.at("<") && self.nextIs("<")) || (self.at(">") && self.nextIs(">"))) {
+      let c: str = self.text(); self.adv(); self.adv();   // c = "<" or ">"; op = "<<" / ">>"
+      let right: Box<Expr> = self.parseAdd();
+      left = Box.new(Bin(c + c, left, right));
+    }
+    return left;
+  }
+  function parseCmp(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseShift();
     while (self.at("<") || self.at("<=") || self.at(">") || self.at(">=") || self.at("==") || self.at("!=")) {
       let op: str = self.word();
-      let right: Box<Expr> = self.parseAdd();
+      let right: Box<Expr> = self.parseShift();
       left = Box.new(Bin(op, left, right));
     }
     return left;
   }
-  function parseAnd(&mut self): Box<Expr> {
+  function parseBitAnd(&mut self): Box<Expr> {   // infix & (prefix & is a borrow, parsed in parseUnary)
     let left: Box<Expr> = self.parseCmp();
-    while (self.at("&&")) { self.adv(); let right: Box<Expr> = self.parseCmp(); left = Box.new(Bin("&&", left, right)); }
+    while (self.at("&")) { self.adv(); let right: Box<Expr> = self.parseCmp(); left = Box.new(Bin("&", left, right)); }
+    return left;
+  }
+  function parseBitXor(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseBitAnd();
+    while (self.at("^")) { self.adv(); let right: Box<Expr> = self.parseBitAnd(); left = Box.new(Bin("^", left, right)); }
+    return left;
+  }
+  function parseBitOr(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseBitXor();
+    while (self.at("|")) { self.adv(); let right: Box<Expr> = self.parseBitXor(); left = Box.new(Bin("|", left, right)); }
+    return left;
+  }
+  function parseAnd(&mut self): Box<Expr> {
+    let left: Box<Expr> = self.parseBitOr();
+    while (self.at("&&")) { self.adv(); let right: Box<Expr> = self.parseBitOr(); left = Box.new(Bin("&&", left, right)); }
     return left;
   }
   function parseLogOr(&mut self): Box<Expr> {
@@ -977,6 +1008,7 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
     Comptime(x) => { return emitExpr(x.get(), enums); }   // build-time value -> emit the operand (C++ folds / static-inits it)
     BoolLit(b) => { if (b) { return "true"; } return "false"; }
     Not(x) => { return `(!${emitExpr(x.get(), enums)})`; }
+    BitNot(x) => { return `(~${emitExpr(x.get(), enums)})`; }
     Field(o, f) => {
       let ov: str = varName(o.get());
       if ((ov == "grid" || ov == "local" || ov == "group") && (f == "x" || f == "y" || f == "z")) { return `${ov}_${f}`; }   // GPU thread indices -> kernel params
@@ -1002,6 +1034,8 @@ function emitExpr(e: &Expr, enums: &Vec<EnumDef>): str {
       if (op == "+|") { return `mz::sat_add(${a}, ${b})`; }    // saturating (clamp to type min/max)
       if (op == "-|") { return `mz::sat_sub(${a}, ${b})`; }
       if (op == "*|") { return `mz::sat_mul(${a}, ${b})`; }
+      if (op == "<<") { return `mz::shl(${a}, ${b})`; }   // checked shifts (trap on bad count in debug)
+      if (op == ">>") { return `mz::shr(${a}, ${b})`; }
       // Checked arithmetic: integers trap on overflow in debug / wrap in release; float/str use native op.
       if (op == "+") { return `mz::chk_add(${a}, ${b})`; }
       if (op == "-") { return `mz::chk_sub(${a}, ${b})`; }
@@ -1362,6 +1396,7 @@ function typeOf(e: &Expr, env: &Vec<Param>): str {
     CharLit(c) => { return "char32_t"; }
     Var(n) => { return envType(env, n); }
     Not(x) => { return "bool"; }
+    BitNot(x) => { return typeOf(x.get(), env); }
     Some(x) => { return "opt"; }
     NoneLit => { return "opt"; }
     TryCast(x, t) => { return "opt"; }
@@ -1405,6 +1440,7 @@ function comptimeCheck(e: &Expr, env: &Vec<Param>, consts: &Vec<str>): str {
     Var(n) => { if (envType(env, n) != "" && !contains(consts, n)) { return `'${n}' is not a compile-time value`; } }
     Bin(op, l, r) => { let a: str = comptimeCheck(l.get(), env, consts); if (a != "") { return a; } return comptimeCheck(r.get(), env, consts); }
     Not(x) => { return comptimeCheck(x.get(), env, consts); }
+    BitNot(x) => { return comptimeCheck(x.get(), env, consts); }
     Field(o, f) => { return comptimeCheck(o.get(), env, consts); }
     Index(o, ix) => { let a: str = comptimeCheck(o.get(), env, consts); if (a != "") { return a; } return comptimeCheck(ix.get(), env, consts); }
     Cast(x, t) => { return comptimeCheck(x.get(), env, consts); }
@@ -1431,6 +1467,7 @@ function checkConstMutExpr(e: &Expr, env: &Vec<Param>, consts: &Vec<str>, struct
     Call(n, args) => { let i: u32 = 0; while (i < args.len) { let z: str = checkConstMutExpr(args[i].get(), env, consts, structs); if (z != "") { return z; } i = i +% 1; } }
     Bin(op, l, r) => { let a: str = checkConstMutExpr(l.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(r.get(), env, consts, structs); }
     Not(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
+    BitNot(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
     Field(o, f) => { return checkConstMutExpr(o.get(), env, consts, structs); }
     Index(o, ix) => { let a: str = checkConstMutExpr(o.get(), env, consts, structs); if (a != "") { return a; } return checkConstMutExpr(ix.get(), env, consts, structs); }
     Some(x) => { return checkConstMutExpr(x.get(), env, consts, structs); }
@@ -1532,6 +1569,7 @@ function checkExpr(e: &Expr, env: &Vec<Param>, moved: &Vec<str>): str {
       if (xt != "" && xt != "bool") { return "requires bool operands"; }
       return checkExpr(x.get(), env, moved);
     }
+    BitNot(x) => { return checkExpr(x.get(), env, moved); }
     MethodCall(o, m, args) => {
       if (m == "load" && args.len >= 1) {
         match args[0].get() { Var(ord) => { if (ord == "Release" || ord == "AcqRel") { return "load's order must be one of Relaxed, Acquire"; } } _ => { } }
@@ -1651,6 +1689,7 @@ function exprMentions(e: &Expr, name: str): bool {
     Var(n) => { return n == name; }
     Bin(op, l, r) => { return exprMentions(l.get(), name) || exprMentions(r.get(), name); }
     Not(x) => { return exprMentions(x.get(), name); }
+    BitNot(x) => { return exprMentions(x.get(), name); }
     Field(o, f) => { return exprMentions(o.get(), name); }
     Index(o, ix) => { return exprMentions(o.get(), name) || exprMentions(ix.get(), name); }
     Borrow(bm, x) => { return exprMentions(x.get(), name); }
@@ -1793,6 +1832,7 @@ function exprJoins(e: &Expr, joined: &mut Vec<str>) {
     }
     Bin(op, l, r) => { exprJoins(l.get(), joined); exprJoins(r.get(), joined); }
     Not(x) => { exprJoins(x.get(), joined); }
+    BitNot(x) => { exprJoins(x.get(), joined); }
     Field(o, f) => { exprJoins(o.get(), joined); }
     Index(o, ix) => { exprJoins(o.get(), joined); exprJoins(ix.get(), joined); }
     Borrow(bm, x) => { exprJoins(x.get(), joined); }

@@ -4,9 +4,16 @@
 > 他社 UMA は**非目標**で、長期構想として [VISION.md](VISION.md) に残置する(完成の定義には含めない)。
 > GPU は Apple Silicon / Metal のまま。
 
-## 現在地（M3・M4 完了・M5 ほぼ完了・M6 完了・M7 サブセットで**自己ホスト不動点到達** / branch `m3-abstraction`、ゴールデン **107/107**）
+## 現在地（M3・M4 完了・M5 ほぼ完了・M6 完了・M7 サブセットで**自己ホスト不動点到達** / branch `m3-abstraction`、ゴールデン **112/112**）
 
-> テスト基盤: `node tests/run.ts`(CPU パス、107/107)に加え [tests/prove.sh](tests/prove.sh) が 5 フェーズで証明:
+> **2026-06-04 ビット演算を完全実装**: `& | ^`(整数のみ・両辺同型)/ 前置 `~`(補数)/ `<< >>`(検査付きシフト:
+> debug はシフト量が幅以上/負で trap、`--release` は幅マスクで定義動作・符号付き `>>` は算術)。C 準拠の優先順位
+> (`| < ^ < & < 比較 < シフト < 加算`)。**参照コンパイラ・comptime 折込み・GPU カーネル(MSL)・自己ホスト mozc すべて**に実装。
+> `<<`/`>>` は隣接 2 つの `<`/`>` から構成し入れ子総称 `Vec<Box<T>>` を壊さない。前置 `&`(借用)と中置 `&`(AND)は位置で曖昧性解消。
+> ゴールデン: 正例 `bit_ops`・カーネル `bit_kernel`(CPU≡GPU)、負例 `bit_nonint`/`bit_shift_float`/`bit_complement_float`。
+> mozc も `BitNot` ノードを追加して全対応(coverage 66 正例 + 45 負例、fixpoint・忠実性とも不変)。
+
+> テスト基盤: `node tests/run.ts`(CPU パス、112/112)に加え [tests/prove.sh](tests/prove.sh) が 5 フェーズで証明:
 > ① CPU ゴールデン ② GPU/Metal==CPU ③ 非同期の決定性 ④ **整数オーバーフロー trap**(debug は両コンパイラとも
 > abort、`--release` は wrap)⑤ **忠実性** [tests/faithful.sh](tests/faithful.sh)(全正例ゴールデンで
 > **mozc ≡ 参照コンパイラ**を debug/release 両方でバイナリ出力一致として確認)。
