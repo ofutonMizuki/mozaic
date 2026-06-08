@@ -528,10 +528,10 @@ function perft(b: &mut Board, depth: i32): i64 {
 // ============================================================================
 
 const NPLANE: u32 = 14;             // 入力プレーン数(駒種 1..14)
-const NCH: u32 = 4;                 // conv 出力チャンネル数
+const NCH: u32 = 32;                // conv 出力チャンネル数(4->32 に拡大)
 const PLANE_SZ: u32 = 1134;         // NPLANE * 81
-const CONV_SZ: u32 = 324;           // NCH * 81
-const CONVW_SZ: u32 = 504;          // NCH * NPLANE * 9 (3x3)
+const CONV_SZ: u32 = 2592;          // NCH * 81
+const CONVW_SZ: u32 = 4032;         // NCH * NPLANE * 9 (3x3)
 const NN_SCALE: f32 = 600.0;        // NN 出力 -> センチポーン換算
 
 // conv 3x3 same-pad + ReLU。出力 idx = ((b*NCH + oc)*9 + y)*9 + x。
@@ -798,64 +798,63 @@ function sgn(x: f32): f32 {
   return 0.0;
 }
 
-function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>) {
-  let NPOS: u32 = 192;                 // 学習局面数
-  let EPOCHS: i32 = 120;
-  let lr: f32 = 0.06;                  // sign-SGD の歩幅(勾配スケール不均一に頑健)。線形減衰。
-
-  let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);   // 入力プレーン(局面ごと)
-  let dataY: Buffer<f32> = Buffer.shared(NPOS);              // 教師値(eval/NN_SCALE)
-  let seed: u64 = 1234567891;
-  let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
-
-  // --- データ生成: ランダム自己対局の局面を物量評価でラベル付け ---
-  let p: u32 = 0;
-  while (p < NPOS) {
-    let bd: Board = initBoard();
-    seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
-    let plies: i32 = (seed % (36 as u64)) as i32;
-    let t: i32 = 0;
-    let alive: bool = true;
-    while (t < plies && alive) {
-      let mv: Vec<i32> = bd.gen(false);
-      let n: u32 = mv.len;
-      if (n == 0) { alive = false; }
-      else {
-        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
-        let start: u32 = (seed % (n as u64)) as u32;
-        let picked: i32 = 0 - 1;
-        let k: u32 = 0;
-        while (k < n) {
-          let idx: u32 = (start + k) % n;
-          let m: i32 = mv[idx] & 65535;
-          if (picked < 0 && bd.legalMove(m)) { picked = m; }
-          k = k + 1;
+// 学習済み重みでの 1 局面の前向き(ホスト・先手視点の価値)。自己対局の指し手選択に使う。
+// 盤から直接 conv するので余分なバッファ確保なし(盤の各駒だけが該当プレーンに寄与)。
+function nnValueBoard(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>, b: &Board): f32 {
+  let y: f32 = denseB[0];
+  let oc: u32 = 0;
+  while (oc < NCH) {
+    let ppc: f32 = 0.0;
+    let yy: i32 = 0;
+    while (yy < 9) {
+      let xx: i32 = 0;
+      while (xx < 9) {
+        let z: f32 = convB[oc];
+        let dy: i32 = 0 - 1;
+        while (dy <= 1) {
+          let dx: i32 = 0 - 1;
+          while (dx <= 1) {
+            let ny: i32 = yy + dy;
+            let nx: i32 = xx + dx;
+            if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+              let pc: i32 = b.sq[ny * 9 + nx];
+              if (pc != 0) {
+                let ic: u32 = (typeOf(pc) - 1) as u32;
+                let sv: f32 = 1.0;
+                if (colorOf(pc) == GOTE) { sv = 0.0 - 1.0; }
+                z = z + sv * convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+              }
+            }
+            dx = dx + 1;
+          }
+          dy = dy + 1;
         }
-        if (picked < 0) { alive = false; } else { bd.doMove(picked); }
+        if (z < 0.0) { z = 0.0; }
+        ppc = ppc + z;
+        xx = xx + 1;
       }
-      t = t + 1;
+      yy = yy + 1;
     }
-    encodeBoard(&dataX, p * PLANE_SZ, &bd);
-    let e: i32 = bd.eval();
-    let ty: f32 = (e as f32) / NN_SCALE;
-    if (ty > 8.0) { ty = 8.0; }
-    if (ty < (0.0 - 8.0)) { ty = 0.0 - 8.0; }
-    dataY[p] = ty;
-    p = p + 1;
+    y = y + denseW[oc] * (ppc / 81.0);
+    oc = oc + 1;
   }
+  return y;
+}
 
-  // --- 勾配バッファと活性化バッファ ---
+// データセット(dataX=入力プレーン, dataY=教師値)で CNN を学習(MSE・手書き逆伝播・sign-SGD)。
+// train(物量回帰)と selfplay(勝敗回帰)の両方から呼ぶ共通ルーチン。
+function trainOnDataset(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>,
+                        dataX: Buffer<f32>, dataY: Buffer<f32>, npos: u32, epochs: i32, lr: f32) {
   let gW: Buffer<f32> = Buffer.shared(CONVW_SZ);
   let gCB: Buffer<f32> = Buffer.shared(NCH);
   let gDW: Buffer<f32> = Buffer.shared(NCH);
   let gDB: Buffer<f32> = Buffer.shared(1);
   let aBuf: Buffer<f32> = Buffer.shared(CONV_SZ);   // conv 出力(ReLU後)
   let pp: Buffer<f32> = Buffer.shared(NCH);         // 全域平均プーリング値
-  let invN: f32 = 1.0 / (NPOS as f32);
+  let invN: f32 = 1.0 / (npos as f32);
 
   let ep: i32 = 0;
-  while (ep < EPOCHS) {
+  while (ep < epochs) {
     // 勾配ゼロ化
     let z0: u32 = 0;
     while (z0 < CONVW_SZ) { gW[z0] = 0.0; z0 = z0 + 1; }
@@ -865,7 +864,7 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, d
     let loss: f32 = 0.0;
 
     let i: u32 = 0;
-    while (i < NPOS) {
+    while (i < npos) {
       let xbase: u32 = i * PLANE_SZ;
       // forward: conv + ReLU -> aBuf, GAP -> pp
       let oc: u32 = 0;
@@ -956,7 +955,7 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, d
     }
 
     // sign-SGD 更新 + 線形減衰(全パラメータが一定歩幅で動くのでスケール不均一に頑健)
-    let elr: f32 = lr * (1.0 - (ep as f32) / (EPOCHS as f32));
+    let elr: f32 = lr * (1.0 - (ep as f32) / (epochs as f32));
     let u0: u32 = 0;
     while (u0 < CONVW_SZ) { convW[u0] = convW[u0] - elr * sgn(gW[u0]); u0 = u0 + 1; }
     let u1: u32 = 0;
@@ -968,12 +967,144 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, d
     denseB[0] = denseB[0] - elr * sgn(gDB[0]);
 
     if (ep == 0 || (ep + 1) % 10 == 0) {
-      stdout.println(`train epoch ${ep + 1}/${EPOCHS}  mse=${loss * invN}`);
+      stdout.println(`  epoch ${ep + 1}/${epochs}  mse=${loss * invN}`);
       stdout.flush();
     }
     ep = ep + 1;
   }
+}
+
+// 物量評価への教師あり回帰(ランダム自己生成局面を eval() でラベル付け)。
+function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>) {
+  let NPOS: u32 = 192;
+  let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);
+  let dataY: Buffer<f32> = Buffer.shared(NPOS);
+  let seed: u64 = 1234567891;
+  let wu: i32 = 0;
+  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  let p: u32 = 0;
+  while (p < NPOS) {
+    let bd: Board = initBoard();
+    seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+    let plies: i32 = (seed % (36 as u64)) as i32;
+    let t: i32 = 0;
+    let alive: bool = true;
+    while (t < plies && alive) {
+      let mv: Vec<i32> = bd.gen(false);
+      let n: u32 = mv.len;
+      if (n == 0) { alive = false; }
+      else {
+        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        let start: u32 = (seed % (n as u64)) as u32;
+        let picked: i32 = 0 - 1;
+        let k: u32 = 0;
+        while (k < n) {
+          let idx: u32 = (start + k) % n;
+          let m: i32 = mv[idx] & 65535;
+          if (picked < 0 && bd.legalMove(m)) { picked = m; }
+          k = k + 1;
+        }
+        if (picked < 0) { alive = false; } else { bd.doMove(picked); }
+      }
+      t = t + 1;
+    }
+    encodeBoard(&dataX, p * PLANE_SZ, &bd);
+    let e: i32 = bd.eval();
+    let ty: f32 = (e as f32) / NN_SCALE;
+    if (ty > 8.0) { ty = 8.0; }
+    if (ty < (0.0 - 8.0)) { ty = 0.0 - 8.0; }
+    dataY[p] = ty;
+    p = p + 1;
+  }
+  stdout.println("train: supervised regression to material eval");
+  trainOnDataset(&convW, &convB, &denseW, &denseB, &dataX, &dataY, NPOS, 120, 0.06);
   stdout.println("train: done (weights updated in place)");
+  stdout.flush();
+}
+
+// 自己対局からの強化学習(モンテカルロ価値学習)。
+// CNN 評価で 1 手読み(+ε探索)の自己対局を打ち、各局面に最終結果(先手視点 勝=+1/負=-1/分=0)を
+// ラベル付けして価値を回帰。生成→学習を ITERS 回繰り返す(方策が改善するほど対局も改善)。
+// 評価はエンジン同様 CNN のみ。事前に train で初期化しておくと立ち上がりが速い。
+function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>) {
+  let ITERS: i32 = 4;
+  let NPOS: u32 = 160;
+  let MAXPLY: i32 = 70;
+  let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);
+  let dataY: Buffer<f32> = Buffer.shared(NPOS);
+  let seed: u64 = 987654321;
+  let wu: i32 = 0;
+  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+
+  let it: i32 = 0;
+  while (it < ITERS) {
+    let swins: i32 = 0;
+    let gwins: i32 = 0;
+    let draws: i32 = 0;
+    let pos: u32 = 0;
+    while (pos < NPOS) {
+      let gstart: u32 = pos;
+      let bd: Board = initBoard();
+      let ply: i32 = 0;
+      let alive: bool = true;
+      let result: i32 = 0;                 // 先手視点: +1 先手勝 / -1 後手勝 / 0 分
+      while (ply < MAXPLY && pos < NPOS && alive) {
+        encodeBoard(&dataX, pos * PLANE_SZ, &bd);     // この局面を記録(後で結果でラベル)
+        pos = pos + 1;
+        let mover: i32 = bd.side;
+        let mv: Vec<i32> = bd.gen(false);
+        let n: u32 = mv.len;
+        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        let explore: bool = (seed % (100 as u64)) < 25;    // 25% 探索
+        let bestMv: i32 = 0 - 1;
+        if (explore) {
+          seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+          let start: u32 = 0;
+          if (n > 0) { start = (seed % (n as u64)) as u32; }
+          let k: u32 = 0;
+          while (k < n && bestMv < 0) {
+            let m: i32 = mv[(start + k) % n] & 65535;
+            if (bd.legalMove(m)) { bestMv = m; }
+            k = k + 1;
+          }
+        } else {
+          let bestScore: f32 = 0.0 - 1000000000.0;
+          let k: u32 = 0;
+          while (k < n) {
+            let m: i32 = mv[k] & 65535;
+            if (bd.legalMove(m)) {
+              let cap: i32 = bd.doMove(m);
+              let v: f32 = nnValueBoard(&convW, &convB, &denseW, &denseB, &bd);   // 先手視点
+              bd.undoMove(m, cap);
+              let sp: f32 = v;
+              if (mover == GOTE) { sp = 0.0 - v; }       // 手番視点へ
+              if (sp > bestScore) { bestScore = sp; bestMv = m; }
+            }
+            k = k + 1;
+          }
+        }
+        if (bestMv < 0) {                                 // 合法手なし = 手番側の詰み
+          if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
+          alive = false;
+        } else {
+          bd.doMove(bestMv);
+        }
+        ply = ply + 1;
+      }
+      if (alive) {                                        // 手数上限 -> 物量符号で裁定
+        let e: i32 = bd.eval();
+        if (e > 300) { result = 1; } else if (e < (0 - 300)) { result = 0 - 1; } else { result = 0; }
+      }
+      if (result > 0) { swins = swins + 1; } else if (result < 0) { gwins = gwins + 1; } else { draws = draws + 1; }
+      let q: u32 = gstart;
+      while (q < pos) { dataY[q] = result as f32; q = q + 1; }   // この対局の全局面に結果をラベル
+    }
+    stdout.println(`selfplay iter ${it + 1}/${ITERS}: results S:${swins} G:${gwins} D:${draws}`);
+    stdout.flush();
+    trainOnDataset(&convW, &convB, &denseW, &denseB, &dataX, &dataY, NPOS, 30, 0.05);
+    it = it + 1;
+  }
+  stdout.println("selfplay: done (value learned from self-play outcomes)");
   stdout.flush();
 }
 
@@ -1142,7 +1273,9 @@ function qsearch(ctrl: Buffer<Atomic<u64>>, bb: Buffer<Atomic<i32>>, w: &mut Wor
   w.nodes = w.nodes + 1;
   checkTime(&ctrl, w);
   if (w.stop) { return 0; }
-  let stand: i32 = b.evalToMove() + leafEval(&bb, b);    // 物量評価 + GPU CNN(NN無効時は +0)
+  let stand: i32 = 0;
+  if (bb[B_NN].load(Relaxed) != 0) { stand = leafEval(&bb, b); }   // 評価は GPU CNN の値のみ
+  else { stand = b.evalToMove(); }                                  // NN 無効パス(ベンチ等)は従来の物量評価
   if (stand >= beta) { return beta; }
   let a: i32 = alpha;
   if (stand > a) { a = stand; }
@@ -1542,9 +1675,11 @@ function runBench() {
 //  対応コマンド: usi / isready / usinewgame / setoption name Threads value N /
 //                position (startpos|sfen) [moves..] /
 //                go [depth N | movetime MS | btime/wtime/byoyomi/binc/winc | infinite] /
-//                quit、加えて独自の bench・d(盤表示)・train(CNN 重みを学習)。
+//                quit、加えて独自の bench・d(盤表示)・train(物量回帰で初期化)・
+//                selfplay(自己対局の勝敗から価値を強化学習)。
 //  探索は Lazy SMP(共有 TT のロックレス並列探索)+ 反復深化 + 時間制御。
-//  末端評価は GPU CNN(コーディネータが全スレッドのリーフをバッチ評価)。train で重みを学習。
+//  末端評価は GPU CNN の値のみ(コーディネータが全スレッドのリーフをバッチ評価)。
+//  学習は train(教師=物量評価)で初期化 → selfplay(教師=自己対局の最終結果)で強化。
 //  go では Threads 本のワーカーが共有 TT を読み書きしながら並列に読み、時間が来れば
 //  clock で全スレッドを打ち切る。指し手は USI 表記(7g7f / 7g7f+ / P*5e)で入出力する。
 // ============================================================================
@@ -1842,7 +1977,10 @@ function main() {
       runBench();
       stdout.flush();
     } else if (toks[0] == "train") {
-      trainCNN(&cnv, &cnb, &dnw, &dnb);                   // 重みをその場学習(以後の go が使う)
+      trainCNN(&cnv, &cnb, &dnw, &dnb);                   // 物量回帰で初期化(以後の go が使う)
+      stdout.flush();
+    } else if (toks[0] == "selfplay") {
+      selfplayTrain(&cnv, &cnb, &dnw, &dnb);              // 自己対局の勝敗から価値を強化学習
       stdout.flush();
     } else if (toks[0] == "dumpweights") {
       // 重みを固定小数(×1e6)1 行で出力。外部ラッパーがファイル保存する。

@@ -54,7 +54,8 @@ if (existsSync(WEIGHTS)) {
 // its weights so the pump above persists them.
 createInterface({ input: process.stdin }).on("line", (line) => {
   send(line);
-  if (line.trim() === "train") send("dumpweights");
+  const c = line.trim();
+  if (c === "train" || c === "selfplay") send("dumpweights");   // persist learned weights
 });
 
 eng.on("exit", (code) => process.exit(code ?? 0));

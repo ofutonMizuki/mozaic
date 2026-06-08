@@ -96,7 +96,7 @@ int main() {
     while ((n = getline(&line, &cap, stdin)) >= 0) {
       std::string s(line, (size_t)n); rstrip(s);
       sendLine(s);
-      if (s == "train") sendLine("dumpweights");
+      if (s == "train" || s == "selfplay") sendLine("dumpweights");   // persist learned weights
       if (s == "quit") break;
     }
     free(line);
