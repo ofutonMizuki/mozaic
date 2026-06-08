@@ -99,9 +99,9 @@ int main() {
     char* line = nullptr; size_t cap = 0; ssize_t n;
     while ((n = getline(&line, &cap, stdin)) >= 0) {
       std::string s(line, (size_t)n); rstrip(s);
-      if (s == "selfplay") {                          // 時刻+カウンタ由来の種を i32 範囲で注入
+      if (s == "selfplay" || s == "td" || s == "tdgauge") {   // 学習コマンド: 時刻種を注入し保存
         unsigned long long seed = ((unsigned long long)time(nullptr) * 1000003ULL + (seedCtr++)) & 0x7fffffffULL;
-        sendLine("selfplay " + std::to_string(seed));
+        sendLine(s + " " + std::to_string(seed));
         sendLine("dumpweights");
       } else {
         sendLine(s);

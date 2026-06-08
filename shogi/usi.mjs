@@ -56,9 +56,9 @@ if (existsSync(WEIGHTS)) {
 let seedCtr = 0;
 createInterface({ input: process.stdin }).on("line", (line) => {
   const c = line.trim();
-  if (c === "selfplay") {
-    const seed = ((Date.now() * 1000003 + (seedCtr++)) >>> 0) & 0x7fffffff;   // 時刻+カウンタ, i32 範囲
-    send("selfplay " + seed);
+  if (c === "selfplay" || c === "td" || c === "tdgauge") {   // 学習コマンド: 時刻種を注入し保存
+    const seed = ((Date.now() * 1000003 + (seedCtr++)) >>> 0) & 0x7fffffff;
+    send(c + " " + seed);
     send("dumpweights");
   } else {
     send(line);

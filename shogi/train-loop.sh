@@ -1,11 +1,21 @@
 #!/bin/sh
 # ============================================================================
-#  Automatic self-play training loop with live progress.
+#  Automatic TD value-learning loop with a per-round strength gauge.
 # ----------------------------------------------------------------------------
-#  Repeatedly runs `selfplay` through the binary wrapper (build/shogi-usi), which
-#  loads weights.txt at startup and saves it after each round — so every round
-#  resumes from the previous one and learning accumulates on disk. Ctrl-C stops
-#  cleanly (the latest weights are already saved).
+#  Each round runs `tdgauge` through the binary wrapper (build/shogi-usi):
+#    1. loads weights.txt (resume), snapshots them,
+#    2. runs TD(0) value learning over diverse RANDOM positions (bootstrapped via
+#       a frozen target net — broad coverage, low variance, resists collapse),
+#    3. plays the trained net vs the pre-round snapshot (1-ply self-match) and
+#       prints a strength score, then the wrapper persists the new weights.
+#
+#  Reading the score:  >50% = this round improved play;  ~50% over many rounds
+#  = converged (or step too small).  This is real-play strength, NOT final_mse
+#  (which only measures fit to the round's own targets and can hide a collapse).
+#
+#  TD learns win-values in [-1,1] from scratch — do NOT material-pretrain first
+#  (`train` uses a wider material scale and clashes). To start clean from an old
+#  material-trained net:   rm -f shogi/weights.txt
 #
 #  Usage:   shogi/train-loop.sh [ROUNDS]      (ROUNDS omitted or 0 = run forever)
 #  Env:     MZ_SHOGI_WEIGHTS  weights file (default shogi/weights.txt)
@@ -19,36 +29,38 @@ ROUNDS="${1:-0}"
 
 [ -x "$WRAP" ] || { echo "missing $WRAP — build it: npm run build:usi" >&2; exit 1; }
 
-# one self-play round; prints "S:<n> G:<n> D:<n> mse=<final>" parsed from engine output
-run_round() { printf 'selfplay\nquit\n' | "$WRAP" 2>/dev/null | awk '
-  /results S:/ { for (i=1;i<=NF;i++){ if($i~/^S:/)s+=substr($i,3); if($i~/^G:/)g+=substr($i,3); if($i~/^D:/)d+=substr($i,3) } }
-  /mse=/       { split($0,a,"mse="); m=a[2] }
-  END          { printf "S:%d G:%d D:%d mse=%s", s, g, d, m }'; }
+# Strength gauging (the 1-ply self-match) is pure measurement and is the slow part,
+# so run it only every GAUGE_EVERY rounds; the other rounds just learn (`td`, fast).
+GAUGE_EVERY="${MZ_GAUGE_EVERY:-5}"
 
-# Cold start: pretrain (regress to material eval) if there is no weights file yet.
-if [ ! -f "$WEIGHTS" ]; then
-  echo "== cold start: pretrain (train) — no $WEIGHTS yet =="
-  printf 'train\nquit\n' | "$WRAP" 2>/dev/null | grep -E 'epoch|done' | tail -2
-fi
+run_td()    { printf 'td\nquit\n'      | "$WRAP" 2>/dev/null >/dev/null; }                # learn only
+run_gauge() { printf 'tdgauge\nquit\n' | "$WRAP" 2>/dev/null | awk '                      # learn + gauge
+  /score vs snapshot/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+%$/) sc = $i }
+  END { printf "%s", sc }'; }
 
-echo "== self-play training loop (wrapper=$WRAP, weights=$WEIGHTS) =="
+echo "== TD value-learning loop (wrapper=$WRAP, weights=$WEIGHTS) =="
+[ -f "$WEIGHTS" ] && echo "   resuming from $WEIGHTS" || echo "   starting fresh from built-in init"
 [ "$ROUNDS" -eq 0 ] && echo "   running forever — Ctrl-C to stop" || echo "   $ROUNDS rounds"
+echo "   gauging strength every $GAUGE_EVERY rounds (vs that round's starting net; >50% = improved)"
 
-round=0; games=0; start=$(date +%s)
-trap 't=$(( $(date +%s) - start )); echo; echo "== stopped: $round rounds, $games games, ${t}s — weights saved in $WEIGHTS =="; exit 0' INT
+round=0; start=$(date +%s)
+trap 't=$(( $(date +%s) - start )); echo; echo "== stopped: $round rounds, ${t}s — weights saved in $WEIGHTS =="; exit 0' INT
 
 while [ "$ROUNDS" -eq 0 ] || [ "$round" -lt "$ROUNDS" ]; do
   round=$((round + 1))
   t0=$(date +%s)
-  printf '[round %3d] running…\r' "$round"
-  sum=$(run_round)
-  dt=$(( $(date +%s) - t0 ))
-  s=$(echo "$sum" | sed -n 's/.*S:\([0-9]*\).*/\1/p')
-  g=$(echo "$sum" | sed -n 's/.*G:\([0-9]*\).*/\1/p')
-  d=$(echo "$sum" | sed -n 's/.*D:\([0-9]*\).*/\1/p')
-  mse=$(echo "$sum" | sed -n 's/.*mse=\([0-9.eE+-]*\).*/\1/p')
-  games=$((games + s + g + d))
-  printf '[round %3d] %3ds  games S:%s G:%s D:%s  final_mse=%s   (total %d games, %ds)\n' \
-         "$round" "$dt" "$s" "$g" "$d" "$mse" "$games" "$(( $(date +%s) - start ))"
+  if [ $((round % GAUGE_EVERY)) -eq 0 ]; then
+    printf '[round %3d] td + gauging…\r' "$round"
+    sc=$(run_gauge)
+    dt=$(( $(date +%s) - t0 ))
+    printf '[round %3d] %3ds  TD + strength(vs round-start)=%-5s   (total %ds)\n' \
+           "$round" "$dt" "${sc:-?}" "$(( $(date +%s) - start ))"
+  else
+    printf '[round %3d] td…\r' "$round"
+    run_td
+    dt=$(( $(date +%s) - t0 ))
+    printf '[round %3d] %3ds  TD                                  (total %ds)\n' \
+           "$round" "$dt" "$(( $(date +%s) - start ))"
+  fi
 done
-echo "== done: $round rounds, $games games — weights saved in $WEIGHTS =="
+echo "== done: $round rounds — weights saved in $WEIGHTS =="
