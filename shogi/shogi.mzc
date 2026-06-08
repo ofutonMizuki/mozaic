@@ -527,12 +527,12 @@ function perft(b: &mut Board, depth: i32): i64 {
 //  ・重みは未学習(固定の決定的初期値)。学習済み重みを差し込めば評価が意味を持つ。
 // ============================================================================
 
-const NPLANE: u32 = 14;             // 入力プレーン数(駒種 1..14)
+const NPLANE: u32 = 21;             // 入力プレーン: 駒種 14 + 持ち駒 7(符号付き・ブロードキャスト)
 const NCH: u32 = 32;                // conv 出力チャンネル数
 const HID: u32 = 32;               // 隠れ全結合層の幅(深さ追加: conv->GAP->FC1->ReLU->FC2)
-const PLANE_SZ: u32 = 1134;         // NPLANE * 81
+const PLANE_SZ: u32 = 1701;         // NPLANE * 81
 const CONV_SZ: u32 = 2592;          // NCH * 81
-const CONVW_SZ: u32 = 4032;         // NCH * NPLANE * 9 (3x3)
+const CONVW_SZ: u32 = 6048;         // NCH * NPLANE * 9 (3x3)
 const FC1W_SZ: u32 = 1024;          // NCH * HID
 // 頭部の重みは 1 本の headW に詰める(受け渡しを増やさないため): [FC1W | FC1B | FC2W | FC2B]
 const H_FC1: u32 = 0;               // FC1 重み (NCH*HID)
@@ -623,7 +623,10 @@ function nnWeights(n: u32, seed0: u64): Buffer<f32> {
   return w;
 }
 
-// 盤面を base オフセットの 14x9x9 プレーンへ符号化(先手 +1 / 後手 -1)。
+// 盤面を base オフセットのプレーンへ符号化(全エンコーダの唯一の真実)。
+//   plane 0..13 : 盤上の駒種(先手 +1 / 後手 -1)
+//   plane 14..20: 持ち駒 7 種(t=1..7 -> plane 13+t)。値=(先手枚数-後手枚数)*0.2 を全マスへ。
+// 持ち駒は将棋評価の要(どこにでも打てる)。GAP は一様プレーンをそのまま価値に通す。
 function encodeBoard(inp: Buffer<f32>, base: u32, b: &Board) {
   let i: u32 = 0;
   while (i < PLANE_SZ) { inp[base + i] = 0.0; i = i + 1; }
@@ -638,6 +641,24 @@ function encodeBoard(inp: Buffer<f32>, base: u32, b: &Board) {
     }
     s = s + 1;
   }
+  let t: i32 = 1;
+  while (t <= 7) {
+    let hv: f32 = ((b.hand[t] - b.hand[8 + t]) as f32) * 0.2;   // 先手 - 後手(符号付き)
+    let plane: u32 = (13 + t) as u32;
+    let c: u32 = 0;
+    while (c < 81) { inp[base + plane * 81 + c] = hv; c = c + 1; }
+    t = t + 1;
+  }
+}
+
+// バッチ用の生スロット(81 盤 + 16 駒台)から Board を復元(符号化を encodeBoard に一本化するため)。
+function boardFromSlot(src: Buffer<Atomic<i32>>, base: u32): Board {
+  let b: Board = emptyBoard();
+  let s: u32 = 0;
+  while (s < 81) { b.sq[s] = src[base + s].load(Relaxed); s = s + 1; }
+  let h: u32 = 0;
+  while (h < 16) { b.hand[h] = src[base + 81 + h].load(Relaxed); h = h + 1; }
+  return b;
 }
 
 // ----------------------------------------------------------------------------
@@ -675,20 +696,8 @@ function batchWorker(slotCtr: Atomic<u32>, arrived: Atomic<u32>, gen: Atomic<u32
       let count: u32 = slotCtr.load(Acquire);
       let bb: u32 = 0;
       while (bb < count) {                                   // 集約: 予約された count 局面を planesF へ符号化
-        let pbase: u32 = bb * PLANE_SZ;
-        let cl: u32 = 0;
-        while (cl < PLANE_SZ) { planesF[pbase + cl] = 0.0; cl = cl + 1; }
-        let k: u32 = 0;
-        while (k < 81) {
-          let p: i32 = boardsA[bb * BOARD_INTS + k].load(Relaxed);
-          if (p != 0) {
-            let v: f32 = 1.0;
-            if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
-            let plane: u32 = (typeOf(p) - 1) as u32;
-            planesF[pbase + plane * 81 + k] = v;
-          }
-          k = k + 1;
-        }
+        let gb: Board = boardFromSlot(&boardsA, bb * BOARD_INTS);
+        encodeBoard(&planesF, bb * PLANE_SZ, &gb);
         bb = bb + 1;
       }
       let j1: Job = dev.launch(nnConv, count * CONV_SZ, &planesF, &convW, &convB, &mut convF, NPLANE, NCH);
@@ -765,21 +774,9 @@ function coordinator(bb: Buffer<Atomic<i32>>, convW: Buffer<f32>, convB: Buffer<
     } else if (ready >= active) {                         // アクティブ全員が準備完了 -> フラッシュ
       let count: i32 = bb[B_ARRIVED].load(Acquire);
       let bb2: u32 = 0;
-      while ((bb2 as i32) < count) {                      // 集約: 盤 -> プレーン符号化
-        let pbase: u32 = bb2 * PLANE_SZ;
-        let cl: u32 = 0;
-        while (cl < PLANE_SZ) { planesF[pbase + cl] = 0.0; cl = cl + 1; }
-        let sqi: u32 = 0;
-        while (sqi < 81) {
-          let p: i32 = bb[B_BOARDS + bb2 * BOARD_INTS + sqi].load(Relaxed);
-          if (p != 0) {
-            let v: f32 = 1.0;
-            if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
-            let plane: u32 = (typeOf(p) - 1) as u32;
-            planesF[pbase + plane * 81 + sqi] = v;
-          }
-          sqi = sqi + 1;
-        }
+      while ((bb2 as i32) < count) {                      // 集約: 盤 -> プレーン符号化(encodeBoard 一本化)
+        let gb: Board = boardFromSlot(&bb, B_BOARDS + bb2 * BOARD_INTS);
+        encodeBoard(&planesF, bb2 * PLANE_SZ, &gb);
         bb2 = bb2 + 1;
       }
       let j1: Job = dev.launch(nnConv, (count as u32) * CONV_SZ, &planesF, &convW, &convB, &mut convF, NPLANE, NCH);
@@ -815,9 +812,10 @@ function sgn(x: f32): f32 {
 }
 
 // 学習済み重みでの 1 局面の前向き(ホスト・先手視点の価値)。自己対局の指し手選択に使う。
-// conv は盤から直接(各駒だけが該当プレーンに寄与)。pp は再利用スクラッチ(NCH)。
-// カーネル nnConv+nnHead と同じ式: conv->GAP(pp[oc]) -> FC1 -> ReLU -> FC2。
-function nnValueBoard(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, pp: Buffer<f32>, b: &Board): f32 {
+// planes/pp は再利用スクラッチ。encodeBoard でプレーン化してから conv するので、持ち駒
+// など全プレーンをカーネル(nnConv+nnHead)と完全に同じ式で評価する(一致テストで担保)。
+function nnValueBoard(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, planes: Buffer<f32>, pp: Buffer<f32>, b: &Board): f32 {
+  encodeBoard(&planes, 0, b);
   let oc: u32 = 0;
   while (oc < NCH) {
     let ppc: f32 = 0.0;
@@ -826,24 +824,23 @@ function nnValueBoard(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>
       let xx: i32 = 0;
       while (xx < 9) {
         let z: f32 = convB[oc];
-        let dy: i32 = 0 - 1;
-        while (dy <= 1) {
-          let dx: i32 = 0 - 1;
-          while (dx <= 1) {
-            let ny: i32 = yy + dy;
-            let nx: i32 = xx + dx;
-            if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
-              let pc: i32 = b.sq[ny * 9 + nx];
-              if (pc != 0) {
-                let ic: u32 = (typeOf(pc) - 1) as u32;
-                let sv: f32 = 1.0;
-                if (colorOf(pc) == GOTE) { sv = 0.0 - 1.0; }
-                z = z + sv * convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+        let ic: u32 = 0;
+        while (ic < NPLANE) {
+          let dy: i32 = 0 - 1;
+          while (dy <= 1) {
+            let dx: i32 = 0 - 1;
+            while (dx <= 1) {
+              let ny: i32 = yy + dy;
+              let nx: i32 = xx + dx;
+              if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+                let xv: f32 = planes[ic * 81 + ((ny as u32) * 9 + (nx as u32))];
+                z = z + xv * convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
               }
+              dx = dx + 1;
             }
-            dx = dx + 1;
+            dy = dy + 1;
           }
-          dy = dy + 1;
+          ic = ic + 1;
         }
         if (z < 0.0) { z = 0.0; }
         ppc = ppc + z;
@@ -1085,6 +1082,7 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
   let MAXPLY: i32 = 70;
   let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);
   let dataY: Buffer<f32> = Buffer.shared(NPOS);
+  let plbuf: Buffer<f32> = Buffer.shared(PLANE_SZ); // nnValueBoard 用 プレーンスクラッチ(再利用)
   let ppbuf: Buffer<f32> = Buffer.shared(NCH);     // nnValueBoard 用 GAP スクラッチ(再利用)
   let seed: u64 = 987654321;
   let wu: i32 = 0;
@@ -1128,7 +1126,7 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
             let m: i32 = mv[k] & 65535;
             if (bd.legalMove(m)) {
               let cap: i32 = bd.doMove(m);
-              let v: f32 = nnValueBoard(&convW, &convB, &headW, &ppbuf, &bd);   // 先手視点
+              let v: f32 = nnValueBoard(&convW, &convB, &headW, &plbuf, &ppbuf, &bd);   // 先手視点
               bd.undoMove(m, cap);
               let sp: f32 = v;
               if (mover == GOTE) { sp = 0.0 - v; }       // 手番視点へ
@@ -1704,12 +1702,21 @@ function runBench() {
   // (7) 前向き一致: カーネル(nnConv+nnHead) と ホスト前向き(nnValueBoard) が同じ値か。
   //     これがズレると「ホストで学習した重み」を「カーネル推論」が誤解釈して静かに壊れる。
   let hb: Board = initBoard();
+  let hpl: Buffer<f32> = Buffer.shared(PLANE_SZ);
   let hpp: Buffer<f32> = Buffer.shared(NCH);
-  let hostCp: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpp, &hb) * NN_SCALE) as i32;
+  let hostCp: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &hpp, &hb) * NN_SCALE) as i32;
   let dCp: i32 = hostCp - s0;
   if (dCp < 0) { dCp = 0 - dCp; }
   assert(dCp <= 4, "kernel forward must match host forward (deep-CNN consistency)");
   stdout.println(`nn-consistency: kernel cp=${s0}  host cp=${hostCp}  (|Δ|=${dCp} <= 4)`);
+
+  // (8) 持ち駒が評価に効いているか: 同じ盤面でも手駒が違えば評価が変わること。
+  let hb2: Board = initBoard();
+  hb2.hand[ROOK] = 2;                                       // 先手の持ち駒に飛車 2 枚
+  let cpEmpty: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &hpp, &hb) * NN_SCALE) as i32;
+  let cpHand: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &hpp, &hb2) * NN_SCALE) as i32;
+  assert(cpEmpty != cpHand, "hand pieces must change the evaluation (hand planes wired in)");
+  stdout.println(`hand-feature: empty-hand=${cpEmpty}cp  +2R-in-hand=${cpHand}cp (differ -> 持ち駒が評価に反映)`);
 
   stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
   let ply: i32 = 0;
