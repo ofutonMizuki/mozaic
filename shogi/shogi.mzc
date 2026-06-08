@@ -516,6 +516,273 @@ function perft(b: &mut Board, depth: i32): i64 {
 }
 
 // ============================================================================
+//  GPU CNN 評価 (末端で呼ぶ畳み込み評価関数)
+// ----------------------------------------------------------------------------
+//  ・盤面を 14 枚(駒種ごと)の 9x9 プレーンに符号化(先手 +1 / 後手 -1)。
+//  ・conv 3x3(14->NCH, same-pad, ReLU) -> 全域平均プーリング -> 全結合(NCH->1)。
+//  ・カーネルなので mozaic の CPU/GPU 同格で動く: 既定ビルドは CPU ワーカープール、
+//    --gpu なら同じカーネルが Metal に降りる(ただし --gpu は Atomic 禁止のため
+//    Lazy SMP の共有TT とは別ビルド)。
+//  ・バッチ次元 B を持ち、1 ディスパッチで B 局面を並列評価する(スレッド数分のバッチ)。
+//  ・重みは未学習(固定の決定的初期値)。学習済み重みを差し込めば評価が意味を持つ。
+// ============================================================================
+
+const NPLANE: u32 = 14;             // 入力プレーン数(駒種 1..14)
+const NCH: u32 = 4;                 // conv 出力チャンネル数
+const PLANE_SZ: u32 = 1134;         // NPLANE * 81
+const CONV_SZ: u32 = 324;           // NCH * 81
+const CONVW_SZ: u32 = 504;          // NCH * NPLANE * 9 (3x3)
+const NN_SCALE: f32 = 600.0;        // NN 出力 -> センチポーン換算
+
+// conv 3x3 same-pad + ReLU。出力 idx = ((b*NCH + oc)*9 + y)*9 + x。
+kernel nnConv(inp: Buffer<f32>, w: Buffer<f32>, bias: Buffer<f32>, out: Buffer<f32>, nplane: u32, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < out.len) {
+    let x: u32 = i % 9;
+    let t1: u32 = i / 9;
+    let y: u32 = t1 % 9;
+    let t2: u32 = t1 / 9;
+    let oc: u32 = t2 % nch;
+    let bb: u32 = t2 / nch;
+    let acc: f32 = bias[oc];
+    let yi: i32 = y as i32;
+    let xi: i32 = x as i32;
+    let ic: u32 = 0;
+    while (ic < nplane) {
+      let dy: i32 = 0 - 1;
+      while (dy <= 1) {
+        let dx: i32 = 0 - 1;
+        while (dx <= 1) {
+          let ny: i32 = yi + dy;
+          let nx: i32 = xi + dx;
+          if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+            let inIdx: u32 = (bb * nplane + ic) * 81 + ((ny as u32) * 9 + (nx as u32));
+            let wIdx: u32 = (oc * nplane + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32));
+            acc = acc + inp[inIdx] * w[wIdx];
+          }
+          dx = dx + 1;
+        }
+        dy = dy + 1;
+      }
+      ic = ic + 1;
+    }
+    if (acc < 0.0) { acc = 0.0; }                  // ReLU
+    out[i] = acc;
+  }
+}
+
+// 全域平均プーリング + 全結合(NCH->1)。1 スレッド 1 局面。out[b] = スカラ値。
+kernel nnHead(conv: Buffer<f32>, dw: Buffer<f32>, db: Buffer<f32>, out: Buffer<f32>, nch: u32) {
+  let bb: u32 = grid.x;
+  if (bb < out.len) {
+    let acc: f32 = db[0];
+    let oc: u32 = 0;
+    while (oc < nch) {
+      let sum: f32 = 0.0;
+      let p: u32 = 0;
+      while (p < 81) {
+        sum = sum + conv[(bb * nch + oc) * 81 + p];
+        p = p + 1;
+      }
+      acc = acc + (sum / 81.0) * dw[oc];
+      oc = oc + 1;
+    }
+    out[bb] = acc;
+  }
+}
+
+// 固定の決定的な小さな重みを生成(xorshift64 を ~[-0.1,0.1] にマップ)。未学習。
+function nnWeights(n: u32, seed0: u64): Buffer<f32> {
+  let w: Buffer<f32> = Buffer.shared(n);
+  let s: u64 = seed0;
+  let k: u32 = 0;
+  while (k < 6) { s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17); k = k + 1; }
+  let i: u32 = 0;
+  while (i < n) {
+    s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+    let r: i32 = (s & 1023) as i32;                // 0..1023
+    w[i] = ((r - 512) as f32) * 0.0002;            // ~[-0.1, 0.1]
+    i = i + 1;
+  }
+  return w;
+}
+
+// 盤面を base オフセットの 14x9x9 プレーンへ符号化(先手 +1 / 後手 -1)。
+function encodeBoard(inp: Buffer<f32>, base: u32, b: &Board) {
+  let i: u32 = 0;
+  while (i < PLANE_SZ) { inp[base + i] = 0.0; i = i + 1; }
+  let s: i32 = 0;
+  while (s < 81) {
+    let p: i32 = b.sq[s];
+    if (p != 0) {
+      let v: f32 = 1.0;
+      if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
+      let plane: u32 = (typeOf(p) - 1) as u32;
+      inp[base + plane * 81 + (s as u32)] = v;
+    }
+    s = s + 1;
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  スレッド数で同期するバッチ GPU 評価
+//  ・各スレッドは「スロット予約(slotCtr.fetchAdd)」で投入枠を取り、生の盤(81)+駒台(16)を
+//    共有 Buffer<Atomic<i32>> へ書く(共有メモリへの並行書き込みは Atomic 経由のみ)。
+//  ・全スレッド到達を gen バリアで待ち、最後の到達者だけが予約された count 局面を
+//    1 ディスパッチで評価して結果を outA(Atomic)へ配り、解放する(GPU 投入は常に 1 本)。
+//  ・予約は fetchAdd なので将来 1 スレッドが複数局面を投げる拡張が容易(枠を複数取り、
+//    結果も自分の枠範囲から読むだけ)。CAP がバッチ容量。
+// ----------------------------------------------------------------------------
+
+const BOARD_INTS: u32 = 97;         // 盤 81 + 駒台 16
+
+function batchWorker(slotCtr: Atomic<u32>, arrived: Atomic<u32>, gen: Atomic<u32>,
+                     boardsA: Buffer<Atomic<i32>>, outA: Buffer<Atomic<i32>>,
+                     convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>,
+                     id: u32, nb: u32, cap: u32, rounds: u32) {
+  let planesF: Buffer<f32> = Buffer.shared(cap * PLANE_SZ);   // ランチャ専用の平坦バッファ(カーネル入出力)
+  let convF: Buffer<f32> = Buffer.shared(cap * CONV_SZ);
+  let outF: Buffer<f32> = Buffer.shared(cap);
+  let dev: Device = Device.gpu;
+  let bd: Board = initBoard();
+  let r: u32 = 0;
+  while (r < rounds) {
+    let mySlot: u32 = slotCtr.fetchAdd(1, AcqRel);           // 1 局面分の枠を予約(複数なら fetchAdd(k))
+    let base: u32 = mySlot * BOARD_INTS;
+    let sq: u32 = 0;
+    while (sq < 81) { boardsA[base + sq].store(bd.sq[sq], Relaxed); sq = sq + 1; }
+    let hh: u32 = 0;
+    while (hh < 16) { boardsA[base + 81 + hh].store(bd.hand[hh], Relaxed); hh = hh + 1; }
+
+    let a: u32 = arrived.fetchAdd(1, AcqRel) + 1;            // バリア到達(AcqRel が盤書き込みを公開)
+    if (a == nb) {                                           // 最後の到達者がバッチを評価
+      let count: u32 = slotCtr.load(Acquire);
+      let bb: u32 = 0;
+      while (bb < count) {                                   // 集約: 予約された count 局面を planesF へ符号化
+        let pbase: u32 = bb * PLANE_SZ;
+        let cl: u32 = 0;
+        while (cl < PLANE_SZ) { planesF[pbase + cl] = 0.0; cl = cl + 1; }
+        let k: u32 = 0;
+        while (k < 81) {
+          let p: i32 = boardsA[bb * BOARD_INTS + k].load(Relaxed);
+          if (p != 0) {
+            let v: f32 = 1.0;
+            if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
+            let plane: u32 = (typeOf(p) - 1) as u32;
+            planesF[pbase + plane * 81 + k] = v;
+          }
+          k = k + 1;
+        }
+        bb = bb + 1;
+      }
+      let j1: Job = dev.launch(nnConv, count * CONV_SZ, &planesF, &convW, &convB, &mut convF, NPLANE, NCH);
+      j1.await();
+      let j2: Job = dev.launch(nnHead, count, &convF, &denseW, &denseB, &mut outF, NCH);
+      j2.await();
+      let w: u32 = 0;
+      while (w < count) { outA[w].store((outF[w] * NN_SCALE) as i32, Relaxed); w = w + 1; }
+      slotCtr.store(0, Relaxed);
+      arrived.store(0, Relaxed);
+      gen.store(r + 1, Release);                             // 結果を公開して解放
+    } else {
+      while (gen.load(Acquire) < (r + 1)) { }                // 解放待ち(スピン)
+    }
+    r = r + 1;
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  実探索の末端で使う GPU バッチ評価(コーディネータ方式・デッドロックフリー)
+//  共有状態は 1 本の bb: Buffer<Atomic<i32>> に束ねて探索へ通す:
+//    [0]=ARRIVED [1]=READY [2]=FINISHED [3]=GEN(バッチ番号) [4]=NN_ON
+//    boards: [B_BOARDS + slot*97 ..]   out: [B_OUT + slot]   done: [B_DONE + slot]
+//  各 worker は ARRIVED で枠を取り盤を書き READY を上げて自分の done タグを待つ。
+//  唯一のコーディネータ(専用スレッド)が「アクティブ全員が READY」になったらバッチを
+//  GPU 評価して結果と done を公開→解放。離脱は FINISHED 加算で active を減らして吸収。
+// ----------------------------------------------------------------------------
+
+const BCAP: u32 = 16;               // バッチ容量(= 最大スレッド数)
+const B_ARRIVED: u32 = 0;
+const B_READY: u32 = 1;
+const B_FIN: u32 = 2;
+const B_GEN: u32 = 3;
+const B_NN: u32 = 4;                // 1=GPU評価有効 / 0=従来の物量評価のみ(単一スレッド検証用)
+const B_BOARDS: u32 = 8;            // 盤面領域の開始
+const B_OUT: u32 = 1560;            // 8 + 16*97
+const B_DONE: u32 = 1576;           // B_OUT + 16
+const BB_SZ: u32 = 1592;            // B_DONE + 16
+
+// worker 側: 末端で 1 局面を投入し、コーディネータの評価を待って手番視点の cp を返す。
+// NN 無効なら 0(従来評価のみ)。
+function leafEval(bb: Buffer<Atomic<i32>>, b: &Board): i32 {
+  if (bb[B_NN].load(Relaxed) == 0) { return 0; }
+  let myIdx: i32 = bb[B_ARRIVED].fetchAdd(1, AcqRel);     // このバッチでの枠
+  let myBatch: i32 = bb[B_GEN].load(Acquire);             // 自分のバッチ番号(READY前なので安定)
+  let base: u32 = B_BOARDS + (myIdx as u32) * BOARD_INTS;
+  let s: u32 = 0;
+  while (s < 81) { bb[base + s].store(b.sq[s], Relaxed); s = s + 1; }
+  let h: u32 = 0;
+  while (h < 16) { bb[base + 81 + h].store(b.hand[h], Relaxed); h = h + 1; }
+  bb[B_READY].fetchAdd(1, Release);                       // 盤を公開して「準備完了」
+  let want: i32 = myBatch + 1;
+  while (bb[B_DONE + (myIdx as u32)].load(Acquire) < want) { }   // 自分のバッチ完了を待つ
+  let cp: i32 = bb[B_OUT + (myIdx as u32)].load(Relaxed);
+  if (b.side == GOTE) { return 0 - cp; }                  // NN は先手視点 -> 手番視点へ
+  return cp;
+}
+
+// 唯一の GPU 投入者。アクティブ全員が投入し終えたバッチを 1 ディスパッチで評価する。
+function coordinator(bb: Buffer<Atomic<i32>>, convW: Buffer<f32>, convB: Buffer<f32>,
+                     denseW: Buffer<f32>, denseB: Buffer<f32>, nthreads: i32) {
+  let planesF: Buffer<f32> = Buffer.shared(BCAP * PLANE_SZ);
+  let convF: Buffer<f32> = Buffer.shared(BCAP * CONV_SZ);
+  let outF: Buffer<f32> = Buffer.shared(BCAP);
+  let dev: Device = Device.gpu;
+  let bnum: i32 = 0;
+  let running: bool = true;
+  while (running) {
+    let fin: i32 = bb[B_FIN].load(Acquire);
+    let active: i32 = nthreads - fin;
+    let ready: i32 = bb[B_READY].load(Acquire);
+    if (active <= 0) {
+      running = false;
+    } else if (ready >= active) {                         // アクティブ全員が準備完了 -> フラッシュ
+      let count: i32 = bb[B_ARRIVED].load(Acquire);
+      let bb2: u32 = 0;
+      while ((bb2 as i32) < count) {                      // 集約: 盤 -> プレーン符号化
+        let pbase: u32 = bb2 * PLANE_SZ;
+        let cl: u32 = 0;
+        while (cl < PLANE_SZ) { planesF[pbase + cl] = 0.0; cl = cl + 1; }
+        let sqi: u32 = 0;
+        while (sqi < 81) {
+          let p: i32 = bb[B_BOARDS + bb2 * BOARD_INTS + sqi].load(Relaxed);
+          if (p != 0) {
+            let v: f32 = 1.0;
+            if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
+            let plane: u32 = (typeOf(p) - 1) as u32;
+            planesF[pbase + plane * 81 + sqi] = v;
+          }
+          sqi = sqi + 1;
+        }
+        bb2 = bb2 + 1;
+      }
+      let j1: Job = dev.launch(nnConv, (count as u32) * CONV_SZ, &planesF, &convW, &convB, &mut convF, NPLANE, NCH);
+      j1.await();
+      let j2: Job = dev.launch(nnHead, count as u32, &convF, &denseW, &denseB, &mut outF, NCH);
+      j2.await();
+      let w: u32 = 0;
+      while ((w as i32) < count) { bb[B_OUT + w].store((outF[w] * NN_SCALE) as i32, Relaxed); w = w + 1; }
+      bb[B_ARRIVED].store(0, Relaxed);                    // 解放前にリセット(ABA 回避)
+      bb[B_READY].store(0, Relaxed);
+      bb[B_GEN].store(bnum + 1, Release);
+      let d: u32 = 0;
+      while ((d as i32) < count) { bb[B_DONE + d].store(bnum + 1, Release); d = d + 1; }   // 各枠を解放
+      bnum = bnum + 1;
+    }
+  }
+}
+
+// ============================================================================
 //  探索: 反復深化 ネガマックス αβ + 静止探索 + 置換表(TT) + 時間制御
 // ============================================================================
 
@@ -676,11 +943,11 @@ function checkTime(ctrl: Buffer<Atomic<u64>>, w: &mut Worker) {
 }
 
 // 静止探索: 取り合いだけ読む。TT は引かず、ハッシュも触らない(末端の軽い探索)。
-function qsearch(ctrl: Buffer<Atomic<u64>>, w: &mut Worker, b: &mut Board, alpha: i32, beta: i32, ply: i32): i32 {
+function qsearch(ctrl: Buffer<Atomic<u64>>, bb: Buffer<Atomic<i32>>, w: &mut Worker, b: &mut Board, alpha: i32, beta: i32, ply: i32): i32 {
   w.nodes = w.nodes + 1;
   checkTime(&ctrl, w);
   if (w.stop) { return 0; }
-  let stand: i32 = b.evalToMove();
+  let stand: i32 = b.evalToMove() + leafEval(&bb, b);    // 物量評価 + GPU CNN(NN無効時は +0)
   if (stand >= beta) { return beta; }
   let a: i32 = alpha;
   if (stand > a) { a = stand; }
@@ -698,7 +965,7 @@ function qsearch(ctrl: Buffer<Atomic<u64>>, w: &mut Worker, b: &mut Board, alpha
     let cap: i32 = b.doMove(m);
     let score: i32 = 0;
     if (typeOf(cap) == KING) { score = MATE - ply; }
-    else { score = 0 - qsearch(&ctrl, w, b, 0 - beta, 0 - a, ply + 1); }
+    else { score = 0 - qsearch(&ctrl, &bb, w, b, 0 - beta, 0 - a, ply + 1); }
     b.undoMove(m, cap);
     if (w.stop) { return 0; }
     if (score >= beta) { return beta; }
@@ -709,11 +976,11 @@ function qsearch(ctrl: Buffer<Atomic<u64>>, w: &mut Worker, b: &mut Board, alpha
 }
 
 // ネガマックス αβ + 共有置換表。tt/ctrl/zob は全スレッドで共有(& 経由・競合自由)。
-function search(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, w: &mut Worker, b: &mut Board, depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
+function search(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, bb: Buffer<Atomic<i32>>, w: &mut Worker, b: &mut Board, depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
   w.nodes = w.nodes + 1;
   checkTime(&ctrl, w);
   if (w.stop) { return 0; }
-  if (depth <= 0) { return qsearch(&ctrl, w, b, alpha, beta, ply); }
+  if (depth <= 0) { return qsearch(&ctrl, &bb, w, b, alpha, beta, ply); }
 
   let hit: TTHit = ttProbe(&tt, b.hash, ply);
   let ttMove: i32 = 0;
@@ -749,7 +1016,7 @@ function search(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<
     let cap: i32 = doMoveH(&zob, b, m);
     let score: i32 = 0;
     if (typeOf(cap) == KING) { score = MATE - ply; }      // 玉を取れたら即勝ち
-    else { score = 0 - search(&tt, &ctrl, &zob, w, b, depth - 1, 0 - beta, 0 - a, ply + 1); }
+    else { score = 0 - search(&tt, &ctrl, &zob, &bb, w, b, depth - 1, 0 - beta, 0 - a, ply + 1); }
     b.undoMove(m, cap);
     b.hash = saved;
     if (w.stop) { return 0; }
@@ -771,7 +1038,7 @@ function search(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<
 }
 
 // ルート探索: 合法手のみを指し、最善手を返す。
-function rootSearch(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, w: &mut Worker, b: &mut Board, depth: i32): Best {
+function rootSearch(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, bb: Buffer<Atomic<i32>>, w: &mut Worker, b: &mut Board, depth: i32): Best {
   let moves: Vec<i32> = b.gen(false);
   let n: u32 = moves.len;
   let hit: TTHit = ttProbe(&tt, b.hash, 0);
@@ -797,7 +1064,7 @@ function rootSearch(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buf
     let cap: i32 = doMoveH(&zob, b, m);
     let score: i32 = 0;
     if (typeOf(cap) == KING) { score = MATE - 1; }
-    else { score = 0 - search(&tt, &ctrl, &zob, w, b, depth - 1, 0 - INF, 0 - a, 1); }
+    else { score = 0 - search(&tt, &ctrl, &zob, &bb, w, b, depth - 1, 0 - INF, 0 - a, 1); }
     b.undoMove(m, cap);
     b.hash = saved;
     if (w.stop) { break; }                                // 中断: この反復は破棄
@@ -823,12 +1090,12 @@ function submitBest(ctrl: Buffer<Atomic<u64>>, depth: i32, mv: i32, score: i32) 
 }
 
 // 固定深さで一発探索(自己検証・自己対局用。単一スレッド・決定的)。
-function bestMove(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, b: &mut Board, depth: i32): Best {
+function bestMove(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, bb: Buffer<Atomic<i32>>, b: &mut Board, depth: i32): Best {
   ctrl[C_STOP].store(0, Relaxed);
   ctrl[C_DEADLINE].store(0, Relaxed);
   b.hash = computeHash(&zob, b);
   let w: Worker = Worker { nodes: 0, stop: false, id: 0 };
-  return rootSearch(&tt, &ctrl, &zob, &mut w, b, depth);
+  return rootSearch(&tt, &ctrl, &zob, &bb, &mut w, b, depth);
 }
 
 // ルート局面のバッファからスレッドローカルな盤を構築。
@@ -844,7 +1111,7 @@ function boardFromBuffers(rsq: Buffer<i32>, rhand: Buffer<i32>, side: i32): Boar
 
 // Lazy SMP ワーカー。各スレッドが自分の盤で反復深化し、共有 TT を読み書きして
 // 互いの探索を加速する。id==0 が代表で info を出力。完了深さごとに submitBest。
-function worker(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, rsq: Buffer<i32>, rhand: Buffer<i32>, side: i32, id: u32, maxDepth: i32) {
+function worker(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<u64>, bb: Buffer<Atomic<i32>>, rsq: Buffer<i32>, rhand: Buffer<i32>, side: i32, id: u32, maxDepth: i32) {
   let b: Board = boardFromBuffers(&rsq, &rhand, side);
   let w: Worker = Worker { nodes: 0, stop: false, id: id };
   b.hash = computeHash(&zob, &b);
@@ -852,7 +1119,7 @@ function worker(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<
   if ((id & 1) == 1) { d = 2; }                           // 多様化: 奇数スレッドは深さ1を飛ばす
   while (d <= maxDepth) {
     if (ctrl[C_STOP].load(Relaxed) != 0) { break; }
-    let res: Best = rootSearch(&tt, &ctrl, &zob, &mut w, &mut b, d);
+    let res: Best = rootSearch(&tt, &ctrl, &zob, &bb, &mut w, &mut b, d);
     if (w.stop) { break; }                                // 時間切れ: 未完反復は捨てる
     if (res.mv < 0) {                                     // 合法手なし = 詰み
       if (id == 0) { ctrl[C_STOP].store(1, Relaxed); }
@@ -872,6 +1139,7 @@ function worker(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<
     d = d + 1;
   }
   ctrl[C_NODES].fetchAdd(w.nodes as u64, Relaxed);
+  bb[B_FIN].fetchAdd(1, Release);                          // 離脱通知: コーディネータの active を減らす
 }
 
 // Zobrist 差分更新が一から計算と一致するか、全擬似合法手を depth まで辿って検証。
@@ -941,6 +1209,8 @@ function runBench() {
   let tt: Buffer<Atomic<u64>> = Buffer.shared(TT2_N);
   let ctrl: Buffer<Atomic<u64>> = Buffer.shared(CTRL_N);
   let zob: Buffer<u64> = makeZob();
+  let bb: Buffer<Atomic<i32>> = Buffer.shared(BB_SZ);      // バッチ評価バス。ベンチは NN 無効(コーディネータ無し)
+  bb[B_NN].store(0, Relaxed);
   let b: Board = initBoard();
   stdout.println("=== initial position (uppercase=Sente, lowercase=Gote) ===");
   b.show();
@@ -957,7 +1227,7 @@ function runBench() {
   tac.sq[0 * 9 + 8] = KING | 16;     // 後手玉(飛の利きの外に置く)
   tac.sq[4 * 9 + 4] = ROOK;          // 先手飛(中央)
   tac.sq[4 * 9 + 0] = GOLD | 16;     // 浮いた後手金(同じ段)
-  let t1: Best = bestMove(&tt, &ctrl, &zob, &mut tac, 4);
+  let t1: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut tac, 4);
   let goldSq: i32 = t1.mv & 127;
   stdout.println(`free-capture: best=${moveStr(t1.mv)} eval=${t1.score}`);
   assert(typeOf(tac.sq[goldSq]) == GOLD, "engine must capture the hanging gold");
@@ -968,7 +1238,7 @@ function runBench() {
   mt.sq[8 * 9 + 4] = KING;           // 先手玉
   mt.sq[4 * 9 + 4] = KING | 16;      // 取れる後手玉
   mt.sq[4 * 9 + 0] = ROOK;           // 先手飛が同じ段で王を狙う
-  let t2: Best = bestMove(&tt, &ctrl, &zob, &mut mt, 2);
+  let t2: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut mt, 2);
   stdout.println(`king-capture: best=${moveStr(t2.mv)} eval=${t2.score}`);
   assert(t2.score > 900000, "engine must see the king capture as a win");
 
@@ -982,7 +1252,7 @@ function runBench() {
   let escape: i32      = (8 * 9 + 5) | ((8 * 9 + 4) << 7);   // 76->77: 筋を外す = 合法
   assert(!ck.legalMove(stayInCheck), "leaving the king in check must be illegal");
   assert(ck.legalMove(escape), "escaping check must be legal");
-  let cr: Best = bestMove(&tt, &ctrl, &zob, &mut ck, 3);
+  let cr: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut ck, 3);
   assert(cr.mv >= 0, "engine must find a legal reply to check");
   assert(ck.legalMove(cr.mv), "engine must only ever play a legal move");
   stdout.println(`under-check: best=${moveStr(cr.mv)} eval=${cr.score} (legal)`);
@@ -1016,7 +1286,7 @@ function runBench() {
   while (sh < 16) { shnd[sh] = b.hand[sh]; sh = sh + 1; }
   scope {
     let id: u32 = 0;
-    while (id < 4) { spawn worker(&tt, &ctrl, &zob, &ssq, &shnd, SENTE, id, 10); id = id + 1; }
+    while (id < 4) { spawn worker(&tt, &ctrl, &zob, &bb, &ssq, &shnd, SENTE, id, 10); id = id + 1; }
   }
   let smpDepth: u64 = ctrl[C_DEPTH].load(Relaxed);
   let smpMv: i32 = ctrl[C_MOVE].load(Relaxed) as i32;
@@ -1025,10 +1295,35 @@ function runBench() {
   assert(b.legalMove(smpMv), "lazy SMP must return a legal move");
   stdout.println(`lazy-SMP (4 threads, 300ms): depth=${smpDepth} nodes=${smpNodes} best=${moveStr(smpMv)} (legal)`);
 
+  // (6) スレッド数で同期するバッチ GPU CNN 評価: NB スレッドが各自リーフ局面を出し、
+  //     最後の到達者が 1 ディスパッチで全局面を評価して配り返す(--gpu なら実機 Metal)。
+  let cnv: Buffer<f32> = nnWeights(CONVW_SZ, 11111);
+  let cnb: Buffer<f32> = nnWeights(NCH, 22222);
+  let dnw: Buffer<f32> = nnWeights(NCH, 33333);
+  let dnb: Buffer<f32> = nnWeights(1, 44444);
+  let NB: u32 = 4;
+  let CAP: u32 = 4;                                          // バッチ容量(= NB*1)。複数投入なら増やす
+  let boardsA: Buffer<Atomic<i32>> = Buffer.shared(CAP * BOARD_INTS);
+  let outA: Buffer<Atomic<i32>> = Buffer.shared(CAP);
+  let slotCtr: Atomic<u32> = Atomic.new(0);
+  let bArrived: Atomic<u32> = Atomic.new(0);
+  let bGen: Atomic<u32> = Atomic.new(0);
+  scope {
+    let id: u32 = 0;
+    while (id < NB) {
+      spawn batchWorker(&slotCtr, &bArrived, &bGen, &boardsA, &outA, &cnv, &cnb, &dnw, &dnb, id, NB, CAP, 4);
+      id = id + 1;
+    }
+  }
+  let s0: i32 = outA[0].load(Relaxed);
+  let s1: i32 = outA[1].load(Relaxed);
+  assert(s0 == s1, "same position must evaluate equally across batch slots");
+  stdout.println(`gpu-batch (${NB} threads sync, batch<=${CAP}): nn eval cp=${s0} (slots agree=${s0 == s1})`);
+
   stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
   let ply: i32 = 0;
   while (ply < MAXPLY) {
-    let best: Best = bestMove(&tt, &ctrl, &zob, &mut b, DEPTH);
+    let best: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut b, DEPTH);
     if (best.mv < 0) {                                       // 合法手なし = 詰み(反則を犯さず投了)
       let loser: str = "S";
       let winner: str = "G";
@@ -1206,6 +1501,11 @@ function main() {
   let tt: Buffer<Atomic<u64>> = Buffer.shared(TT2_N);     // 共有置換表(全 go で再利用)
   let ctrl: Buffer<Atomic<u64>> = Buffer.shared(CTRL_N);  // 共有制御セル
   let zob: Buffer<u64> = makeZob();                        // Zobrist 表
+  let bb: Buffer<Atomic<i32>> = Buffer.shared(BB_SZ);      // GPU バッチ評価バス(末端評価)
+  let cnv: Buffer<f32> = nnWeights(CONVW_SZ, 11111);       // CNN 重み(未学習・固定)
+  let cnb: Buffer<f32> = nnWeights(NCH, 22222);
+  let dnw: Buffer<f32> = nnWeights(NCH, 33333);
+  let dnb: Buffer<f32> = nnWeights(1, 44444);
   let threads: i32 = 4;                                    // setoption name Threads value N で変更
   while (true) {
     let lo: str? = stdin.readLine();
@@ -1292,20 +1592,30 @@ function main() {
       let side: i32 = game.side;
       let nt: i32 = threads;
       if (nt < 1) { nt = 1; }
+      // バッチ評価バスを初期化(NN 有効化)。コーディネータ + nt ワーカーを起動。
+      bb[B_ARRIVED].store(0, Relaxed);
+      bb[B_READY].store(0, Relaxed);
+      bb[B_FIN].store(0, Relaxed);
+      bb[B_GEN].store(0, Relaxed);
+      bb[B_NN].store(1, Relaxed);
+      let di: u32 = 0;
+      while (di < BCAP) { bb[B_DONE + di].store(0, Relaxed); di = di + 1; }
       scope {
+        spawn coordinator(&bb, &cnv, &cnb, &dnw, &dnb, nt);  // 唯一の GPU 投入者(末端バッチ評価)
         let id: u32 = 0;
         while ((id as i32) < nt) {
-          spawn worker(&tt, &ctrl, &zob, &rsq, &rhand, side, id, maxDepth);
+          spawn worker(&tt, &ctrl, &zob, &bb, &rsq, &rhand, side, id, maxDepth);
           id = id + 1;
         }
-      }                                                     // 全ワーカー join
+      }                                                     // 全ワーカー + コーディネータ join
+      bb[B_NN].store(0, Relaxed);                           // 以降(フォールバック)は単一スレッド = NN 無効
       let bd: u64 = ctrl[C_DEPTH].load(Relaxed);
       let bmv: i32 = 0 - 1;
       if (bd != 0) {
         bmv = ctrl[C_MOVE].load(Relaxed) as i32;
       } else {                                              // どの反復も未完: 単一スレッドで深さ1を保証
         let fb: Board = boardFromBuffers(&rsq, &rhand, side);
-        let fr: Best = bestMove(&tt, &ctrl, &zob, &mut fb, 1);
+        let fr: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut fb, 1);
         bmv = fr.mv;
       }
       if (bmv < 0) {

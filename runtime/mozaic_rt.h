@@ -369,6 +369,20 @@ template <class T> struct Buffer {
   uint32_t size() const { return len; }
 };
 
+// Host-resident specialization for atomic buffers on the Metal target. An `Buffer<Atomic<U>>`
+// is CPU-shared state (e.g. a transposition table for multi-threaded host search) — never a GPU
+// kernel argument (the kernel-param Atomic ban enforces that) — so it lives in host memory exactly
+// like the CPU Buffer, NOT in an MTLBuffer. This lets a --gpu program run host-threaded Lazy SMP
+// (atomic TT) AND dispatch GPU kernels in the same binary.
+template <class U> struct Buffer<std::atomic<U>> {
+  std::vector<std::atomic<U>> data;   // value-inits each atomic (C++20); std::atomic is non-copyable
+  uint32_t len;
+  Buffer(uint32_t n) : data(n), len(n) {}
+  std::atomic<U>& operator[](uint32_t i) { return data[i]; }
+  const std::atomic<U>& operator[](uint32_t i) const { return data[i]; }
+  uint32_t size() const { return len; }
+};
+
 // Device value (kind: 0 = cpu, 1 = gpu). The compute backend is chosen at compile time (--gpu),
 // but `Device.gpu.first()` reports whether a GPU is actually present, so the portable idiom
 // `Device.gpu.first() ?? Device.cpu` resolves correctly per build (Metal build with a GPU -> gpu;

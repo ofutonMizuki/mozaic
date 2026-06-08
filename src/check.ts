@@ -494,9 +494,10 @@ class Checker {
           const ctor = lb === "Arc" ? isArcNew(s.value) : isMutexNew(s.value);
           if (ctor) { const arg = (s.value as Extract<Expr, { kind: "Call" }>).args[0]; if (arg && !this.assignable(arg.ty ?? "unit", inner)) this.err(`${lb}.new: cannot init ${lb}<${inner}> with ${arg.ty}`); }
         }
-        // Buffer<Atomic<...>> is CPU-only (the Metal buffer is raw bytes; std::atomic can't alias it).
-        if (this.target === "metal" && bufferElem(declTy) !== null && this.hasAtomic(declTy))
-          this.err(`Buffer<Atomic<...>> is not supported on the GPU/Metal target (Atomic is host-only)`);
+        // Buffer<Atomic<...>> is allowed on the Metal target too: it is HOST-resident shared state
+        // (the runtime backs it with std::vector, not an MTLBuffer) for multi-threaded host search.
+        // It can never reach the GPU — the kernel-param Atomic ban rejects it as a launch argument —
+        // so a --gpu program can run host Lazy SMP (atomic TT) alongside GPU kernels in one binary.
         // Atomic-containing AND Mutex/Channel values are non-copyable/non-movable (in-place only):
         // only fresh construction or & sharing. (Arc is movable, so it is excluded here.)
         if ((this.hasAtomic(declTy) || isSyncShared(declTy)) && !isAtomicNew(s.value) && !isMutexNew(s.value) && !isChannelNew(s.value) && !isBufferNew(s.value) && s.value.kind !== "StructLit")
