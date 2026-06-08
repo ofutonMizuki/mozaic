@@ -782,6 +782,201 @@ function coordinator(bb: Buffer<Atomic<i32>>, convW: Buffer<f32>, convB: Buffer<
   }
 }
 
+// ----------------------------------------------------------------------------
+//  CNN 重みの学習(教師あり回帰・ホスト実行)
+//  ・自己生成: 初期局面からランダム合法手を 0..35 手指して多様な局面を作る。
+//  ・教師ラベル: 手書きの物量評価 eval()(先手視点 cp)を NN_SCALE で正規化した値。
+//  ・損失 MSE、手書き逆伝播(conv/GAP/dense/ReLU)+ SGD で 4 つの重み Buffer をその場更新。
+//  ・推論カーネル(nnConv/nnHead)と同じ式・同じ添字レイアウトを host で再現しているので、
+//    学習後の重みは探索の GPU 推論でそのまま効く。
+//  ・ファイル I/O が無いので重みは保存せず、起動セッション内で学習して使う(train コマンド)。
+// ----------------------------------------------------------------------------
+
+function sgn(x: f32): f32 {
+  if (x > 0.0) { return 1.0; }
+  if (x < 0.0) { return 0.0 - 1.0; }
+  return 0.0;
+}
+
+function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, denseW: Buffer<f32>, denseB: Buffer<f32>) {
+  let NPOS: u32 = 192;                 // 学習局面数
+  let EPOCHS: i32 = 120;
+  let lr: f32 = 0.06;                  // sign-SGD の歩幅(勾配スケール不均一に頑健)。線形減衰。
+
+  let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);   // 入力プレーン(局面ごと)
+  let dataY: Buffer<f32> = Buffer.shared(NPOS);              // 教師値(eval/NN_SCALE)
+  let seed: u64 = 1234567891;
+  let wu: i32 = 0;
+  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+
+  // --- データ生成: ランダム自己対局の局面を物量評価でラベル付け ---
+  let p: u32 = 0;
+  while (p < NPOS) {
+    let bd: Board = initBoard();
+    seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+    let plies: i32 = (seed % (36 as u64)) as i32;
+    let t: i32 = 0;
+    let alive: bool = true;
+    while (t < plies && alive) {
+      let mv: Vec<i32> = bd.gen(false);
+      let n: u32 = mv.len;
+      if (n == 0) { alive = false; }
+      else {
+        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        let start: u32 = (seed % (n as u64)) as u32;
+        let picked: i32 = 0 - 1;
+        let k: u32 = 0;
+        while (k < n) {
+          let idx: u32 = (start + k) % n;
+          let m: i32 = mv[idx] & 65535;
+          if (picked < 0 && bd.legalMove(m)) { picked = m; }
+          k = k + 1;
+        }
+        if (picked < 0) { alive = false; } else { bd.doMove(picked); }
+      }
+      t = t + 1;
+    }
+    encodeBoard(&dataX, p * PLANE_SZ, &bd);
+    let e: i32 = bd.eval();
+    let ty: f32 = (e as f32) / NN_SCALE;
+    if (ty > 8.0) { ty = 8.0; }
+    if (ty < (0.0 - 8.0)) { ty = 0.0 - 8.0; }
+    dataY[p] = ty;
+    p = p + 1;
+  }
+
+  // --- 勾配バッファと活性化バッファ ---
+  let gW: Buffer<f32> = Buffer.shared(CONVW_SZ);
+  let gCB: Buffer<f32> = Buffer.shared(NCH);
+  let gDW: Buffer<f32> = Buffer.shared(NCH);
+  let gDB: Buffer<f32> = Buffer.shared(1);
+  let aBuf: Buffer<f32> = Buffer.shared(CONV_SZ);   // conv 出力(ReLU後)
+  let pp: Buffer<f32> = Buffer.shared(NCH);         // 全域平均プーリング値
+  let invN: f32 = 1.0 / (NPOS as f32);
+
+  let ep: i32 = 0;
+  while (ep < EPOCHS) {
+    // 勾配ゼロ化
+    let z0: u32 = 0;
+    while (z0 < CONVW_SZ) { gW[z0] = 0.0; z0 = z0 + 1; }
+    let z1: u32 = 0;
+    while (z1 < NCH) { gCB[z1] = 0.0; gDW[z1] = 0.0; z1 = z1 + 1; }
+    gDB[0] = 0.0;
+    let loss: f32 = 0.0;
+
+    let i: u32 = 0;
+    while (i < NPOS) {
+      let xbase: u32 = i * PLANE_SZ;
+      // forward: conv + ReLU -> aBuf, GAP -> pp
+      let oc: u32 = 0;
+      while (oc < NCH) {
+        let ppc: f32 = 0.0;
+        let yy: u32 = 0;
+        while (yy < 9) {
+          let xx: u32 = 0;
+          while (xx < 9) {
+            let z: f32 = convB[oc];
+            let ic: u32 = 0;
+            while (ic < NPLANE) {
+              let dy: i32 = 0 - 1;
+              while (dy <= 1) {
+                let dx: i32 = 0 - 1;
+                while (dx <= 1) {
+                  let ny: i32 = (yy as i32) + dy;
+                  let nx: i32 = (xx as i32) + dx;
+                  if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+                    let xv: f32 = dataX[xbase + ic * 81 + ((ny as u32) * 9 + (nx as u32))];
+                    let wv: f32 = convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+                    z = z + xv * wv;
+                  }
+                  dx = dx + 1;
+                }
+                dy = dy + 1;
+              }
+              ic = ic + 1;
+            }
+            let av: f32 = z;
+            if (av < 0.0) { av = 0.0; }
+            aBuf[oc * 81 + (yy * 9 + xx)] = av;
+            ppc = ppc + av;
+            xx = xx + 1;
+          }
+          yy = yy + 1;
+        }
+        pp[oc] = ppc / 81.0;
+        oc = oc + 1;
+      }
+      // dense
+      let yout: f32 = denseB[0];
+      let od: u32 = 0;
+      while (od < NCH) { yout = yout + denseW[od] * pp[od]; od = od + 1; }
+      let diff: f32 = yout - dataY[i];
+      loss = loss + diff * diff;
+      // backward
+      let g: f32 = 2.0 * diff;
+      gDB[0] = gDB[0] + g;
+      let ob: u32 = 0;
+      while (ob < NCH) {
+        gDW[ob] = gDW[ob] + g * pp[ob];
+        let dzc: f32 = (g * denseW[ob]) / 81.0;     // dL/da (GAP は均等分配); ReLU で z>0 のみ通す
+        let yy2: u32 = 0;
+        while (yy2 < 9) {
+          let xx2: u32 = 0;
+          while (xx2 < 9) {
+            let av2: f32 = aBuf[ob * 81 + (yy2 * 9 + xx2)];
+            if (av2 > 0.0) {
+              gCB[ob] = gCB[ob] + dzc;
+              let ic2: u32 = 0;
+              while (ic2 < NPLANE) {
+                let dy2: i32 = 0 - 1;
+                while (dy2 <= 1) {
+                  let dx2: i32 = 0 - 1;
+                  while (dx2 <= 1) {
+                    let ny2: i32 = (yy2 as i32) + dy2;
+                    let nx2: i32 = (xx2 as i32) + dx2;
+                    if (ny2 >= 0 && ny2 < 9 && nx2 >= 0 && nx2 < 9) {
+                      let xv2: f32 = dataX[xbase + ic2 * 81 + ((ny2 as u32) * 9 + (nx2 as u32))];
+                      let wi: u32 = (ob * NPLANE + ic2) * 9 + (((dy2 + 1) as u32) * 3 + ((dx2 + 1) as u32));
+                      gW[wi] = gW[wi] + dzc * xv2;
+                    }
+                    dx2 = dx2 + 1;
+                  }
+                  dy2 = dy2 + 1;
+                }
+                ic2 = ic2 + 1;
+              }
+            }
+            xx2 = xx2 + 1;
+          }
+          yy2 = yy2 + 1;
+        }
+        ob = ob + 1;
+      }
+      i = i + 1;
+    }
+
+    // sign-SGD 更新 + 線形減衰(全パラメータが一定歩幅で動くのでスケール不均一に頑健)
+    let elr: f32 = lr * (1.0 - (ep as f32) / (EPOCHS as f32));
+    let u0: u32 = 0;
+    while (u0 < CONVW_SZ) { convW[u0] = convW[u0] - elr * sgn(gW[u0]); u0 = u0 + 1; }
+    let u1: u32 = 0;
+    while (u1 < NCH) {
+      convB[u1] = convB[u1] - elr * sgn(gCB[u1]);
+      denseW[u1] = denseW[u1] - elr * sgn(gDW[u1]);
+      u1 = u1 + 1;
+    }
+    denseB[0] = denseB[0] - elr * sgn(gDB[0]);
+
+    if (ep == 0 || (ep + 1) % 10 == 0) {
+      stdout.println(`train epoch ${ep + 1}/${EPOCHS}  mse=${loss * invN}`);
+      stdout.flush();
+    }
+    ep = ep + 1;
+  }
+  stdout.println("train: done (weights updated in place)");
+  stdout.flush();
+}
+
 // ============================================================================
 //  探索: 反復深化 ネガマックス αβ + 静止探索 + 置換表(TT) + 時間制御
 // ============================================================================
@@ -1347,8 +1542,9 @@ function runBench() {
 //  対応コマンド: usi / isready / usinewgame / setoption name Threads value N /
 //                position (startpos|sfen) [moves..] /
 //                go [depth N | movetime MS | btime/wtime/byoyomi/binc/winc | infinite] /
-//                quit、加えて独自の bench・d(盤表示)。
+//                quit、加えて独自の bench・d(盤表示)・train(CNN 重みを学習)。
 //  探索は Lazy SMP(共有 TT のロックレス並列探索)+ 反復深化 + 時間制御。
+//  末端評価は GPU CNN(コーディネータが全スレッドのリーフをバッチ評価)。train で重みを学習。
 //  go では Threads 本のワーカーが共有 TT を読み書きしながら並列に読み、時間が来れば
 //  clock で全スレッドを打ち切る。指し手は USI 表記(7g7f / 7g7f+ / P*5e)で入出力する。
 // ============================================================================
@@ -1629,6 +1825,9 @@ function main() {
       stdout.flush();
     } else if (toks[0] == "bench") {
       runBench();
+      stdout.flush();
+    } else if (toks[0] == "train") {
+      trainCNN(&cnv, &cnb, &dnw, &dnb);                   // 重みをその場学習(以後の go が使う)
       stdout.flush();
     } else if (toks[0] == "quit") {
       break;
