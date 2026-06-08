@@ -2740,6 +2740,10 @@ function main() {
         stdout.println(`bestmove ${moveStr(bmv)}`);
       }
       stdout.flush();
+    } else if (toks[0] == "eval") {
+      // 現局面の物量評価(先手視点・cp)。外部の対局裁定(手数上限での物量判定)用。
+      stdout.println(`evalcp ${game.eval()}`);
+      stdout.flush();
     } else if (toks[0] == "d" || toks[0] == "board") {
       game.show();
       stdout.flush();
