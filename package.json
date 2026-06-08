@@ -10,6 +10,7 @@
     "build:shogi": "node --disable-warning=ExperimentalWarning src/main.ts build shogi/shogi.mzc --release",
     "build:shogi:gpu": "node --disable-warning=ExperimentalWarning src/main.ts build shogi/shogi.mzc --metal",
     "build:usi": "sh shogi/build-wrap.sh",
+    "train:loop": "sh shogi/train-loop.sh",
     "test": "node --disable-warning=ExperimentalWarning tests/run.ts"
   }
 }
