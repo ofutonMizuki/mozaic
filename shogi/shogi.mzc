@@ -527,12 +527,12 @@ function perft(b: &mut Board, depth: i32): i64 {
 //  ・重みは未学習(固定の決定的初期値)。学習済み重みを差し込めば評価が意味を持つ。
 // ============================================================================
 
-const NPLANE: u32 = 21;             // 入力プレーン: 駒種 14 + 持ち駒 7(符号付き・ブロードキャスト)
+const NPLANE: u32 = 42;             // 入力: 自駒14 + 相手駒14 + 自持駒7 + 相手持駒7(canonical・別面)
 const NCH: u32 = 256;               // conv 出力チャンネル数(GPU が得するよう厚く: 32->256)
 const HID: u32 = 64;                // 隠れ全結合層の幅(32->64)
-const PLANE_SZ: u32 = 1701;         // NPLANE * 81
+const PLANE_SZ: u32 = 3402;         // NPLANE * 81
 const CONV_SZ: u32 = 20736;         // NCH * 81
-const CONVW_SZ: u32 = 48384;        // NCH * NPLANE * 9 (3x3)
+const CONVW_SZ: u32 = 96768;        // NCH * NPLANE * 9 (3x3) = 256*42*9
 const FC1W_SZ: u32 = 16384;         // NCH * HID
 // 頭部の重みは 1 本の headW に詰める(受け渡しを増やさないため): [FC1W | FC1B | FC2W | FC2B]
 const H_FC1: u32 = 0;               // FC1 重み (NCH*HID)
@@ -541,6 +541,7 @@ const H_FC2: u32 = 16448;           // FC2 重み (HID)      = FC1W_SZ + HID
 const H_FC2B: u32 = 16512;          // FC2 バイアス (1)    = FC1W_SZ + 2*HID
 const HEADW_SZ: u32 = 16513;        // FC1W_SZ + 2*HID + 1
 const NN_SCALE: f32 = 600.0;        // NN 出力 -> センチポーン換算
+const SQUASH_K: f32 = 600.0;        // 物量を勝率風 [-1,1] に圧縮する係数(train を selfplay と同スケールに)
 const MBATCH: u32 = 512;            // 自己対局の指し手選択を GPU バッチ評価する上限(合法手数)
 
 // conv 3x3 same-pad + ReLU。出力 idx = ((b*NCH + oc)*9 + y)*9 + x。
@@ -750,26 +751,38 @@ function nnWeights(n: u32, seed0: u64): Buffer<f32> {
 //   plane 0..13 : 盤上の駒種(先手 +1 / 後手 -1)
 //   plane 14..20: 持ち駒 7 種(t=1..7 -> plane 13+t)。値=(先手枚数-後手枚数)*0.2 を全マスへ。
 // 持ち駒は将棋評価の要(どこにでも打てる)。GAP は一様プレーンをそのまま価値に通す。
+// canonical 視点: 常に手番側を自分(+1)・盤の下側にして符号化する。後手番は盤を 180° 回転し
+// 駒色・持ち駒の所有者を入れ替える。これで NN は「手番側が勝勢か」を手番非依存に評価でき(先手偏重
+// が消える)、末端の符号反転が不要になる。先手番のときは従来と完全に同一の出力(回転なし)。
 function encodeBoard(inp: Buffer<f32>, base: u32, b: &Board) {
   let i: u32 = 0;
   while (i < PLANE_SZ) { inp[base + i] = 0.0; i = i + 1; }
+  let me: i32 = b.side;                                  // 手番側 = 自分
   let s: i32 = 0;
   while (s < 81) {
     let p: i32 = b.sq[s];
     if (p != 0) {
-      let v: f32 = 1.0;
-      if (colorOf(p) == GOTE) { v = 0.0 - 1.0; }
+      let sq: u32 = s as u32;
+      if (me == GOTE) { sq = (80 - s) as u32; }          // 後手番は 180° 回転(s -> 80-s)
+      // 自駒は面 0..13、相手駒は面 14..27(存在=1.0・色で別面)
       let plane: u32 = (typeOf(p) - 1) as u32;
-      inp[base + plane * 81 + (s as u32)] = v;
+      if (colorOf(p) != me) { plane = plane + 14; }
+      inp[base + plane * 81 + sq] = 1.0;
     }
     s = s + 1;
   }
   let t: i32 = 1;
   while (t <= 7) {
-    let hv: f32 = ((b.hand[t] - b.hand[8 + t]) as f32) * 0.2;   // 先手 - 後手(符号付き)
-    let plane: u32 = (13 + t) as u32;
+    let mine: i32 = b.hand[t];                           // 自分の持ち駒(先手番)
+    let opp: i32 = b.hand[8 + t];
+    if (me == GOTE) { mine = b.hand[8 + t]; opp = b.hand[t]; }   // 後手番は所有者入れ替え
+    // 自持駒は面 28..34、相手持駒は面 35..41(枚数×0.2 をブロードキャスト・別面)
+    let mvp: f32 = (mine as f32) * 0.2;
+    let ovp: f32 = (opp as f32) * 0.2;
+    let pm: u32 = (28 + t - 1) as u32;
+    let po: u32 = (35 + t - 1) as u32;
     let c: u32 = 0;
-    while (c < 81) { inp[base + plane * 81 + c] = hv; c = c + 1; }
+    while (c < 81) { inp[base + pm * 81 + c] = mvp; inp[base + po * 81 + c] = ovp; c = c + 1; }
     t = t + 1;
   }
 }
@@ -884,8 +897,7 @@ function leafEval(bb: Buffer<Atomic<i32>>, b: &Board): i32 {
   let want: i32 = myBatch + 1;
   while (bb[B_DONE + (myIdx as u32)].load(Acquire) < want) { }   // 自分のバッチ完了を待つ
   let cp: i32 = bb[B_OUT + (myIdx as u32)].load(Relaxed);
-  if (b.side == GOTE) { return 0 - cp; }                  // NN は先手視点 -> 手番視点へ
-  return cp;
+  return cp;                                              // canonical 入力 -> NN は既に手番視点
 }
 
 // 唯一の GPU 投入者。アクティブ全員が投入し終えたバッチを 1 ディスパッチで評価する。
@@ -1082,18 +1094,17 @@ function evalChildren(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
   return cnt;
 }
 
-// CNN 価値で手番側の最善手を返す(子局面を一括評価して手番視点で argmax)。合法手なし= -1(詰み)。
+// CNN 価値で手番側の最善手を返す。canonical/negamax: 子は相手番の局面で vals[c] は相手視点なので、
+// 自分の最善 = 相手視点の値が最小の手(argmin)。合法手なし= -1(詰み)。
 function cnnGreedyMove(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
                       Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
-                      bd: &mut Board, mv: &Vec<i32>, mover: i32): i32 {
+                      bd: &mut Board, mv: &Vec<i32>): i32 {
   let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
-  let bestScore: f32 = 0.0 - 1000000000.0;
+  let bestScore: f32 = 1000000000.0;
   let bestMv: i32 = 0 - 1;
   let c: u32 = 0;
   while (c < cnt) {
-    let sp: f32 = vals[c];
-    if (mover == GOTE) { sp = 0.0 - sp; }              // 先手視点 -> 手番視点
-    if (sp > bestScore) { bestScore = sp; bestMv = mvb[c]; }
+    if (vals[c] < bestScore) { bestScore = vals[c]; bestMv = mvb[c]; }   // argmin(相手視点最小)
     c = c + 1;
   }
   return bestMv;
@@ -1101,19 +1112,17 @@ function cnnGreedyMove(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
 
 // TD ターゲット(先手視点): 終局は ±1(手番側の詰み)、非終局は γ·(先手番なら子の max / 後手番なら
 // min)を [-1,1] にクランプ。tdTrain がブートストラップ目標を作るのに使う。
+// canonical/negamax: 子は相手番の局面なので vals[c] は相手視点。自分の手番視点の値 = -vals[c]。
+// 自分は最大化 -> max(-vals) = -min(vals)。終局(自分詰み)= -1。
 function tdTargetValue(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
                        Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
-                       bd: &mut Board, mv: &Vec<i32>, mover: i32, gamma: f32): f32 {
+                       bd: &mut Board, mv: &Vec<i32>, gamma: f32): f32 {
   let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
-  if (cnt == 0) {                                       // 終局: 手番側が詰み
-    if (mover == SENTE) { return 0.0 - 1.0; }
-    return 1.0;
-  }
-  let best: f32 = vals[0];
+  if (cnt == 0) { return 0.0 - 1.0; }                   // 手番側が詰み = 自分の負け
+  let best: f32 = vals[0];                              // 子の最小(相手視点で最小 = 自分に最良)
   let c: u32 = 1;
-  if (mover == SENTE) { while (c < cnt) { if (vals[c] > best) { best = vals[c]; } c = c + 1; } }
-  else { while (c < cnt) { if (vals[c] < best) { best = vals[c]; } c = c + 1; } }
-  let tgt: f32 = gamma * best;
+  while (c < cnt) { if (vals[c] < best) { best = vals[c]; } c = c + 1; }
+  let tgt: f32 = 0.0 - gamma * best;                    // negamax: 自分視点へ反転
   if (tgt > 1.0) { tgt = 1.0; }
   if (tgt < (0.0 - 1.0)) { tgt = 0.0 - 1.0; }
   return tgt;
@@ -1418,11 +1427,12 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
       t = t + 1;
     }
     encodeBoard(&dataX, p * PLANE_SZ, &bd);
-    let e: i32 = bd.eval();
-    let ty: f32 = (e as f32) / NN_SCALE;
-    if (ty > 8.0) { ty = 8.0; }
-    if (ty < (0.0 - 8.0)) { ty = 0.0 - 8.0; }
-    dataY[p] = ty;
+    // 物量を勝率風に [-1,1] へ圧縮(squash)。自己対局の結果ラベル(±1/0)と同じスケールにすることで、
+    // train(物量) -> selfplay(勝敗) の橋渡しでスケール衝突せず、物量知識を保ったまま結果で精錬できる。
+    let e: f32 = bd.evalToMove() as f32;            // 手番視点の物量(canonical 入力と整合)
+    let ea: f32 = e;
+    if (ea < 0.0) { ea = 0.0 - ea; }
+    dataY[p] = e / (ea + SQUASH_K);                 // |e|=K で ±0.5、大物量で ±1 に漸近
     p = p + 1;
   }
   stdout.println("train: supervised regression to material eval");
@@ -1489,7 +1499,7 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
         } else {
           // CNN 価値で最善手(子局面を一括 GPU 評価)。重み GPU 常駐でホスト読みが無く、Metal でも
           // 学習状態に依らず一定で頑健(ホスト nnValueBoard は未学習ネットの長い対局で評価が爆発)。
-          bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
+          bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
         }
         if (bestMv < 0) {                                 // 合法手なし = 手番側の詰み
           if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
@@ -1505,7 +1515,15 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
       }
       if (result > 0) { swins = swins + 1; } else if (result < 0) { gwins = gwins + 1; } else { draws = draws + 1; }
       let q: u32 = gstart;
-      while (q < pos) { dataY[q] = result as f32; q = q + 1; }   // この対局の全局面に結果をラベル
+      // 各局面を「その手番側の視点」でラベル付け(canonical 入力と整合)。result は先手視点。
+      // gstart=先手番(偶数手目), 奇数手目は後手番なので符号反転。
+      let jj: u32 = 0;
+      while (q < pos) {
+        let lab: f32 = result as f32;
+        if ((jj & 1) == 1) { lab = 0.0 - lab; }
+        dataY[q] = lab;
+        q = q + 1; jj = jj + 1;
+      }
     }
     stdout.println(`selfplay iter ${it + 1}/${ITERS}: results S:${swins} G:${gwins} D:${draws}`);
     stdout.flush();
@@ -1585,10 +1603,9 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
         t = t + 1;
       }
       encodeBoard(&dataX, p * PLANE_SZ, &bd);
-      // TD ターゲット(先手視点)を凍結ターゲットネットで 1 手先読みブートストラップ
-      let mover: i32 = bd.side;
+      // TD ターゲット(手番視点)を凍結ターゲットネットで 1 手先読みブートストラップ(negamax)
       let mv2: Vec<i32> = bd.gen(false);
-      dataY[p] = tdTargetValue(&tcW, &tcB, &thW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv2, mover, GAMMA);
+      dataY[p] = tdTargetValue(&tcW, &tcB, &thW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv2, GAMMA);
       p = p + 1;
     }
     trainGPU(&convW, &convB, &headW, &dataX, &dataY, BATCH, EPOCHS, LR, false);   // 実勾配 SGD
@@ -1649,7 +1666,7 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
           k = k + 1;
         }
       } else if (mover == cnnSide) {
-        bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
+        bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
       } else {
         // 物量貪欲。子局面の material を手番視点で argmax。
         let bestScoreI: i32 = 0 - 2000000000;
@@ -1736,9 +1753,9 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
           k = k + 1;
         }
       } else if (mover == aSide) {                    // 手番側のネットで最善手
-        bestMv = cnnGreedyMove(&wA, &bA, &hA, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
+        bestMv = cnnGreedyMove(&wA, &bA, &hA, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
       } else {
-        bestMv = cnnGreedyMove(&wB, &bB, &hB, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
+        bestMv = cnnGreedyMove(&wB, &bB, &hB, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
       }
       if (bestMv < 0) {
         if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
