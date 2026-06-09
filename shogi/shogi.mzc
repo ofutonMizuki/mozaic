@@ -952,6 +952,14 @@ function sgn(x: f32): f32 {
   return 0.0;
 }
 
+// xorshift64 一段(学習/自己対局/対戦の決定的乱数)。種は呼び元で warmup 8 段してから使う。
+function xorshift64(s: u64): u64 {
+  s = s ^ (s << 13);
+  s = s ^ (s >> 7);
+  s = s ^ (s << 17);
+  return s;
+}
+
 // 勾配バッファの L∞ ノルム(最大絶対値, 0 除算回避)。実勾配 SGD の層ごと正規化に使う。
 function maxAbsBuf(g: Buffer<f32>, n: u32): f32 {
   let m: f32 = 0.00000001;
@@ -1049,6 +1057,66 @@ function nnValueChildrenGPU(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffe
     vals[i] = y;
     i = i + 1;
   }
+}
+
+// 全合法子局面を Xb に集めて GPU で一括評価する共通ルーチン(自己対局/対戦/TD で共有)。
+// vals[0..cnt]=各子の先手視点値, mvb[0..cnt]=指し手。cnt(<=MBATCH)を返す。合法手 > MBATCH は稀。
+function evalChildren(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                     Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                     bd: &mut Board, mv: &Vec<i32>): u32 {
+  let n: u32 = mv.len;
+  let cnt: u32 = 0;
+  let k: u32 = 0;
+  while (k < n && cnt < MBATCH) {
+    let m: i32 = mv[k] & 65535;
+    if (bd.legalMove(m)) {
+      let cap: i32 = bd.doMove(m);
+      encodeBoard(&Xb, cnt * PLANE_SZ, bd);
+      bd.undoMove(m, cap);
+      mvb[cnt] = m;
+      cnt = cnt + 1;
+    }
+    k = k + 1;
+  }
+  if (cnt > 0) { nnValueChildrenGPU(&w, &b, &h, &Xb, &cA, &ppB, &vals, cnt); }
+  return cnt;
+}
+
+// CNN 価値で手番側の最善手を返す(子局面を一括評価して手番視点で argmax)。合法手なし= -1(詰み)。
+function cnnGreedyMove(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                      Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                      bd: &mut Board, mv: &Vec<i32>, mover: i32): i32 {
+  let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
+  let bestScore: f32 = 0.0 - 1000000000.0;
+  let bestMv: i32 = 0 - 1;
+  let c: u32 = 0;
+  while (c < cnt) {
+    let sp: f32 = vals[c];
+    if (mover == GOTE) { sp = 0.0 - sp; }              // 先手視点 -> 手番視点
+    if (sp > bestScore) { bestScore = sp; bestMv = mvb[c]; }
+    c = c + 1;
+  }
+  return bestMv;
+}
+
+// TD ターゲット(先手視点): 終局は ±1(手番側の詰み)、非終局は γ·(先手番なら子の max / 後手番なら
+// min)を [-1,1] にクランプ。tdTrain がブートストラップ目標を作るのに使う。
+function tdTargetValue(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                       Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                       bd: &mut Board, mv: &Vec<i32>, mover: i32, gamma: f32): f32 {
+  let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
+  if (cnt == 0) {                                       // 終局: 手番側が詰み
+    if (mover == SENTE) { return 0.0 - 1.0; }
+    return 1.0;
+  }
+  let best: f32 = vals[0];
+  let c: u32 = 1;
+  if (mover == SENTE) { while (c < cnt) { if (vals[c] > best) { best = vals[c]; } c = c + 1; } }
+  else { while (c < cnt) { if (vals[c] < best) { best = vals[c]; } c = c + 1; } }
+  let tgt: f32 = gamma * best;
+  if (tgt > 1.0) { tgt = 1.0; }
+  if (tgt < (0.0 - 1.0)) { tgt = 0.0 - 1.0; }
+  return tgt;
 }
 
 // データセット(dataX=入力プレーン, dataY=教師値)で CNN を学習(MSE・手書き逆伝播・sign-SGD)。
@@ -1322,11 +1390,11 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
   let dataY: Buffer<f32> = Buffer.shared(NPOS);
   let seed: u64 = 1234567891;
   let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
   let p: u32 = 0;
   while (p < NPOS) {
     let bd: Board = initBoard();
-    seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+    seed = xorshift64(seed);
     let plies: i32 = (seed % (36 as u64)) as i32;
     let t: i32 = 0;
     let alive: bool = true;
@@ -1335,7 +1403,7 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
       let n: u32 = mv.len;
       if (n == 0) { alive = false; }
       else {
-        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        seed = xorshift64(seed);
         let start: u32 = (seed % (n as u64)) as u32;
         let picked: i32 = 0 - 1;
         let k: u32 = 0;
@@ -1385,7 +1453,7 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
   let seed: u64 = seed0 ^ 987654321;                  // ラウンドごとに異なる種(ラッパーが供給)
   if (seed == 0) { seed = 987654321; }                // xorshift は 0 を吸い込むので回避
   let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
 
   let it: i32 = 0;
   while (it < ITERS) {
@@ -1405,11 +1473,11 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
         let mover: i32 = bd.side;
         let mv: Vec<i32> = bd.gen(false);
         let n: u32 = mv.len;
-        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        seed = xorshift64(seed);
         let explore: bool = (seed % (100 as u64)) < 25;    // 25% 探索
         let bestMv: i32 = 0 - 1;
         if (explore) {
-          seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+          seed = xorshift64(seed);
           let start: u32 = 0;
           if (n > 0) { start = (seed % (n as u64)) as u32; }
           let k: u32 = 0;
@@ -1419,45 +1487,9 @@ function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32
             k = k + 1;
           }
         } else {
-          // 全合法子局面を Xb に集めて GPU で一括評価(MBATCH 単位でチャンク)。先手視点の値を
-          // 手番視点へ直して argmax。conv+GAP はバッチで GPU・重み GPU 常駐なのでホスト読みが無い。
-          // (ホスト nnValueBoard は Metal で重みを局面ごとにホスト読みし、未学習ネットの長い対局で
-          //  指し手評価が爆発する: バッチ GPU は学習状態に依らず一定で頑健。)
-          let bestScore: f32 = 0.0 - 1000000000.0;
-          let cnt: u32 = 0;
-          let k: u32 = 0;
-          while (k < n) {
-            let m: i32 = mv[k] & 65535;
-            if (bd.legalMove(m)) {
-              let cap: i32 = bd.doMove(m);
-              encodeBoard(&Xb, cnt * PLANE_SZ, &bd);
-              bd.undoMove(m, cap);
-              mvb[cnt] = m;
-              cnt = cnt + 1;
-              if (cnt == MBATCH) {                       // 満杯 -> 評価して反映(稀: 合法手 > MBATCH)
-                nnValueChildrenGPU(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, cnt);
-                let c: u32 = 0;
-                while (c < cnt) {
-                  let sp: f32 = vals[c];
-                  if (mover == GOTE) { sp = 0.0 - sp; }
-                  if (sp > bestScore) { bestScore = sp; bestMv = mvb[c]; }
-                  c = c + 1;
-                }
-                cnt = 0;
-              }
-            }
-            k = k + 1;
-          }
-          if (cnt > 0) {                                  // 残り(通常はここだけが走る)
-            nnValueChildrenGPU(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, cnt);
-            let c2: u32 = 0;
-            while (c2 < cnt) {
-              let sp2: f32 = vals[c2];
-              if (mover == GOTE) { sp2 = 0.0 - sp2; }
-              if (sp2 > bestScore) { bestScore = sp2; bestMv = mvb[c2]; }
-              c2 = c2 + 1;
-            }
-          }
+          // CNN 価値で最善手(子局面を一括 GPU 評価)。重み GPU 常駐でホスト読みが無く、Metal でも
+          // 学習状態に依らず一定で頑健(ホスト nnValueBoard は未学習ネットの長い対局で評価が爆発)。
+          bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
         }
         if (bestMv < 0) {                                 // 合法手なし = 手番側の詰み
           if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
@@ -1512,11 +1544,12 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
   let cA: Buffer<f32> = Buffer.shared(MBATCH * CONV_SZ);
   let ppB: Buffer<f32> = Buffer.shared(MBATCH * NCH);
   let vals: Buffer<f32> = Buffer.shared(MBATCH);
+  let mvb: Buffer<i32> = Buffer.shared(MBATCH);            // evalChildren が使う(値のみ参照)
 
   let seed: u64 = seed0 ^ 1357924680;
   if (seed == 0) { seed = 1357924680; }
   let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
 
   let it: i32 = 0;
   while (it < ITERS) {
@@ -1526,11 +1559,10 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
       let q2: u32 = 0; while (q2 < HEADW_SZ) { thW[q2] = headW[q2]; q2 = q2 + 1; }
     }
     let p: u32 = 0;
-    let terms: i32 = 0;                               // 終局局面数(統計)
     while (p < BATCH) {
       // ランダム走行(深さ可変)で 1 局面を作る
       let bd: Board = initBoard();
-      seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+      seed = xorshift64(seed);
       let plies: i32 = (seed % ((MAXW + 1) as u64)) as i32;
       let t: i32 = 0;
       let alive: bool = true;
@@ -1539,7 +1571,7 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
         let n: u32 = mv.len;
         if (n == 0) { alive = false; }
         else {
-          seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+          seed = xorshift64(seed);
           let start: u32 = (seed % (n as u64)) as u32;
           let picked: i32 = 0 - 1;
           let k: u32 = 0;
@@ -1553,43 +1585,14 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
         t = t + 1;
       }
       encodeBoard(&dataX, p * PLANE_SZ, &bd);
-      // TD ターゲット(先手視点): 1 手先読み + ターゲットネットでブートストラップ
+      // TD ターゲット(先手視点)を凍結ターゲットネットで 1 手先読みブートストラップ
       let mover: i32 = bd.side;
       let mv2: Vec<i32> = bd.gen(false);
-      let n2: u32 = mv2.len;
-      let cnt: u32 = 0;
-      let k2: u32 = 0;
-      while (k2 < n2 && cnt < MBATCH) {
-        let m: i32 = mv2[k2] & 65535;
-        if (bd.legalMove(m)) {
-          let cap: i32 = bd.doMove(m);
-          encodeBoard(&Xb, cnt * PLANE_SZ, &bd);
-          bd.undoMove(m, cap);
-          cnt = cnt + 1;
-        }
-        k2 = k2 + 1;
-      }
-      if (cnt == 0) {                                 // 終局: 手番側が詰み -> 先手視点の結果
-        terms = terms + 1;
-        if (mover == SENTE) { dataY[p] = 0.0 - 1.0; } else { dataY[p] = 1.0; }
-      } else {
-        nnValueChildrenGPU(&tcW, &tcB, &thW, &Xb, &cA, &ppB, &vals, cnt);   // 凍結ターゲットネット
-        let best: f32 = vals[0];
-        let c: u32 = 1;
-        if (mover == SENTE) {                         // 先手番: 子の max(先手最善)
-          while (c < cnt) { if (vals[c] > best) { best = vals[c]; } c = c + 1; }
-        } else {                                      // 後手番: 子の min(先手視点で最悪)
-          while (c < cnt) { if (vals[c] < best) { best = vals[c]; } c = c + 1; }
-        }
-        let tgt: f32 = GAMMA * best;
-        if (tgt > 1.0) { tgt = 1.0; }
-        if (tgt < (0.0 - 1.0)) { tgt = 0.0 - 1.0; }
-        dataY[p] = tgt;
-      }
+      dataY[p] = tdTargetValue(&tcW, &tcB, &thW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv2, mover, GAMMA);
       p = p + 1;
     }
     trainGPU(&convW, &convB, &headW, &dataX, &dataY, BATCH, EPOCHS, LR, false);   // 実勾配 SGD
-    stdout.println(`td iter ${it + 1}/${ITERS}: terminals=${terms}/${BATCH}`);
+    stdout.println(`td iter ${it + 1}/${ITERS}`);
     stdout.flush();
     it = it + 1;
   }
@@ -1616,7 +1619,7 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
   let seed: u64 = seed0 ^ 2468013579;
   if (seed == 0) { seed = 2468013579; }
   let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
 
   let cnnW: i32 = 0;                                   // CNN 側の勝ち
   let matW: i32 = 0;                                   // 物量側の勝ち
@@ -1636,7 +1639,7 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
       let bestMv: i32 = 0 - 1;
       if (ply < OPEN) {
         // ランダム合法手(開幕の多様化)
-        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        seed = xorshift64(seed);
         let start: u32 = 0;
         if (n > 0) { start = (seed % (n as u64)) as u32; }
         let k: u32 = 0;
@@ -1646,31 +1649,7 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
           k = k + 1;
         }
       } else if (mover == cnnSide) {
-        // CNN 貪欲(GPU バッチ)。子局面を集めて一括評価し手番視点で argmax。
-        let bestScore: f32 = 0.0 - 1000000000.0;
-        let cnt: u32 = 0;
-        let k: u32 = 0;
-        while (k < n && cnt < MBATCH) {                // 合法手 > MBATCH は稀(指標なので先頭のみで十分)
-          let m: i32 = mv[k] & 65535;
-          if (bd.legalMove(m)) {
-            let cap: i32 = bd.doMove(m);
-            encodeBoard(&Xb, cnt * PLANE_SZ, &bd);
-            bd.undoMove(m, cap);
-            mvb[cnt] = m;
-            cnt = cnt + 1;
-          }
-          k = k + 1;
-        }
-        if (cnt > 0) {
-          nnValueChildrenGPU(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, cnt);
-          let c: u32 = 0;
-          while (c < cnt) {
-            let sp: f32 = vals[c];
-            if (mover == GOTE) { sp = 0.0 - sp; }
-            if (sp > bestScore) { bestScore = sp; bestMv = mvb[c]; }
-            c = c + 1;
-          }
-        }
+        bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
       } else {
         // 物量貪欲。子局面の material を手番視点で argmax。
         let bestScoreI: i32 = 0 - 2000000000;
@@ -1729,7 +1708,7 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
   let seed: u64 = seed0 ^ 99001122;
   if (seed == 0) { seed = 99001122; }
   let wu: i32 = 0;
-  while (wu < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); wu = wu + 1; }
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
   let aW: i32 = 0;
   let bWcnt: i32 = 0;
   let draws: i32 = 0;
@@ -1747,7 +1726,7 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
       let n: u32 = mv.len;
       let bestMv: i32 = 0 - 1;
       if (ply < OPEN) {                               // ランダム開幕(対局を多様化)
-        seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+        seed = xorshift64(seed);
         let start: u32 = 0;
         if (n > 0) { start = (seed % (n as u64)) as u32; }
         let k: u32 = 0;
@@ -1756,32 +1735,10 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
           if (bd.legalMove(m)) { bestMv = m; }
           k = k + 1;
         }
+      } else if (mover == aSide) {                    // 手番側のネットで最善手
+        bestMv = cnnGreedyMove(&wA, &bA, &hA, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
       } else {
-        let cnt: u32 = 0;
-        let k: u32 = 0;
-        while (k < n && cnt < MBATCH) {
-          let m: i32 = mv[k] & 65535;
-          if (bd.legalMove(m)) {
-            let cap: i32 = bd.doMove(m);
-            encodeBoard(&Xb, cnt * PLANE_SZ, &bd);
-            bd.undoMove(m, cap);
-            mvb[cnt] = m;
-            cnt = cnt + 1;
-          }
-          k = k + 1;
-        }
-        if (cnt > 0) {                                // 手番側のネットで子局面を評価
-          if (mover == aSide) { nnValueChildrenGPU(&wA, &bA, &hA, &Xb, &cA, &ppB, &vals, cnt); }
-          else { nnValueChildrenGPU(&wB, &bB, &hB, &Xb, &cA, &ppB, &vals, cnt); }
-          let bestScore: f32 = 0.0 - 1000000000.0;
-          let c: u32 = 0;
-          while (c < cnt) {
-            let sp: f32 = vals[c];
-            if (mover == GOTE) { sp = 0.0 - sp; }
-            if (sp > bestScore) { bestScore = sp; bestMv = mvb[c]; }
-            c = c + 1;
-          }
-        }
+        bestMv = cnnGreedyMove(&wB, &bB, &hB, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv, mover);
       }
       if (bestMv < 0) {
         if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
@@ -1877,10 +1834,10 @@ function makeZob(): Buffer<u64> {
   let z: Buffer<u64> = Buffer.shared(ZOB_N);
   let seed: u64 = 1234567891;
   let w: u32 = 0;
-  while (w < 8) { seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17); w = w + 1; }
+  while (w < 8) { seed = xorshift64(seed); w = w + 1; }
   let i: u32 = 0;
   while (i < ZOB_N) {
-    seed = seed ^ (seed << 13); seed = seed ^ (seed >> 7); seed = seed ^ (seed << 17);
+    seed = xorshift64(seed);
     z[i] = seed;
     i = i + 1;
   }
