@@ -26,9 +26,9 @@ ROUNDS="${1:-0}"
 
 # one self-play round; prints "S:<n> G:<n> D:<n> mse=<final>" parsed from engine output
 run_round() { printf 'selfplay\nquit\n' | "$WRAP" 2>/dev/null | awk '
-  /results S:/ { for (i=1;i<=NF;i++){ if($i~/^S:/)s+=substr($i,3); if($i~/^G:/)g+=substr($i,3); if($i~/^D:/)d+=substr($i,3) } }
-  /mse=/       { split($0,a,"mse="); m=a[2] }
-  END          { printf "S:%d G:%d D:%d mse=%s", s, g, d, m }'; }
+  /selfplay iter/ { for (i=1;i<=NF;i++){ if($i~/^S:/)s+=substr($i,3); if($i~/^G:/)g+=substr($i,3); if($i~/^D:/)d+=substr($i,3) } }
+  /mse=/          { split($0,a,"mse="); m=a[2] }
+  END             { printf "S:%d G:%d D:%d mse=%s", s, g, d, m }'; }
 
 # Cold start: squashed-material pretrain if there is no weights file yet.
 if [ ! -f "$WEIGHTS" ]; then
