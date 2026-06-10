@@ -55,21 +55,25 @@ function toUpper(c: char): char {
   return c;
 }
 
-function usiSquare(fc: char, rc: char): i32 {              // "5e" 等 -> 内部マス
+function usiSquare(fc: char, rc: char): i32 {              // "5e" 等 -> 内部マス。不正は -1(u32 下溢れで巨大 index になるのを防ぐ)
+  if (fc < '1' || fc > '9' || rc < 'a' || rc > 'i') { return 0 - 1; }
   let usiFile: i32 = ((fc as u32) - ('0' as u32)) as i32;  // 1..9
   let f: i32 = 9 - usiFile;                                 // 内部 file 0..8
   let r: i32 = ((rc as u32) - ('a' as u32)) as i32;        // 0..8
   return r * 9 + f;
 }
 
-function parseUsiMove(s: &str): i32 {                       // USI 指し手 -> 16bit パック
+function parseUsiMove(s: &str): i32 {                       // USI 指し手 -> 16bit パック。不正は 0(null move)
+  if (s.len < 4) { return 0; }                              // 短すぎる入力で s[0..3] が OOB になるのを防ぐ
   if (s[1] == '*') {                                        // 打ち: P*5e
     let t: i32 = letterToType(s[0]);
     let to: i32 = usiSquare(s[2], s[3]);
+    if (t < PAWN || t > GOLD || to < 0) { return 0; }       // 打てる駒種/マスが不正なら null
     return to | ((80 + t) << 7);
   }
   let from: i32 = usiSquare(s[0], s[1]);
   let to: i32 = usiSquare(s[2], s[3]);
+  if (from < 0 || to < 0) { return 0; }                     // マスが不正なら null(後段の OOB を防ぐ)
   let promo: i32 = 0;
   if (s.len >= 5 && s[4] == '+') { promo = 1; }
   return to | (from << 7) | (promo << 14);
@@ -80,9 +84,10 @@ function parseIntStr(s: &str): i32 {
   let i: u32 = 0;
   while (i < s.len) {
     let c: char = s[i];
-    if (c >= '0' && c <= '9') { v = v * 10 + (((c as u32) - ('0' as u32)) as i32); }
+    if (c >= '0' && c <= '9') { v = v *| 10 +| (((c as u32) - ('0' as u32)) as i32); }   // 飽和: 巨大トークンでもトラップしない
     i = i + 1;
   }
+  if (v > 86400000) { v = 86400000; }                  // 24h(ms)上限。go の時間予算演算のオーバーフローを防ぐ
   return v;
 }
 
@@ -112,7 +117,7 @@ function parseSfen(toks: &Vec<str>, start: u32): Board {
   let promo: bool = false;
   while (i < n) {
     let c: char = board[i];
-    if (c == '/') { r = r + 1; f = 0; }
+    if (c == '/') { if (r < 8) { r = r + 1; } f = 0; }      // 段数超過でも r を 8 で止める(OOB 防止)
     else if (c >= '1' && c <= '9') { f = f + (((c as u32) - ('0' as u32)) as i32); }
     else if (c == '+') { promo = true; }
     else {
@@ -120,7 +125,7 @@ function parseSfen(toks: &Vec<str>, start: u32): Board {
       if (c >= 'A' && c <= 'Z') { col = SENTE; }
       let t: i32 = letterToType(toUpper(c));
       if (promo) { t = t + 8; }
-      b.sq[r * 9 + f] = pieceCode(col, t);
+      if (r >= 0 && r < 9 && f >= 0 && f < 9) { b.sq[r * 9 + f] = pieceCode(col, t); }   // 範囲内のみ書く
       f = f + 1;
       promo = false;
     }
@@ -142,7 +147,7 @@ function parseSfen(toks: &Vec<str>, start: u32): Board {
         let t: i32 = letterToType(toUpper(hc));
         let add: i32 = cnt;
         if (add == 0) { add = 1; }
-        b.hand[col * 8 + t] = b.hand[col * 8 + t] + add;
+        if (t >= PAWN && t <= GOLD) { b.hand[col * 8 + t] = b.hand[col * 8 + t] + add; }   // 持てるのは歩..金のみ。玉(8)/不明(0)は index 16 等の OOB なので無視
         cnt = 0;
       }
       hi = hi + 1;
@@ -161,7 +166,8 @@ function parsePosition(toks: &Vec<str>): Board {
   if (toks.len > movesIdx && toks[movesIdx] == "moves") {
     let k: u32 = movesIdx + 1;
     while (k < toks.len) {
-      b.doMove(parseUsiMove(&toks[k]));
+      let m: i32 = parseUsiMove(&toks[k]);
+      if (m != 0) { b.doMove(m); }                         // 不正トークンは適用しない(OOB 防止)
       k = k + 1;
     }
   }

@@ -241,6 +241,18 @@ function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
       }
       t = t + 1;
     }
+    // 物量の偏りを注入: 序盤ランダム手はほぼ駒を取らず material≈0 に偏る -> 教師値が常時 ~0 で
+    // 価値ヘッドが定数 collapse(駒得を学べず駒得AIに全敗)。ランダムに数枚(玉以外)除去して
+    // material 軸を満遍なく散らし、回帰が駒得を学習できるようにする。
+    let drops: i32 = (seed % (7 as u64)) as i32;     // 0..6 枚除去
+    let dd: i32 = 0;
+    while (dd < drops) {
+      seed = xorshift64(seed);
+      let rsq: u32 = (seed % (81 as u64)) as u32;
+      let pc: i32 = bd.sq[rsq];
+      if (pc != 0 && typeOf(pc) != KING) { bd.sq[rsq] = 0; }   // 玉は残す(評価/符号の前提)
+      dd = dd + 1;
+    }
     encodeBoard(&dataX, p * PLANE_SZ, &bd);
     // 物量を勝率風に [-1,1] へ圧縮(squash)。自己対局の結果ラベル(±1/0)と同じスケールにすることで、
     // train(物量) -> selfplay(勝敗) の橋渡しでスケール衝突せず、物量知識を保ったまま結果で精錬できる。
@@ -492,6 +504,9 @@ function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, see
 //  GUI 用の本探索ではなく eval の質を 1 手で隔離して測る(学習が変えるのは eval のみ)。
 // ============================================================================
 function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, games: i32, seed0: u64) {
+  let ngames: i32 = games;
+  if (ngames < 1) { ngames = 1; }                     // games=0 で 0/0=NaN になるのを防ぐ
+  if ((ngames & 1) == 1) { ngames = ngames + 1; }     // 奇数だと A 側が SENTE を1回多く持ち色の有利が相殺されない
   let MAXPLY: i32 = 200;
   let OPEN: i32 = 4;                                   // ランダム開幕手数(対局を多様化)
   let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);
@@ -508,7 +523,7 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
   let matW: i32 = 0;                                   // 物量側の勝ち
   let draws: i32 = 0;
   let g: i32 = 0;
-  while (g < games) {
+  while (g < ngames) {
     let cnnSide: i32 = SENTE;
     if (g % 2 == 1) { cnnSide = GOTE; }                // 手番を交互に(色の有利を相殺)
     let bd: Board = initBoard();
@@ -571,8 +586,8 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
     }
     g = g + 1;
   }
-  let score: f32 = ((cnnW as f32) + 0.5 * (draws as f32)) / (games as f32);
-  stdout.println(`match: CNN(now) vs material(1-ply greedy)  games=${games}  CNN W:${cnnW} L:${matW} D:${draws}  score=${score * 100.0}%  (>50% = 物量超え)`);
+  let score: f32 = ((cnnW as f32) + 0.5 * (draws as f32)) / (ngames as f32);
+  stdout.println(`match: CNN(now) vs material(1-ply greedy)  games=${ngames}  CNN W:${cnnW} L:${matW} D:${draws}  score=${score * 100.0}%  (>50% = 物量超え)`);
   stdout.flush();
 }
 
@@ -581,6 +596,9 @@ function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f
 function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
                    wB: Buffer<f32>, bB: Buffer<f32>, hB: Buffer<f32>,
                    games: i32, seed0: u64): f32 {
+  let ngames: i32 = games;
+  if (ngames < 1) { ngames = 1; }                     // games=0 で 0/0=NaN を防ぐ
+  if ((ngames & 1) == 1) { ngames = ngames + 1; }     // 色の有利を相殺するため偶数に
   let MAXPLY: i32 = 200;
   let OPEN: i32 = 4;
   let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);
@@ -596,7 +614,7 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
   let bWcnt: i32 = 0;
   let draws: i32 = 0;
   let g: i32 = 0;
-  while (g < games) {
+  while (g < ngames) {
     let aSide: i32 = SENTE;
     if (g % 2 == 1) { aSide = GOTE; }                 // 手番を交互に
     let bd: Board = initBoard();
@@ -644,7 +662,7 @@ function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
     }
     g = g + 1;
   }
-  let score: f32 = ((aW as f32) + 0.5 * (draws as f32)) / (games as f32);
+  let score: f32 = ((aW as f32) + 0.5 * (draws as f32)) / (ngames as f32);
   stdout.println(`  matchNets: A W:${aW} L:${bWcnt} D:${draws}  A-score=${score * 100.0}%`);
   return score;
 }

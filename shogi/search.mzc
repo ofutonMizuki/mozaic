@@ -217,7 +217,7 @@ function search(tt: Buffer<Atomic<u64>>, ctrl: Buffer<Atomic<u64>>, zob: Buffer<
 
   let moves: Vec<i32> = b.gen(false);
   let n: u32 = moves.len;
-  if (n == 0) { return (0 - MATE) + ply; }                // 指す手なし = 負け
+  if (n == 0) { return (0 - MATE) + ply - 1; }            // 指す手なし = 負け(玉取り MATE-ply 規約と1手分整合)
   if (ttMove != 0) {
     let k: u32 = 0;
     while (k < n) { if ((moves[k] & 65535) == ttMove) { moves[k] = (moves[k] & 65535) | (2000 << 16); } k = k + 1; }

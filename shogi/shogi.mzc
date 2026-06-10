@@ -45,7 +45,7 @@ function main() {
     if (toks[0] == "usi") {
       stdout.println("id name mozaic-shogi");
       stdout.println("id author mozaic");
-      stdout.println("option name Threads type spin default 4 min 1 max 32");   // GUI に並列数を出す
+      stdout.println("option name Threads type spin default 4 min 1 max 16");   // GUI に並列数を出す(BCAP=16 が GPU バス上限)
       stdout.println("usiok");
       stdout.flush();
     } else if (toks[0] == "isready") {
@@ -61,6 +61,7 @@ function main() {
         si = si + 1;
       }
       if (threads < 1) { threads = 1; }
+      if (threads > (BCAP as i32)) { threads = BCAP as i32; }   // GPU バス bb は BCAP スロットしか無い(超過は OOB)
     } else if (toks[0] == "position") {
       game = parsePosition(&toks);
     } else if (toks[0] == "go") {
@@ -120,6 +121,7 @@ function main() {
       let side: i32 = game.side;
       let nt: i32 = threads;
       if (nt < 1) { nt = 1; }
+      if (nt > (BCAP as i32)) { nt = BCAP as i32; }         // 防御: GPU バス bb は BCAP スロット上限
       // バッチ評価バスを初期化(NN 有効化)。コーディネータ + nt ワーカーを起動。
       bb[B_ARRIVED].store(0, Relaxed);
       bb[B_READY].store(0, Relaxed);
@@ -195,11 +197,11 @@ function main() {
       let total: u32 = CONVW_SZ + CONVB_SZ + HEADW_SZ;
       let out: str = `weights ${total}`;
       let wi: u32 = 0;
-      while (wi < CONVW_SZ) { out = out + ` ${(cnv[wi] * 1000000.0) as i32}`; wi = wi + 1; }
+      while (wi < CONVW_SZ) { out = out + ` ${fx6(cnv[wi])}`; wi = wi + 1; }
       let wj: u32 = 0;
-      while (wj < CONVB_SZ) { out = out + ` ${(cnb[wj] * 1000000.0) as i32}`; wj = wj + 1; }
+      while (wj < CONVB_SZ) { out = out + ` ${fx6(cnb[wj])}`; wj = wj + 1; }
       let wk: u32 = 0;
-      while (wk < HEADW_SZ) { out = out + ` ${(headW[wk] * 1000000.0) as i32}`; wk = wk + 1; }
+      while (wk < HEADW_SZ) { out = out + ` ${fx6(headW[wk])}`; wk = wk + 1; }
       stdout.println(out);
       stdout.flush();
     } else if (toks[0] == "loadweights") {

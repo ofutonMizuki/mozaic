@@ -45,6 +45,12 @@ function baseType(t: i32): i32 {                             // 成駒 -> 元の
   if (t > 8) { return t - 8; }
   return t;
 }
+function fx6(w: f32): i32 {                                  // 重みを固定小数 ×1e6 へ。i32 範囲(±2e9)へクランプし NaN は 0
+  let s: f32 = w;                                            // (|w|>2147 で `as i32` が未定義になるのを防ぐ)
+  if (s != s) { return 0; }                                 // NaN は 0
+  if (s > 2000.0) { s = 2000.0; } else if (s < (0.0 - 2000.0)) { s = 0.0 - 2000.0; }
+  return (s * 1000000.0) as i32;
+}
 function inZone(r: i32, me: i32): bool {                     // 成れる段(敵陣)か
   if (me == SENTE) { return r <= 2; }
   return r >= 6;
