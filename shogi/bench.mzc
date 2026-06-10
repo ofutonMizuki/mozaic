@@ -1,0 +1,209 @@
+// ============================================================================
+//  自己検証 bench (perft + 戦術 + 自己対局)  — shogi.mzc から分割 (mozaic 将棋エンジン)
+// ============================================================================
+
+// ============================================================================
+//  自己検証 (perft + 戦術 + 自己対局)。USI の `bench` コマンドで起動する。
+// ============================================================================
+
+function runBench() {
+  let tt: Buffer<Atomic<u64>> = Buffer.shared(TT2_N);
+  let ctrl: Buffer<Atomic<u64>> = Buffer.shared(CTRL_N);
+  let zob: Buffer<u64> = makeZob();
+  let bb: Buffer<Atomic<i32>> = Buffer.shared(BB_SZ);      // バッチ評価バス。ベンチは NN 無効(コーディネータ無し)
+  bb[B_NN].store(0, Relaxed);
+  let b: Board = initBoard();
+  stdout.println("=== initial position (uppercase=Sente, lowercase=Gote) ===");
+  b.show();
+
+  stdout.println("=== perft (move-generation sanity; expect 30 / 900 / 25470) ===");
+  stdout.println(perft(&mut b, 1));
+  stdout.println(perft(&mut b, 2));
+  stdout.println(perft(&mut b, 3));
+
+  stdout.println("=== tactics self-test ===");
+  // (1) タダ取り: 先手飛が同じ段の浮いている後手金を取れる -> 取るのが最善のはず。
+  let tac: Board = emptyBoard();
+  tac.sq[8 * 9 + 4] = KING;          // 先手玉
+  tac.sq[0 * 9 + 8] = KING | 16;     // 後手玉(飛の利きの外に置く)
+  tac.sq[4 * 9 + 4] = ROOK;          // 先手飛(中央)
+  tac.sq[4 * 9 + 0] = GOLD | 16;     // 浮いた後手金(同じ段)
+  let t1: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut tac, 4);
+  let goldSq: i32 = t1.mv & 127;
+  stdout.println(`free-capture: best=${moveStr(t1.mv)} eval=${t1.score}`);
+  assert(typeOf(tac.sq[goldSq]) == GOLD, "engine must capture the hanging gold");
+  assert(t1.score > 400, "engine must be winning material");
+
+  // (2) 玉を取れる(詰みの一歩手前)局面の認識: 後手玉が取れる -> MATE 級の評価。
+  let mt: Board = emptyBoard();
+  mt.sq[8 * 9 + 4] = KING;           // 先手玉
+  mt.sq[4 * 9 + 4] = KING | 16;      // 取れる後手玉
+  mt.sq[4 * 9 + 0] = ROOK;           // 先手飛が同じ段で王を狙う
+  let t2: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut mt, 2);
+  stdout.println(`king-capture: best=${moveStr(t2.mv)} eval=${t2.score}`);
+  assert(t2.score > 900000, "engine must see the king capture as a win");
+
+  // (3) 反則回避: 先手玉が後手飛に王手されている。玉が同じ筋に留まる手は反則、
+  //     筋を外す手は合法。エンジンは必ず合法手を選ぶ。
+  let ck: Board = emptyBoard();
+  ck.sq[8 * 9 + 4] = KING;           // 先手玉 (76)
+  ck.sq[0 * 9 + 4] = ROOK | 16;      // 後手飛が同じ筋(file4)で王手
+  ck.side = SENTE;
+  let stayInCheck: i32 = (7 * 9 + 4) | ((8 * 9 + 4) << 7);   // 76->67: 筋に留まる(王手継続) = 反則
+  let escape: i32      = (8 * 9 + 5) | ((8 * 9 + 4) << 7);   // 76->77: 筋を外す = 合法
+  assert(!ck.legalMove(stayInCheck), "leaving the king in check must be illegal");
+  assert(ck.legalMove(escape), "escaping check must be legal");
+  let cr: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut ck, 3);
+  assert(cr.mv >= 0, "engine must find a legal reply to check");
+  assert(ck.legalMove(cr.mv), "engine must only ever play a legal move");
+  stdout.println(`under-check: best=${moveStr(cr.mv)} eval=${cr.score} (legal)`);
+
+  // (4) Zobrist 差分更新の検証: 取り・成り・打ちを含む局面を全手 3 手先まで辿り、
+  //     差分ハッシュが毎ノードで再計算と一致することを確認。
+  let zb: Board = emptyBoard();
+  zb.sq[8 * 9 + 4] = KING;           // 先手玉
+  zb.sq[0 * 9 + 4] = KING | 16;      // 後手玉
+  zb.sq[2 * 9 + 4] = ROOK;           // 敵陣の先手飛(成れる/後手金を取れる)
+  zb.sq[1 * 9 + 4] = GOLD | 16;      // 取られる後手金
+  zb.hand[SENTE * 8 + PAWN] = 1;     // 先手の持ち歩(打ちを発生させる)
+  zb.side = SENTE;
+  zb.hash = computeHash(&zob, &zb);
+  assert(hashWalk(&zob, &mut zb, 3), "incremental Zobrist must match full recompute");
+  stdout.println("zobrist: incremental update == full recompute (ok)");
+
+  // (5) Lazy SMP スモークテスト: 初期局面を 4 スレッド・短時間で並列探索し、
+  //     共有 TT 越しに少なくとも 1 反復が完了して合法手が返ることを確認。
+  ctrl[C_STOP].store(0, Relaxed);
+  ctrl[C_DEPTH].store(0, Relaxed);
+  ctrl[C_MOVE].store(0, Relaxed);
+  ctrl[C_SCORE].store(SCORE_OFF as u64, Relaxed);
+  ctrl[C_NODES].store(0, Relaxed);
+  ctrl[C_DEADLINE].store(clock.now() + ((300 as u64) * NS_PER_MS), Relaxed);
+  let ssq: Buffer<i32> = Buffer.shared(81);
+  let shnd: Buffer<i32> = Buffer.shared(16);
+  let sk: u32 = 0;
+  while (sk < 81) { ssq[sk] = b.sq[sk]; sk = sk + 1; }
+  let sh: u32 = 0;
+  while (sh < 16) { shnd[sh] = b.hand[sh]; sh = sh + 1; }
+  scope {
+    let id: u32 = 0;
+    while (id < 4) { spawn worker(&tt, &ctrl, &zob, &bb, &ssq, &shnd, SENTE, id, 10); id = id + 1; }
+  }
+  let smpDepth: u64 = ctrl[C_DEPTH].load(Relaxed);
+  let smpMv: i32 = ctrl[C_MOVE].load(Relaxed) as i32;
+  let smpNodes: u64 = ctrl[C_NODES].load(Relaxed);
+  assert(smpDepth >= 1, "lazy SMP must complete at least one iteration");
+  assert(b.legalMove(smpMv), "lazy SMP must return a legal move");
+  stdout.println(`lazy-SMP (4 threads, 300ms): depth=${smpDepth} nodes=${smpNodes} best=${moveStr(smpMv)} (legal)`);
+
+  // (6) スレッド数で同期するバッチ GPU CNN 評価: NB スレッドが各自リーフ局面を出し、
+  //     最後の到達者が 1 ディスパッチで全局面を評価して配り返す(--gpu なら実機 Metal)。
+  let cnv: Buffer<f32> = nnWeights(CONVW_SZ, 11111);
+  let cnb: Buffer<f32> = nnWeights(CONVB_SZ, 22222);
+  let headW: Buffer<f32> = nnWeights(HEADW_SZ, 33333);
+  let NB: u32 = 4;
+  let CAP: u32 = 4;                                          // バッチ容量(= NB*1)。複数投入なら増やす
+  let boardsA: Buffer<Atomic<i32>> = Buffer.shared(CAP * BOARD_INTS);
+  let outA: Buffer<Atomic<i32>> = Buffer.shared(CAP);
+  let slotCtr: Atomic<u32> = Atomic.new(0);
+  let bArrived: Atomic<u32> = Atomic.new(0);
+  let bGen: Atomic<u32> = Atomic.new(0);
+  scope {
+    let id: u32 = 0;
+    while (id < NB) {
+      spawn batchWorker(&slotCtr, &bArrived, &bGen, &boardsA, &outA, &cnv, &cnb, &headW, id, NB, CAP, 4);
+      id = id + 1;
+    }
+  }
+  let s0: i32 = outA[0].load(Relaxed);
+  let s1: i32 = outA[1].load(Relaxed);
+  assert(s0 == s1, "same position must evaluate equally across batch slots");
+  stdout.println(`gpu-batch (${NB} threads sync, batch<=${CAP}): nn eval cp=${s0} (slots agree=${s0 == s1})`);
+
+  // (7) 前向き一致: カーネル(nnConv+nnHead) と ホスト前向き(nnValueBoard) が同じ値か。
+  //     これがズレると「ホストで学習した重み」を「カーネル推論」が誤解釈して静かに壊れる。
+  let hb: Board = initBoard();
+  let hpl: Buffer<f32> = Buffer.shared(PLANE_SZ);
+  let ha: Buffer<f32> = Buffer.shared(CONV_SZ);             // conv 出力スクラッチ
+  let hscr: Buffer<f32> = Buffer.shared(FLAT + HID + FLAT); // 空間ヘッドのスクラッチ
+  let hostCp: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &ha, &hscr, &hb) * NN_SCALE) as i32;
+  let dCp: i32 = hostCp - s0;
+  if (dCp < 0) { dCp = 0 - dCp; }
+  assert(dCp <= 40, "batch(GPU conv) forward must roughly match host(f32) forward");
+  stdout.println(`nn-consistency: batch(f32) cp=${s0}  host(f32) cp=${hostCp}  (|Δ|=${dCp} <= 40)`);
+
+  // (8) 持ち駒が評価に効いているか: 同じ盤面でも手駒が違えば評価が変わること。
+  let hb2: Board = initBoard();
+  hb2.hand[ROOK] = 2;                                       // 先手の持ち駒に飛車 2 枚
+  let cpEmpty: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &ha, &hscr, &hb) * NN_SCALE) as i32;
+  let cpHand: i32 = (nnValueBoard(&cnv, &cnb, &headW, &hpl, &ha, &hscr, &hb2) * NN_SCALE) as i32;
+  assert(cpEmpty != cpHand, "hand pieces must change the evaluation (hand planes wired in)");
+  stdout.println(`hand-feature: empty-hand=${cpEmpty}cp  +2R-in-hand=${cpHand}cp (differ -> 持ち駒が評価に反映)`);
+
+  // (9) 2 層 GPU 学習のスモークテスト。前向き 2 層は (7) で host==GPU 一致済。ここでは逆伝播
+  //     (head -> hDconv -> conv2勾配 -> tConvDX -> addMaskReLU -> conv1勾配)が「生きている」ことを、
+  //     conv1/conv2 双方の重みが学習で動くこと・有限・再現性(sign-SGD 同一2回 = bit一致)で確認する。
+  //     逆伝播の数値的正しさ(勾配の向き)は arena(2層学習 vs init)で実証する。
+  let vN: u32 = 24;
+  let vX: Buffer<f32> = Buffer.shared(vN * PLANE_SZ);
+  let vY: Buffer<f32> = Buffer.shared(vN);
+  let vp: u32 = 0;
+  while (vp < vN) {
+    let vb: Board = initBoard();
+    vb.hand[PAWN] = (vp % 5) as i32;                  // 持ち駒を変えてプレーンも多様化
+    vb.hand[ROOK] = (vp % 3) as i32;
+    encodeBoard(&vX, vp * PLANE_SZ, &vb);
+    vY[vp] = (vp as f32) * 0.13 - 1.5;
+    vp = vp + 1;
+  }
+  let cwI: Buffer<f32> = nnWeights(CONVW_SZ, 71);     // 初期値の控え(動いたか比較用)
+  let cwA: Buffer<f32> = nnWeights(CONVW_SZ, 71);
+  let cbA: Buffer<f32> = nnWeights(CONVB_SZ, 72);
+  let hwA: Buffer<f32> = nnWeights(HEADW_SZ, 73);
+  let cwB: Buffer<f32> = nnWeights(CONVW_SZ, 71);     // 同一初期値(決定的)
+  let cbB: Buffer<f32> = nnWeights(CONVB_SZ, 72);
+  let hwB: Buffer<f32> = nnWeights(HEADW_SZ, 73);
+  trainGPU(&cwA, &cbA, &hwA, &vX, &vY, vN, 5, 0.05, true);          // 2 層 GPU 学習
+  trainGPU(&cwB, &cbB, &hwB, &vX, &vY, vN, 5, 0.05, true);          // 同条件で再実行(再現性)
+  let mism: u32 = 0;            // A/B 不一致(再現性)
+  let nfin: u32 = 0;            // 非有限(NaN は self != self)
+  let moved1: u32 = 0;          // conv1 ブロックで動いた重み
+  let moved2: u32 = 0;          // conv2 ブロックで動いた重み
+  let vi: u32 = 0;
+  while (vi < CONVW_SZ) {
+    let a: f32 = cwA[vi];
+    if (a != a) { nfin = nfin + 1; }
+    let d: f32 = a - cwB[vi]; if (d < 0.0) { d = 0.0 - d; }
+    if (d > 0.0) { mism = mism + 1; }
+    let m: f32 = a - cwI[vi]; if (m < 0.0) { m = 0.0 - m; }
+    if (m > 0.000001) { if (vi < CONVW1_SZ) { moved1 = moved1 + 1; } if (vi >= WO_CONV2) { moved2 = moved2 + 1; } }
+    vi = vi + 1;
+  }
+  assert(mism == 0, "two identical sign-SGD runs must be bit-identical (determinism)");
+  assert(nfin == 0, "weights must stay finite (no NaN/Inf in 2-layer backward)");
+  assert(moved1 * 4 > CONVW1_SZ, "conv1 weights must train -> backward reaches input layer (tConvDX/addMaskReLU live)");
+  assert(moved2 * 4 > CONVW2_SZ, "conv2 weights must train");
+  stdout.println(`2L-train smoke: conv1 moved=${moved1}/${CONVW1_SZ} conv2 moved=${moved2}/${CONVW2_SZ} nonfinite=${nfin} det-mismatch=${mism}`);
+
+  stdout.println(`=== self-play (alpha-beta, depth ${DEPTH}) ===`);
+  let ply: i32 = 0;
+  while (ply < MAXPLY) {
+    let best: Best = bestMove(&tt, &ctrl, &zob, &bb, &mut b, DEPTH);
+    if (best.mv < 0) {                                       // 合法手なし = 詰み(反則を犯さず投了)
+      let loser: str = "S";
+      let winner: str = "G";
+      if (b.side == GOTE) { loser = "G"; winner = "S"; }
+      stdout.println(`${loser} is checkmated (no legal move) -- ${winner} wins`);
+      break;
+    }
+    let m: i32 = best.mv;
+    let sideStr: str = "S";
+    if (b.side == GOTE) { sideStr = "G"; }
+    let cap: i32 = b.sq[m & 127];
+    stdout.println(`${ply + 1} ${sideStr} ${moveStr(m)}  eval=${best.score}`);
+    b.doMove(m);
+    if (cap != 0 && typeOf(cap) == KING) { stdout.println(`${sideStr} captures the KING -- win!`); break; }
+    ply = ply + 1;
+  }
+}
+

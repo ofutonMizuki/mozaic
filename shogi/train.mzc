@@ -1,0 +1,667 @@
+// ============================================================================
+//  学習 (物量回帰/自己対局/TD) ・強さ計測 (match)  — shogi.mzc から分割 (mozaic 将棋エンジン)
+// ============================================================================
+
+// データセット(dataX=入力プレーン, dataY=教師値)で CNN を学習(MSE・手書き逆伝播・sign-SGD)。
+// train(物量回帰)と selfplay(勝敗回帰)の両方から呼ぶ共通ルーチン。
+function trainOnDataset(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>,
+                        dataX: Buffer<f32>, dataY: Buffer<f32>, npos: u32, epochs: i32, lr: f32) {
+  let gW: Buffer<f32> = Buffer.shared(CONVW_SZ);    // conv 重み勾配
+  let gCB: Buffer<f32> = Buffer.shared(NCH);        // conv バイアス勾配
+  let gHead: Buffer<f32> = Buffer.shared(HEADW_SZ); // 空間ヘッド勾配(headW と同レイアウト)
+  let aBuf: Buffer<f32> = Buffer.shared(CONV_SZ);   // conv 出力(ReLU後)
+  let daBuf: Buffer<f32> = Buffer.shared(CONV_SZ);  // dL/dconv(headBackward が書く)
+  let scr: Buffer<f32> = Buffer.shared(FLAT + HID + FLAT);   // 空間ヘッドのスクラッチ
+  let invN: f32 = 1.0 / (npos as f32);
+
+  let ep: i32 = 0;
+  while (ep < epochs) {
+    // 勾配ゼロ化
+    let z0: u32 = 0;
+    while (z0 < CONVW_SZ) { gW[z0] = 0.0; z0 = z0 + 1; }
+    let z1: u32 = 0;
+    while (z1 < NCH) { gCB[z1] = 0.0; z1 = z1 + 1; }
+    let z2: u32 = 0;
+    while (z2 < HEADW_SZ) { gHead[z2] = 0.0; z2 = z2 + 1; }
+    let loss: f32 = 0.0;
+
+    let i: u32 = 0;
+    while (i < npos) {
+      let xbase: u32 = i * PLANE_SZ;
+      // forward: conv3x3 + ReLU -> aBuf(空間ヘッドが使う)
+      let oc: u32 = 0;
+      while (oc < NCH) {
+        let yy: u32 = 0;
+        while (yy < 9) {
+          let xx: u32 = 0;
+          while (xx < 9) {
+            let z: f32 = convB[oc];
+            let ic: u32 = 0;
+            while (ic < NPLANE) {
+              let dy: i32 = 0 - 1;
+              while (dy <= 1) {
+                let dx: i32 = 0 - 1;
+                while (dx <= 1) {
+                  let ny: i32 = (yy as i32) + dy;
+                  let nx: i32 = (xx as i32) + dx;
+                  if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+                    let xv: f32 = dataX[xbase + ic * 81 + ((ny as u32) * 9 + (nx as u32))];
+                    let wv: f32 = convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+                    z = z + xv * wv;
+                  }
+                  dx = dx + 1;
+                }
+                dy = dy + 1;
+              }
+              ic = ic + 1;
+            }
+            let av: f32 = z;
+            if (av < 0.0) { av = 0.0; }
+            aBuf[oc * 81 + (yy * 9 + xx)] = av;
+            xx = xx + 1;
+          }
+          yy = yy + 1;
+        }
+        oc = oc + 1;
+      }
+      // 空間ヘッド fwd/bwd(trainGPU と同一コード -> bit 一致)。daBuf = dL/dconv。
+      let val: f32 = headForward(&aBuf, 0, &headW, &scr);
+      let diff: f32 = val - dataY[i];
+      loss = loss + diff * diff;
+      headBackward(&aBuf, 0, &headW, dataY[i], &scr, &gHead, &daBuf, 0);
+      // conv 重み/バイアス勾配(daBuf=dL/dconv は headBackward が ReLU マスク済で書いた)。
+      // tConvGrad/tConvBGrad と同式(daBuf を全セル総和・順序差は sign-SGD が吸収)。
+      let ob: u32 = 0;
+      while (ob < NCH) {
+        let yy2: u32 = 0;
+        while (yy2 < 9) {
+          let xx2: u32 = 0;
+          while (xx2 < 9) {
+            let dz: f32 = daBuf[ob * 81 + (yy2 * 9 + xx2)];
+            gCB[ob] = gCB[ob] + dz;
+            let ic2: u32 = 0;
+            while (ic2 < NPLANE) {
+              let dy2: i32 = 0 - 1;
+              while (dy2 <= 1) {
+                let dx2: i32 = 0 - 1;
+                while (dx2 <= 1) {
+                  let ny2: i32 = (yy2 as i32) + dy2;
+                  let nx2: i32 = (xx2 as i32) + dx2;
+                  if (ny2 >= 0 && ny2 < 9 && nx2 >= 0 && nx2 < 9) {
+                    let xv2: f32 = dataX[xbase + ic2 * 81 + ((ny2 as u32) * 9 + (nx2 as u32))];
+                    let wi: u32 = (ob * NPLANE + ic2) * 9 + (((dy2 + 1) as u32) * 3 + ((dx2 + 1) as u32));
+                    gW[wi] = gW[wi] + dz * xv2;
+                  }
+                  dx2 = dx2 + 1;
+                }
+                dy2 = dy2 + 1;
+              }
+              ic2 = ic2 + 1;
+            }
+            xx2 = xx2 + 1;
+          }
+          yy2 = yy2 + 1;
+        }
+        ob = ob + 1;
+      }
+      i = i + 1;
+    }
+
+    // sign-SGD 更新 + 線形減衰(全パラメータが一定歩幅で動くのでスケール不均一に頑健)
+    let elr: f32 = lr * (1.0 - (ep as f32) / (epochs as f32));
+    let u0: u32 = 0;
+    while (u0 < CONVW_SZ) { convW[u0] = convW[u0] - elr * sgn(gW[u0]); u0 = u0 + 1; }
+    let u1: u32 = 0;
+    while (u1 < NCH) { convB[u1] = convB[u1] - elr * sgn(gCB[u1]); u1 = u1 + 1; }
+    let u2: u32 = 0;
+    while (u2 < HEADW_SZ) { headW[u2] = headW[u2] - elr * sgn(gHead[u2]); u2 = u2 + 1; }
+
+    if (ep == 0 || (ep + 1) % 10 == 0) {
+      stdout.println(`  epoch ${ep + 1}/${epochs}  mse=${loss * invN}`);
+      stdout.flush();
+    }
+    ep = ep + 1;
+  }
+}
+
+// GPU 学習: trainOnDataset と同じ式だが、重い conv の前向き(tConvFwd)と重み勾配(tConvGrad)を
+// GPU カーネルで並列化(CPU ビルドでも launch がワーカープールで並列実行)。GAP/頭部の逆伝播は
+// 安価なのでホスト。sign-SGD なので勾配の符号さえ一致すれば CPU 版と同一の重みに収束する。
+// useSign=true: sign-SGD(各重み ±elr・スケール不変・GPU==CPU bit一致, 教師あり/MC自己対局用)。
+// useSign=false: 実勾配 SGD・層ごと L∞ 正規化(勾配の大きさを活かす・TD 学習用)。
+function trainGPU(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>,
+                  dataX: Buffer<f32>, dataY: Buffer<f32>, npos: u32, epochs: i32, lr: f32, useSign: bool) {
+  let A1: Buffer<f32> = Buffer.shared(npos * CONV_SZ);   // conv1 出力(ReLU後)
+  let A2: Buffer<f32> = Buffer.shared(npos * CONV_SZ);   // conv2 出力(残差・ReLU後)= head 入力
+  let dconv: Buffer<f32> = Buffer.shared(npos * CONV_SZ); // dZ2 (= dL/d(z2+A1)・head から)
+  let dA1c: Buffer<f32> = Buffer.shared(npos * CONV_SZ); // conv2 の入力勾配(tConvDX)
+  let dZ1: Buffer<f32> = Buffer.shared(npos * CONV_SZ);  // conv1 出力前の勾配
+  let gConvW: Buffer<f32> = Buffer.shared(CONVW_SZ);     // [conv1 grad | conv2 grad]
+  let gConvB: Buffer<f32> = Buffer.shared(CONVB_SZ);     // [b1 grad | b2 grad]
+  let gHead: Buffer<f32> = Buffer.shared(HEADW_SZ);
+  let flat: Buffer<f32> = Buffer.shared(npos * FLAT);
+  let h2: Buffer<f32> = Buffer.shared(npos * HID);
+  let val: Buffer<f32> = Buffer.shared(npos);
+  let draw: Buffer<f32> = Buffer.shared(npos);
+  let dpre2: Buffer<f32> = Buffer.shared(npos * HID);
+  let dpre1: Buffer<f32> = Buffer.shared(npos * FLAT);
+  let dev: Device = Device.gpu;
+  let invN: f32 = 1.0 / (npos as f32);
+
+  let ep: i32 = 0;
+  while (ep < epochs) {
+    // 前向き: conv1 -> A1 -> conv2(残差) -> A2 -> 空間ヘッド。
+    let jf: Job = dev.launch(tConvFwd, npos * CONV_SZ, &dataX, &convW, 0, &convB, 0, &mut A1, NPLANE, NCH);
+    jf.await();
+    let jr: Job = dev.launch(tConvResFwd, npos * CONV_SZ, &A1, &convW, WO_CONV2, &convB, BO_CONV2, &mut A2, NCH, NCH);
+    jr.await();
+    let jh: Job = dev.launch(hFwd, npos, &A2, &headW, &mut flat, &mut h2, &mut val, NCH);
+    jh.await();
+    let loss: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) { let d: f32 = val[i] - dataY[i]; loss = loss + d * d; i = i + 1; }
+    // 頭部逆伝播(gHead へ)。hDconv が dconv = dZ2(head 入力 A2 の ReLU マスク済)を書く。
+    let jb1: Job = dev.launch(hBwd1, npos, &headW, &h2, &val, &dataY, &mut draw, &mut dpre2, npos, NCH); jb1.await();
+    let jb2: Job = dev.launch(hBwd2, npos, &headW, &dpre2, &flat, &mut dpre1, npos, NCH); jb2.await();
+    let ja: Job = dev.launch(hGF2W, HID, &draw, &h2, &mut gHead, npos, NCH); ja.await();
+    let jbb: Job = dev.launch(hGF2B, 1, &draw, &mut gHead, npos, NCH); jbb.await();
+    let jc: Job = dev.launch(hGF1W, FLAT * HID, &dpre2, &flat, &mut gHead, npos, NCH); jc.await();
+    let jd: Job = dev.launch(hGF1B, HID, &dpre2, &mut gHead, npos, NCH); jd.await();
+    let je: Job = dev.launch(hGC1W, NCH * HEADC, &dpre1, &A2, &mut gHead, npos, NCH); je.await();
+    let jf2: Job = dev.launch(hGC1B, HEADC, &dpre1, &mut gHead, npos, NCH); jf2.await();
+    let jdc: Job = dev.launch(hDconv, npos * CONV_SZ, &dpre1, &A2, &headW, &mut dconv, NCH); jdc.await();
+    // conv2 逆伝播: 重み/バイアス勾配 + 入力勾配 dA1c。残差で dA1 = dA1c + dZ2。dZ1 = (A1>0)?dA1:0。
+    let jg2: Job = dev.launch(tConvGrad, CONVW2_SZ, &dconv, &A1, &mut gConvW, WO_CONV2, npos, NCH, NCH); jg2.await();
+    let jb2g: Job = dev.launch(tConvBGrad, NCH, &dconv, &mut gConvB, BO_CONV2, npos, NCH); jb2g.await();
+    let jdx: Job = dev.launch(tConvDX, npos * CONV_SZ, &dconv, &convW, WO_CONV2, &mut dA1c, NCH, NCH); jdx.await();
+    let jmk: Job = dev.launch(addMaskReLU, npos * CONV_SZ, &dA1c, &dconv, &A1, &mut dZ1); jmk.await();
+    // conv1 逆伝播(最下層: dL/dX 不要)。
+    let jg: Job = dev.launch(tConvGrad, CONVW1_SZ, &dZ1, &dataX, &mut gConvW, 0, npos, NPLANE, NCH); jg.await();
+    let jcb: Job = dev.launch(tConvBGrad, NCH, &dZ1, &mut gConvB, 0, npos, NCH); jcb.await();
+    // 更新 + 線形減衰
+    let elr: f32 = lr * (1.0 - (ep as f32) / (epochs as f32));
+    if (useSign) {
+      let u0: u32 = 0;
+      while (u0 < CONVW_SZ) { convW[u0] = convW[u0] - elr * sgn(gConvW[u0]); u0 = u0 + 1; }
+      let u1: u32 = 0;
+      while (u1 < CONVB_SZ) { convB[u1] = convB[u1] - elr * sgn(gConvB[u1]); u1 = u1 + 1; }
+      let u2: u32 = 0;
+      while (u2 < HEADW_SZ) { headW[u2] = headW[u2] - elr * sgn(gHead[u2]); u2 = u2 + 1; }
+    } else {
+      // 実勾配を層ごと L∞ 正規化(最大ステップ=elr, 相対的大きさ保持・層間スケール差で発散しない)。
+      let mC: f32 = maxAbsBuf(&gConvW, CONVW_SZ);
+      let mB: f32 = maxAbsBuf(&gConvB, CONVB_SZ);
+      let mH: f32 = maxAbsBuf(&gHead, HEADW_SZ);
+      let u0: u32 = 0;
+      while (u0 < CONVW_SZ) { convW[u0] = convW[u0] - elr * gConvW[u0] / mC; u0 = u0 + 1; }
+      let u1: u32 = 0;
+      while (u1 < CONVB_SZ) { convB[u1] = convB[u1] - elr * gConvB[u1] / mB; u1 = u1 + 1; }
+      let u2: u32 = 0;
+      while (u2 < HEADW_SZ) { headW[u2] = headW[u2] - elr * gHead[u2] / mH; u2 = u2 + 1; }
+    }
+    if (ep == 0 || (ep + 1) % 10 == 0) {
+      stdout.println(`  [gpu] epoch ${ep + 1}/${epochs}  mse=${loss * invN}`);
+      stdout.flush();
+    }
+    ep = ep + 1;
+  }
+}
+
+// 物量評価への教師あり回帰(ランダム自己生成局面を eval() でラベル付け)。
+function trainCNN(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>) {
+  let NPOS: u32 = 512;           // Stage 3: 物量回帰の局面数を拡大(被覆を広げる)
+  let dataX: Buffer<f32> = Buffer.shared(NPOS * PLANE_SZ);
+  let dataY: Buffer<f32> = Buffer.shared(NPOS);
+  let seed: u64 = 1234567891;
+  let wu: i32 = 0;
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
+  let p: u32 = 0;
+  while (p < NPOS) {
+    let bd: Board = initBoard();
+    seed = xorshift64(seed);
+    let plies: i32 = (seed % (36 as u64)) as i32;
+    let t: i32 = 0;
+    let alive: bool = true;
+    while (t < plies && alive) {
+      let mv: Vec<i32> = bd.gen(false);
+      let n: u32 = mv.len;
+      if (n == 0) { alive = false; }
+      else {
+        seed = xorshift64(seed);
+        let start: u32 = (seed % (n as u64)) as u32;
+        let picked: i32 = 0 - 1;
+        let k: u32 = 0;
+        while (k < n) {
+          let idx: u32 = (start + k) % n;
+          let m: i32 = mv[idx] & 65535;
+          if (picked < 0 && bd.legalMove(m)) { picked = m; }
+          k = k + 1;
+        }
+        if (picked < 0) { alive = false; } else { bd.doMove(picked); }
+      }
+      t = t + 1;
+    }
+    encodeBoard(&dataX, p * PLANE_SZ, &bd);
+    // 物量を勝率風に [-1,1] へ圧縮(squash)。自己対局の結果ラベル(±1/0)と同じスケールにすることで、
+    // train(物量) -> selfplay(勝敗) の橋渡しでスケール衝突せず、物量知識を保ったまま結果で精錬できる。
+    let e: f32 = bd.evalToMove() as f32;            // 手番視点の物量(canonical 入力と整合)
+    let ea: f32 = e;
+    if (ea < 0.0) { ea = 0.0 - ea; }
+    dataY[p] = LABEL_SMOOTH * (e / (ea + SQUASH_K));  // |e|=K で ±0.45、平滑化で ±LABEL_SMOOTH(softsign の raw を過大にしない)
+    p = p + 1;
+  }
+  stdout.println("train: supervised regression to material eval");
+  trainGPU(&convW, &convB, &headW, &dataX, &dataY, NPOS, 120, 0.02, false);   // 深い空間ヘッド -> 実勾配SGD
+  // Stage 3: 学習に使っていない別系列(別種)の局面で検証 MSE を測る(過学習の監視)。
+  // ホスト 2 層前向き nnValueBoard を使うので追加カーネル不要・小規模(NVAL)で安全。
+  let NVAL: u32 = 128;
+  let vseed: u64 = 9876543217;
+  let vwu: i32 = 0;
+  while (vwu < 8) { vseed = xorshift64(vseed); vwu = vwu + 1; }
+  let vpl: Buffer<f32> = Buffer.shared(PLANE_SZ);
+  let vaBuf: Buffer<f32> = Buffer.shared(CONV_SZ);
+  let vscr: Buffer<f32> = Buffer.shared(FLAT + HID + FLAT);
+  let vmse: f32 = 0.0;
+  let vq: u32 = 0;
+  while (vq < NVAL) {
+    let vb: Board = initBoard();                       // 訓練と同じ分布だが別種(held-out)
+    vseed = xorshift64(vseed);
+    let vplies: i32 = (vseed % (36 as u64)) as i32;
+    let vt: i32 = 0;
+    let valive: bool = true;
+    while (vt < vplies && valive) {
+      let vmv: Vec<i32> = vb.gen(false);
+      let vn: u32 = vmv.len;
+      if (vn == 0) { valive = false; }
+      else {
+        vseed = xorshift64(vseed);
+        let vstart: u32 = (vseed % (vn as u64)) as u32;
+        let vpicked: i32 = 0 - 1;
+        let vk: u32 = 0;
+        while (vk < vn) {
+          let vm: i32 = vmv[(vstart + vk) % vn] & 65535;
+          if (vpicked < 0 && vb.legalMove(vm)) { vpicked = vm; }
+          vk = vk + 1;
+        }
+        if (vpicked < 0) { valive = false; } else { vb.doMove(vpicked); }
+      }
+      vt = vt + 1;
+    }
+    let vpred: f32 = nnValueBoard(&convW, &convB, &headW, &vpl, &vaBuf, &vscr, &vb);
+    let ve: f32 = vb.evalToMove() as f32;
+    let vea: f32 = ve; if (vea < 0.0) { vea = 0.0 - vea; }
+    let vy: f32 = LABEL_SMOOTH * (ve / (vea + SQUASH_K));  // 学習と同じ平滑化
+    let vd: f32 = vpred - vy;
+    vmse = vmse + vd * vd;
+    vq = vq + 1;
+  }
+  stdout.println(`train: done (weights updated in place); held-out val mse = ${vmse / (NVAL as f32)}`);
+  stdout.flush();
+}
+
+// 自己対局からの強化学習(モンテカルロ価値学習)。
+// CNN 評価で 1 手読み(+ε探索)の自己対局を打ち、各局面に最終結果(先手視点 勝=+1/負=-1/分=0)を
+// ラベル付けして価値を回帰。生成→学習を ITERS 回繰り返す(方策が改善するほど対局も改善)。
+// 評価はエンジン同様 CNN のみ。事前に train で初期化しておくと立ち上がりが速い。
+// seed0: 探索(ε)の乱数種。ラウンドごとに変えないと毎回同一の対局を再生し、データが更新されず
+// final_mse が固定点で凍る(外部ラッパーが時刻由来の種を渡す)。
+function selfplayTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, seed0: u64) {
+  // 経験再生(experience replay): ローリングバッファに自己対局局面を貯め、毎 iter バッファ全体で
+  // 学習する。毎回新規バッチを捨てる従来法は「過学習→忘却」で蓄積せず頭打ちした。これで積み上がる。
+  // Stage 3 データ規模拡大: バッファ・生成量・エポックを増やす。旧 (1024/160/2ep) は
+  // バッファ全体を 2 エポックでは追従できず iter ごとに mse が上昇(過小適合)していた。
+  let RBUF: u32 = 2048;          // リプレイバッファ容量(直近この数の局面を保持)
+  let ITERS: i32 = 12;
+  let GENPI: u32 = 256;          // 1 iter で新規生成する局面数
+  let MAXPLY: i32 = 70;
+  let EPOCHS: i32 = 6;
+  let rbX: Buffer<f32> = Buffer.shared(RBUF * PLANE_SZ);   // バッファ局面プレーン(GPU 常駐)
+  let rbY: Buffer<f32> = Buffer.shared(RBUF);              // ラベル(手番視点 ±1/0)
+  let gsl: Buffer<u32> = Buffer.shared(80);               // 1 対局の rb スロット記録(<=MAXPLY)
+  // 指し手選択スクラッチ(全 iter で再利用・重み GPU 常駐)
+  let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);
+  let cA: Buffer<f32> = Buffer.shared(MBATCH * CONV_SZ);
+  let ppB: Buffer<f32> = Buffer.shared(MBATCH * (FLAT + HID));
+  let vals: Buffer<f32> = Buffer.shared(MBATCH);
+  let mvb: Buffer<i32> = Buffer.shared(MBATCH);
+  let seed: u64 = seed0 ^ 987654321;
+  if (seed == 0) { seed = 987654321; }
+  let wu: i32 = 0;
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
+
+  let rbHead: u32 = 0;
+  let rbFill: u32 = 0;
+  let it: i32 = 0;
+  while (it < ITERS) {
+    let swins: i32 = 0;
+    let gwins: i32 = 0;
+    let draws: i32 = 0;
+    let gen: u32 = 0;
+    while (gen < GENPI) {                                 // 新規局面を GENPI 個ローリングバッファへ
+      let bd: Board = initBoard();
+      let ply: i32 = 0;
+      let alive: bool = true;
+      let result: i32 = 0;                               // 先手視点 +1/-1/0
+      let gn: u32 = 0;                                   // この対局のスロット数
+      while (ply < MAXPLY && gen < GENPI && alive) {
+        encodeBoard(&rbX, rbHead * PLANE_SZ, &bd);       // ローリングバッファへ記録
+        gsl[gn] = rbHead;
+        gn = gn + 1;
+        rbHead = (rbHead + 1) % RBUF;
+        if (rbFill < RBUF) { rbFill = rbFill + 1; }
+        gen = gen + 1;
+        let mover: i32 = bd.side;
+        let mv: Vec<i32> = bd.gen(false);
+        let n: u32 = mv.len;
+        seed = xorshift64(seed);
+        let explore: bool = (seed % (100 as u64)) < 25;
+        let bestMv: i32 = 0 - 1;
+        if (explore) {
+          seed = xorshift64(seed);
+          let start: u32 = 0;
+          if (n > 0) { start = (seed % (n as u64)) as u32; }
+          let k: u32 = 0;
+          while (k < n && bestMv < 0) {
+            let m: i32 = mv[(start + k) % n] & 65535;
+            if (bd.legalMove(m)) { bestMv = m; }
+            k = k + 1;
+          }
+        } else {
+          bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
+        }
+        if (bestMv < 0) {
+          if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
+          alive = false;
+        } else {
+          bd.doMove(bestMv);
+        }
+        ply = ply + 1;
+      }
+      if (alive) {
+        let e: i32 = bd.eval();
+        if (e > 300) { result = 1; } else if (e < (0 - 300)) { result = 0 - 1; } else { result = 0; }
+      }
+      if (result > 0) { swins = swins + 1; } else if (result < 0) { gwins = gwins + 1; } else { draws = draws + 1; }
+      let jj: u32 = 0;                                    // 手番視点でラベル付け(canonical 整合)
+      while (jj < gn) {
+        let lab: f32 = LABEL_SMOOTH * (result as f32);     // ラベル平滑化(softsign の raw を過大にせず段階的に)
+        if ((jj & 1) == 1) { lab = 0.0 - lab; }
+        rbY[gsl[jj]] = lab;
+        jj = jj + 1;
+      }
+    }
+    // リプレイバッファ全体で学習(多様・蓄積 -> 頭打ちを断つ)
+    trainGPU(&convW, &convB, &headW, &rbX, &rbY, rbFill, EPOCHS, 0.02, false);
+    stdout.println(`selfplay iter ${it + 1}/${ITERS}: S:${swins} G:${gwins} D:${draws}  buffer=${rbFill}`);
+    stdout.flush();
+    it = it + 1;
+  }
+  stdout.println("selfplay: done (experience-replay value learning)");
+  stdout.flush();
+}
+
+// ============================================================================
+//  TD(0) 価値学習(ブートストラップ): 多様なランダム対局局面から学習
+// ----------------------------------------------------------------------------
+//  各 iter: (1) ランダム合法手で深さ可変の局面を BATCH 個生成(被覆を広く), (2) 凍結したターゲット
+//  ネットで 1 手先読みし TD ターゲット(先手視点)を作る — 終局は ±1, 非終局は γ·(先手番なら子の
+//  max / 後手番なら min), (3) 現ネットを実勾配 SGD でそのターゲットへ回帰。ターゲットネットは
+//  REFRESH iter ごとに更新(deadly triad 対策)。MC 自己対局よりデータ被覆が広く分散が低いので
+//  定数 collapse しにくい(定数値は多様な局面で TD 誤差が大きくなる)。
+//  注: encodeBoard は手番を符号化しないので V は配置のみの関数(同一配置で手番差は表せない既存制約)。
+// ============================================================================
+function tdTrain(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, seed0: u64) {
+  let ITERS: i32 = 6;
+  let BATCH: u32 = 512;          // Stage 3: データ規模拡大(被覆を広げ分散を下げる)
+  let EPOCHS: i32 = 8;
+  let LR: f32 = 0.02;
+  let REFRESH: i32 = 2;                               // 何 iter ごとにターゲットネットを更新するか
+  let GAMMA: f32 = 0.99;
+  let MAXW: i32 = 80;                                 // ランダム走行の最大手数(深さ可変で被覆)
+
+  let dataX: Buffer<f32> = Buffer.shared(BATCH * PLANE_SZ);
+  let dataY: Buffer<f32> = Buffer.shared(BATCH);
+  let tcW: Buffer<f32> = Buffer.shared(CONVW_SZ);     // ターゲットネット(凍結コピー)
+  let tcB: Buffer<f32> = Buffer.shared(CONVB_SZ);
+  let thW: Buffer<f32> = Buffer.shared(HEADW_SZ);
+  let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);   // 子局面評価スクラッチ
+  let cA: Buffer<f32> = Buffer.shared(MBATCH * CONV_SZ);
+  let ppB: Buffer<f32> = Buffer.shared(MBATCH * (FLAT + HID));   // hFwdI の flat+h2 スクラッチ
+  let vals: Buffer<f32> = Buffer.shared(MBATCH);
+  let mvb: Buffer<i32> = Buffer.shared(MBATCH);            // evalChildren が使う(値のみ参照)
+
+  let seed: u64 = seed0 ^ 1357924680;
+  if (seed == 0) { seed = 1357924680; }
+  let wu: i32 = 0;
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
+
+  let it: i32 = 0;
+  while (it < ITERS) {
+    if (it % REFRESH == 0) {                          // ターゲットネット更新(現重みをコピー)
+      let q0: u32 = 0; while (q0 < CONVW_SZ) { tcW[q0] = convW[q0]; q0 = q0 + 1; }
+      let q1: u32 = 0; while (q1 < CONVB_SZ) { tcB[q1] = convB[q1]; q1 = q1 + 1; }
+      let q2: u32 = 0; while (q2 < HEADW_SZ) { thW[q2] = headW[q2]; q2 = q2 + 1; }
+    }
+    let p: u32 = 0;
+    while (p < BATCH) {
+      // ランダム走行(深さ可変)で 1 局面を作る
+      let bd: Board = initBoard();
+      seed = xorshift64(seed);
+      let plies: i32 = (seed % ((MAXW + 1) as u64)) as i32;
+      let t: i32 = 0;
+      let alive: bool = true;
+      while (t < plies && alive) {
+        let mv: Vec<i32> = bd.gen(false);
+        let n: u32 = mv.len;
+        if (n == 0) { alive = false; }
+        else {
+          seed = xorshift64(seed);
+          let start: u32 = (seed % (n as u64)) as u32;
+          let picked: i32 = 0 - 1;
+          let k: u32 = 0;
+          while (k < n && picked < 0) {
+            let m: i32 = mv[(start + k) % n] & 65535;
+            if (bd.legalMove(m)) { picked = m; }
+            k = k + 1;
+          }
+          if (picked < 0) { alive = false; } else { bd.doMove(picked); }
+        }
+        t = t + 1;
+      }
+      encodeBoard(&dataX, p * PLANE_SZ, &bd);
+      // TD ターゲット(手番視点)を凍結ターゲットネットで 1 手先読みブートストラップ(negamax)
+      let mv2: Vec<i32> = bd.gen(false);
+      dataY[p] = tdTargetValue(&tcW, &tcB, &thW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv2, GAMMA);
+      p = p + 1;
+    }
+    trainGPU(&convW, &convB, &headW, &dataX, &dataY, BATCH, EPOCHS, LR, false);   // 実勾配 SGD
+    stdout.println(`td iter ${it + 1}/${ITERS}`);
+    stdout.flush();
+    it = it + 1;
+  }
+  stdout.println("td: done (bootstrapped value learning over random positions)");
+  stdout.flush();
+}
+
+// ============================================================================
+//  強さ指標: CNN 評価(現在の重み) vs 物量評価 を 1 手読み貪欲で対戦させ勝率を出す
+// ----------------------------------------------------------------------------
+//  final_mse は「その回の学習データへの当てはめ」で、汎化・強さを測れない(collapse すると逆に
+//  ~0 に張り付く)。これは絶対指標: 駒得カウント(物量)を超えられるか。手番は交互、開幕はランダム
+//  で多様化。score>50% = 物量より強い。collapse した重みは物量に負けるので即わかる。
+//  GUI 用の本探索ではなく eval の質を 1 手で隔離して測る(学習が変えるのは eval のみ)。
+// ============================================================================
+function matchVsMaterial(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, games: i32, seed0: u64) {
+  let MAXPLY: i32 = 200;
+  let OPEN: i32 = 4;                                   // ランダム開幕手数(対局を多様化)
+  let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);
+  let cA: Buffer<f32> = Buffer.shared(MBATCH * CONV_SZ);
+  let ppB: Buffer<f32> = Buffer.shared(MBATCH * (FLAT + HID));   // hFwdI の flat+h2 スクラッチ
+  let vals: Buffer<f32> = Buffer.shared(MBATCH);
+  let mvb: Buffer<i32> = Buffer.shared(MBATCH);
+  let seed: u64 = seed0 ^ 2468013579;
+  if (seed == 0) { seed = 2468013579; }
+  let wu: i32 = 0;
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
+
+  let cnnW: i32 = 0;                                   // CNN 側の勝ち
+  let matW: i32 = 0;                                   // 物量側の勝ち
+  let draws: i32 = 0;
+  let g: i32 = 0;
+  while (g < games) {
+    let cnnSide: i32 = SENTE;
+    if (g % 2 == 1) { cnnSide = GOTE; }                // 手番を交互に(色の有利を相殺)
+    let bd: Board = initBoard();
+    let ply: i32 = 0;
+    let alive: bool = true;
+    let result: i32 = 0;                               // +1 先手勝 / -1 後手勝 / 0 分
+    while (ply < MAXPLY && alive) {
+      let mover: i32 = bd.side;
+      let mv: Vec<i32> = bd.gen(false);
+      let n: u32 = mv.len;
+      let bestMv: i32 = 0 - 1;
+      if (ply < OPEN) {
+        // ランダム合法手(開幕の多様化)
+        seed = xorshift64(seed);
+        let start: u32 = 0;
+        if (n > 0) { start = (seed % (n as u64)) as u32; }
+        let k: u32 = 0;
+        while (k < n && bestMv < 0) {
+          let m: i32 = mv[(start + k) % n] & 65535;
+          if (bd.legalMove(m)) { bestMv = m; }
+          k = k + 1;
+        }
+      } else if (mover == cnnSide) {
+        bestMv = cnnGreedyMove(&convW, &convB, &headW, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
+      } else {
+        // 物量貪欲。子局面の material を手番視点で argmax。
+        let bestScoreI: i32 = 0 - 2000000000;
+        let k: u32 = 0;
+        while (k < n) {
+          let m: i32 = mv[k] & 65535;
+          if (bd.legalMove(m)) {
+            let cap: i32 = bd.doMove(m);
+            let e: i32 = bd.eval();
+            bd.undoMove(m, cap);
+            let sp: i32 = e;
+            if (mover == GOTE) { sp = 0 - e; }
+            if (sp > bestScoreI) { bestScoreI = sp; bestMv = m; }
+          }
+          k = k + 1;
+        }
+      }
+      if (bestMv < 0) {                                // 合法手なし = 手番側の詰み
+        if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
+        alive = false;
+      } else {
+        bd.doMove(bestMv);
+      }
+      ply = ply + 1;
+    }
+    if (alive) {                                       // 手数上限 -> 物量符号で裁定
+      let e: i32 = bd.eval();
+      if (e > 300) { result = 1; } else if (e < (0 - 300)) { result = 0 - 1; } else { result = 0; }
+    }
+    if (result == 0) { draws = draws + 1; }
+    else {
+      let cnnWon: bool = false;
+      if (result > 0 && cnnSide == SENTE) { cnnWon = true; }
+      if (result < 0 && cnnSide == GOTE) { cnnWon = true; }
+      if (cnnWon) { cnnW = cnnW + 1; } else { matW = matW + 1; }
+    }
+    g = g + 1;
+  }
+  let score: f32 = ((cnnW as f32) + 0.5 * (draws as f32)) / (games as f32);
+  stdout.println(`match: CNN(now) vs material(1-ply greedy)  games=${games}  CNN W:${cnnW} L:${matW} D:${draws}  score=${score * 100.0}%  (>50% = 物量超え)`);
+  stdout.flush();
+}
+
+// ネット A vs ネット B(両者 CNN 1 手読み貪欲)。A の得点率(0..1)を返す。物量を介さない相対指標で
+// 学習の改善を測れる(同種 eval 同士なので 1 手読みでも強い価値関数が勝つ・物量バイアス無し)。
+function matchNets(wA: Buffer<f32>, bA: Buffer<f32>, hA: Buffer<f32>,
+                   wB: Buffer<f32>, bB: Buffer<f32>, hB: Buffer<f32>,
+                   games: i32, seed0: u64): f32 {
+  let MAXPLY: i32 = 200;
+  let OPEN: i32 = 4;
+  let Xb: Buffer<f32> = Buffer.shared(MBATCH * PLANE_SZ);
+  let cA: Buffer<f32> = Buffer.shared(MBATCH * CONV_SZ);
+  let ppB: Buffer<f32> = Buffer.shared(MBATCH * (FLAT + HID));   // hFwdI の flat+h2 スクラッチ
+  let vals: Buffer<f32> = Buffer.shared(MBATCH);
+  let mvb: Buffer<i32> = Buffer.shared(MBATCH);
+  let seed: u64 = seed0 ^ 99001122;
+  if (seed == 0) { seed = 99001122; }
+  let wu: i32 = 0;
+  while (wu < 8) { seed = xorshift64(seed); wu = wu + 1; }
+  let aW: i32 = 0;
+  let bWcnt: i32 = 0;
+  let draws: i32 = 0;
+  let g: i32 = 0;
+  while (g < games) {
+    let aSide: i32 = SENTE;
+    if (g % 2 == 1) { aSide = GOTE; }                 // 手番を交互に
+    let bd: Board = initBoard();
+    let ply: i32 = 0;
+    let alive: bool = true;
+    let result: i32 = 0;
+    while (ply < MAXPLY && alive) {
+      let mover: i32 = bd.side;
+      let mv: Vec<i32> = bd.gen(false);
+      let n: u32 = mv.len;
+      let bestMv: i32 = 0 - 1;
+      if (ply < OPEN) {                               // ランダム開幕(対局を多様化)
+        seed = xorshift64(seed);
+        let start: u32 = 0;
+        if (n > 0) { start = (seed % (n as u64)) as u32; }
+        let k: u32 = 0;
+        while (k < n && bestMv < 0) {
+          let m: i32 = mv[(start + k) % n] & 65535;
+          if (bd.legalMove(m)) { bestMv = m; }
+          k = k + 1;
+        }
+      } else if (mover == aSide) {                    // 手番側のネットで最善手
+        bestMv = cnnGreedyMove(&wA, &bA, &hA, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
+      } else {
+        bestMv = cnnGreedyMove(&wB, &bB, &hB, &Xb, &cA, &ppB, &vals, &mvb, &mut bd, &mv);
+      }
+      if (bestMv < 0) {
+        if (mover == SENTE) { result = 0 - 1; } else { result = 1; }
+        alive = false;
+      } else {
+        bd.doMove(bestMv);
+      }
+      ply = ply + 1;
+    }
+    if (alive) {
+      let e: i32 = bd.eval();
+      if (e > 300) { result = 1; } else if (e < (0 - 300)) { result = 0 - 1; } else { result = 0; }
+    }
+    if (result == 0) { draws = draws + 1; }
+    else {
+      let aWon: bool = false;
+      if (result > 0 && aSide == SENTE) { aWon = true; }
+      if (result < 0 && aSide == GOTE) { aWon = true; }
+      if (aWon) { aW = aW + 1; } else { bWcnt = bWcnt + 1; }
+    }
+    g = g + 1;
+  }
+  let score: f32 = ((aW as f32) + 0.5 * (draws as f32)) / (games as f32);
+  stdout.println(`  matchNets: A W:${aW} L:${bWcnt} D:${draws}  A-score=${score * 100.0}%`);
+  return score;
+}
+
+// TD 学習 + 強さ計測を一括。学習前の重みをスナップショットし、TD 学習後に「学習後 vs 学習前」を
+// 自己対局で対戦させ得点率を出す(>50% = この回で強くなった)。final_mse と違い実プレーの改善を測る。
+function tdGauge(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>, seed0: u64) {
+  let sW: Buffer<f32> = Buffer.shared(CONVW_SZ);      // 学習前スナップショット(参照)
+  let sB: Buffer<f32> = Buffer.shared(CONVB_SZ);
+  let sH: Buffer<f32> = Buffer.shared(HEADW_SZ);
+  let q0: u32 = 0; while (q0 < CONVW_SZ) { sW[q0] = convW[q0]; q0 = q0 + 1; }
+  let q1: u32 = 0; while (q1 < CONVB_SZ) { sB[q1] = convB[q1]; q1 = q1 + 1; }
+  let q2: u32 = 0; while (q2 < HEADW_SZ) { sH[q2] = headW[q2]; q2 = q2 + 1; }
+  tdTrain(&convW, &convB, &headW, seed0);
+  stdout.println("=== strength gauge: trained vs pre-training snapshot (1-ply self-match) ===");
+  let sc: f32 = matchNets(&convW, &convB, &headW, &sW, &sB, &sH, 20, seed0 ^ 555);
+  stdout.println(`tdgauge: trained score vs snapshot = ${sc * 100.0}%  (>50% = stronger)`);
+  stdout.flush();
+}
+

@@ -1,0 +1,115 @@
+// ============================================================================
+//  定数・駒コードの小道具・指し手パック  — shogi.mzc から分割 (mozaic 将棋エンジン)
+// ============================================================================
+
+// ---- 手番 ----
+const SENTE: i32 = 0;     // 先手(下手・盤の下側、上=rank0 方向へ進む)
+const GOTE: i32  = 1;     // 後手(上手・盤の上側、下=rank8 方向へ進む)
+
+// ---- 駒種(基本 1..8、成り = 基本+8 で 9..14) ----
+const PAWN: i32   = 1;    // 歩
+const LANCE: i32  = 2;    // 香
+const KNIGHT: i32 = 3;    // 桂
+const SILVER: i32 = 4;    // 銀
+const BISHOP: i32 = 5;    // 角
+const ROOK: i32   = 6;    // 飛
+const GOLD: i32   = 7;    // 金 (成れない)
+const KING: i32   = 8;    // 玉 (成れない)
+const PPAWN: i32   = 9;   // と
+const PLANCE: i32  = 10;  // 成香
+const PKNIGHT: i32 = 11;  // 成桂
+const PSILVER: i32 = 12;  // 成銀
+const PBISHOP: i32 = 13;  // 馬
+const PROOK: i32   = 14;  // 龍
+
+// ---- 探索定数 ----
+const INF: i32  = 2000000;
+const MATE: i32 = 1000000;
+const DEPTH: i32  = 4;    // 自己対局の探索深さ
+const MAXPLY: i32 = 24;   // 自己対局の最大手数
+
+// ============================================================================
+//  駒コードの小道具
+// ============================================================================
+
+function typeOf(p: i32): i32 { return p & 15; }              // 駒種(1..14)
+function colorOf(p: i32): i32 {                              // p != 0 のときのみ有効
+  if ((p & 16) != 0) { return GOTE; }
+  return SENTE;
+}
+function pieceCode(me: i32, t: i32): i32 {                   // 手番+駒種 -> 盤コード
+  if (me == GOTE) { return t | 16; }
+  return t;
+}
+function baseType(t: i32): i32 {                             // 成駒 -> 元の駒種(取って持ち駒にする時)
+  if (t > 8) { return t - 8; }
+  return t;
+}
+function inZone(r: i32, me: i32): bool {                     // 成れる段(敵陣)か
+  if (me == SENTE) { return r <= 2; }
+  return r >= 6;
+}
+
+function pieceValue(t: i32): i32 {                           // 駒の価値(評価/オーダリング用)
+  if (t == PAWN)    { return 100; }
+  if (t == LANCE)   { return 430; }
+  if (t == KNIGHT)  { return 450; }
+  if (t == SILVER)  { return 640; }
+  if (t == GOLD)    { return 690; }
+  if (t == BISHOP)  { return 890; }
+  if (t == ROOK)    { return 1040; }
+  if (t == KING)    { return 15000; }
+  if (t == PPAWN)   { return 420; }
+  if (t == PLANCE)  { return 480; }
+  if (t == PKNIGHT) { return 510; }
+  if (t == PSILVER) { return 540; }
+  if (t == PBISHOP) { return 1150; }
+  if (t == PROOK)   { return 1300; }
+  return 0;
+}
+
+// 軽い位置評価: 玉は自陣深くで安全、攻め駒は前進で加点(微小)。
+function posBonus(t: i32, r: i32, c: i32): i32 {
+  if (t == KING) {
+    if (c == SENTE) { return r * 3; }       // r 大(盤下)=安全
+    return (8 - r) * 3;
+  }
+  let adv: i32 = 0;
+  if (c == SENTE) { adv = 8 - r; } else { adv = r; }   // 敵陣へ近いほど大
+  if (t == PAWN || t == PPAWN) { return adv * 2; }
+  return adv * 4;
+}
+
+// ---- 指し手パック ----
+function pushMove(moves: &mut Vec<i32>, from: i32, to: i32, promo: i32, key: i32) {
+  let mv: i32 = to | (from << 7) | (promo << 14);
+  moves.push((key << 16) | mv);
+}
+
+// 1 マスへの着手を生成(成り/不成・駒打ち禁則は emit が判断)。target は移動先の駒(0=空)。
+function emit(moves: &mut Vec<i32>, from: i32, to: i32, tr: i32, t: i32, me: i32, target: i32, capsOnly: bool) {
+  let key: i32 = 0;
+  let isCap: bool = false;
+  if (target != 0) { isCap = true; key = pieceValue(typeOf(target)); }
+
+  let fr: i32 = from / 9;
+  let promotable: bool = (t <= 6) && (inZone(fr, me) || inZone(tr, me));
+
+  // 行きどころのない駒は成り強制
+  let must: bool = false;
+  if (t == PAWN || t == LANCE) {
+    if ((me == SENTE && tr == 0) || (me == GOTE && tr == 8)) { must = true; }
+  } else if (t == KNIGHT) {
+    if ((me == SENTE && tr <= 1) || (me == GOTE && tr >= 7)) { must = true; }
+  }
+
+  if (promotable) {
+    pushMove(moves, from, to, 1, key + 50);             // 成る手
+    if (!must && !capsOnly) {
+      pushMove(moves, from, to, 0, key);                // 不成(静止探索では省略)
+    }
+  } else {
+    pushMove(moves, from, to, 0, key);
+  }
+}
+

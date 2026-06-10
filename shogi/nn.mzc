@@ -1,0 +1,1077 @@
+// ============================================================================
+//  GPU CNN 評価 (定数・カーネル・前向き/逆伝播・価値評価)  — shogi.mzc から分割 (mozaic 将棋エンジン)
+// ============================================================================
+
+// ============================================================================
+//  GPU CNN 評価 (末端で呼ぶ畳み込み評価関数)
+// ----------------------------------------------------------------------------
+//  ・盤面を 14 枚(駒種ごと)の 9x9 プレーンに符号化(先手 +1 / 後手 -1)。
+//  ・conv 3x3(14->NCH, same-pad, ReLU) -> 全域平均プーリング -> 全結合(NCH->1)。
+//  ・カーネルなので mozaic の CPU/GPU 同格で動く: 既定ビルドは CPU ワーカープール、
+//    --gpu なら同じカーネルが Metal に降りる(ただし --gpu は Atomic 禁止のため
+//    Lazy SMP の共有TT とは別ビルド)。
+//  ・バッチ次元 B を持ち、1 ディスパッチで B 局面を並列評価する(スレッド数分のバッチ)。
+//  ・重みは未学習(固定の決定的初期値)。学習済み重みを差し込めば評価が意味を持つ。
+// ============================================================================
+
+const NPLANE: u32 = 42;             // 入力: 自駒14 + 相手駒14 + 自持駒7 + 相手持駒7(canonical・別面)
+const NCH: u32 = 64;                // conv 本体チャンネル(仕様 §3.1: 多層化を見据え 64)
+const HID: u32 = 64;                // 隠れ全結合層の幅
+const PLANE_SZ: u32 = 3402;         // NPLANE * 81
+const CONV_SZ: u32 = 5184;          // NCH * 81 = 64*81
+// 多層化(Stage 2): conv1(42->64) + conv2(64->64, 残差)。convW にパック。
+const CONVW1_SZ: u32 = 24192;       // conv1 重み = NCH*NPLANE*9 = 64*42*9
+const CONVW2_SZ: u32 = 36864;       // conv2 重み = NCH*NCH*9 = 64*64*9
+const WO_CONV2: u32 = 24192;        // convW 内 conv2 オフセット(= CONVW1_SZ)
+const BO_CONV2: u32 = 64;           // convB 内 conv2 バイアスオフセット(= NCH)
+const CONVB_SZ: u32 = 128;          // conv バイアス全長 = b1(64) + b2(64)
+const CONVW_SZ: u32 = 61056;        // conv1 + conv2 = 24192 + 36864
+const HE_CONV2: f32 = 0.10206;      // conv2 fan_in = NCH*9 = 576 -> sqrt(6/576)
+// 空間価値ヘッド: conv1x1(NCH->HEADC) + ReLU -> flatten(HEADC*81) -> FC1(->HID) + ReLU -> FC2(->1) -> softsign。
+// 出力 softsign(raw)=raw/(1+|raw|) は ±1 に漸近するだけで決して飽和しない -> 評価値が段階的で ±600 に張り付かない。
+// 逆伝播は straight-through(g=1, 飽和でも勾配を殺さない)なので clamp 並みに強く学習する(tanh/softsign 真微分の消失を回避)。
+// headW に詰める: [C1W|C1B|F1W|F1B|F2W|F2B](convH は headW 内。仕様は convW だが機能等価)。
+const HEADC: u32 = 4;               // conv1x1 出力チャンネル(空間 4ch を残す)
+const FLAT: u32 = 324;              // HEADC * 81(平坦化後の次元)
+const H_C1W: u32 = 0;               // conv1x1 重み (NCH*HEADC = 256)
+const H_C1B: u32 = 256;             // conv1x1 バイアス (HEADC = 4)
+const H_F1W: u32 = 260;             // FC1 重み (FLAT*HID = 20736)
+const H_F1B: u32 = 20996;           // FC1 バイアス (HID = 64)
+const H_F2W: u32 = 21060;           // FC2 重み (HID = 64)
+const H_F2B: u32 = 21124;           // FC2 バイアス (1)
+const HEADW_SZ: u32 = 21125;        // 256+4+20736+64+64+1
+const NN_SCALE: f32 = 600.0;        // NN 出力 -> センチポーン換算
+const SQUASH_K: f32 = 600.0;        // 物量を勝率風 [-1,1] に圧縮する係数(train を selfplay と同スケールに)
+const LABEL_SMOOTH: f32 = 0.9;      // 教師値の平滑化係数(±1 を避け softsign の raw を過大にしない。train/selfplay 共通)
+// He-uniform スケール = sqrt(6/fan_in)。sqrt 不可なので定数化(仕様 §3.4 の値)。
+const HE_CONV: f32 = 0.12599;       // conv3x3  fan_in = NPLANE*9 = 378
+const HE_C1: f32 = 0.30619;         // conv1x1  fan_in = NCH = 64
+const HE_F1: f32 = 0.13608;         // FC1      fan_in = FLAT = 324
+const HE_F2: f32 = 0.30619;         // FC2      fan_in = HID = 64
+const MBATCH: u32 = 512;            // 自己対局の指し手選択を GPU バッチ評価する上限(合法手数)
+
+// conv 3x3 same-pad + ReLU。出力 idx = ((b*NCH + oc)*9 + y)*9 + x。
+// fp16: 重み w・出力 out を f16 ストレージにし、計算も f16(GPU は half FMA が 2x)。
+// planes は f32 のままで読み込み時に f16 へキャスト(符号化を変えないため)。
+kernel nnConv(inp: Buffer<f32>, w: Buffer<f16>, bias: Buffer<f16>, out: Buffer<f16>, nplane: u32, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < out.len) {
+    let x: u32 = i % 9;
+    let t1: u32 = i / 9;
+    let y: u32 = t1 % 9;
+    let t2: u32 = t1 / 9;
+    let oc: u32 = t2 % nch;
+    let bb: u32 = t2 / nch;
+    let acc: f16 = bias[oc];
+    let yi: i32 = y as i32;
+    let xi: i32 = x as i32;
+    let ic: u32 = 0;
+    while (ic < nplane) {
+      let dy: i32 = 0 - 1;
+      while (dy <= 1) {
+        let dx: i32 = 0 - 1;
+        while (dx <= 1) {
+          let ny: i32 = yi + dy;
+          let nx: i32 = xi + dx;
+          if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+            let inIdx: u32 = (bb * nplane + ic) * 81 + ((ny as u32) * 9 + (nx as u32));
+            let wIdx: u32 = (oc * nplane + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32));
+            acc = acc + (inp[inIdx] as f16) * w[wIdx];
+          }
+          dx = dx + 1;
+        }
+        dy = dy + 1;
+      }
+      ic = ic + 1;
+    }
+    if (acc < (0.0 as f16)) { acc = 0.0 as f16; }  // ReLU
+    out[i] = acc;
+  }
+}
+
+// 全域平均プーリング(並列カーネル): pp[b*nch+oc] = conv チャンネル oc の 81 マス平均。
+// grid = batch*nch。GAP を頭部から切り出して 1 度だけ並列計算(大ネットでも頭部が詰まらない)。
+kernel nnGap(conv: Buffer<f16>, pp: Buffer<f32>, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < pp.len) {
+    let s: f32 = 0.0;
+    let p: u32 = 0;
+    while (p < 81) { s = s + (conv[i * 81 + p] as f32); p = p + 1; }   // f16 conv -> f32 で平均(精度維持)
+    pp[i] = s / 81.0;
+  }
+}
+
+// 頭部: pp(GAP 済) -> FC1(NCH->HID) -> ReLU -> FC2(HID->1)。1 スレッド 1 局面。
+// 重みは headW に [FC1W | FC1B | FC2W | FC2B] で同居(オフセットは nch/hid から算出)。
+kernel nnHead(pp: Buffer<f32>, headW: Buffer<f32>, out: Buffer<f32>, nch: u32, hid: u32) {
+  let bb: u32 = grid.x;
+  if (bb < out.len) {
+    let fc1b: u32 = nch * hid;            // FC1 バイアス開始
+    let fc2w: u32 = nch * hid + hid;      // FC2 重み開始
+    let fc2b: u32 = nch * hid + hid + hid;// FC2 バイアス
+    let y: f32 = headW[fc2b];
+    let j: u32 = 0;
+    while (j < hid) {
+      let h: f32 = headW[fc1b + j];
+      let oc: u32 = 0;
+      while (oc < nch) { h = h + pp[bb * nch + oc] * headW[oc * hid + j]; oc = oc + 1; }
+      if (h < 0.0) { h = 0.0; }            // ReLU
+      y = y + h * headW[fc2w + j];
+      j = j + 1;
+    }
+    out[bb] = y;
+  }
+}
+
+// ---- GPU 学習用カーネル(f32。重い conv の前向き/重み勾配を並列化) ----
+// 学習用 conv 前向き(f32): convA[(b*nch+oc)*81+cell] = ReLU(conv)。grid = npos*nch*81。
+// 推論の nnConv(f16)とは別に、CPU 学習と一致させるため f32 で持つ。
+// conv3x3 same-pad + ReLU。woff/boff は層パック重みのオフセット(単層は 0)。grid = npos*nch*81。
+kernel tConvFwd(inp: Buffer<f32>, w: Buffer<f32>, woff: u32, bias: Buffer<f32>, boff: u32, out: Buffer<f32>, nplane: u32, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < out.len) {
+    let x: u32 = i % 9;
+    let t1: u32 = i / 9;
+    let y: u32 = t1 % 9;
+    let t2: u32 = t1 / 9;
+    let oc: u32 = t2 % nch;
+    let bb: u32 = t2 / nch;
+    let acc: f32 = bias[boff + oc];
+    let yi: i32 = y as i32;
+    let xi: i32 = x as i32;
+    let ic: u32 = 0;
+    while (ic < nplane) {
+      let dy: i32 = 0 - 1;
+      while (dy <= 1) {
+        let dx: i32 = 0 - 1;
+        while (dx <= 1) {
+          let ny: i32 = yi + dy;
+          let nx: i32 = xi + dx;
+          if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+            let inIdx: u32 = (bb * nplane + ic) * 81 + ((ny as u32) * 9 + (nx as u32));
+            let wIdx: u32 = woff + (oc * nplane + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32));
+            acc = acc + inp[inIdx] * w[wIdx];
+          }
+          dx = dx + 1;
+        }
+        dy = dy + 1;
+      }
+      ic = ic + 1;
+    }
+    if (acc < 0.0) { acc = 0.0; }
+    out[i] = acc;
+  }
+}
+
+// 残差つき conv3x3: out = ReLU(conv(in) + in)。多層化の中間層用(残差スキップ = 入力そのもの)。
+// 残差はチャネル一致が前提(nplane == nch)なので skip[i] = inp[i]。別バッファを取らない(借用検査の別名禁止回避)。
+kernel tConvResFwd(inp: Buffer<f32>, w: Buffer<f32>, woff: u32, bias: Buffer<f32>, boff: u32,
+                   out: Buffer<f32>, nplane: u32, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < out.len) {
+    let x: u32 = i % 9;
+    let t1: u32 = i / 9;
+    let y: u32 = t1 % 9;
+    let t2: u32 = t1 / 9;
+    let oc: u32 = t2 % nch;
+    let bb: u32 = t2 / nch;
+    let acc: f32 = bias[boff + oc];
+    let yi: i32 = y as i32;
+    let xi: i32 = x as i32;
+    let ic: u32 = 0;
+    while (ic < nplane) {
+      let dy: i32 = 0 - 1;
+      while (dy <= 1) {
+        let dx: i32 = 0 - 1;
+        while (dx <= 1) {
+          let ny: i32 = yi + dy;
+          let nx: i32 = xi + dx;
+          if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+            let inIdx: u32 = (bb * nplane + ic) * 81 + ((ny as u32) * 9 + (nx as u32));
+            let wIdx: u32 = woff + (oc * nplane + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32));
+            acc = acc + inp[inIdx] * w[wIdx];
+          }
+          dx = dx + 1;
+        }
+        dy = dy + 1;
+      }
+      ic = ic + 1;
+    }
+    acc = acc + inp[i];                                  // 残差スキップ(nplane==nch なので inp[i] が同チャネル同セル)
+    if (acc < 0.0) { acc = 0.0; }
+    out[i] = acc;
+  }
+}
+
+// dL/dInput(conv の入力への逆伝播 = rot180 相関): dX[ic][p][q] = Σ_oc Σ_(dy,dx) [出力(p-dy,q-dx)が範囲内]
+//   dz[oc][p-dy][q-dx] * W[oc][ic][dy+1][dx+1]。grid = npos*nplane*81。
+kernel tConvDX(dz: Buffer<f32>, w: Buffer<f32>, woff: u32, dX: Buffer<f32>, nplane: u32, nch: u32) {
+  let idx: u32 = grid.x;
+  if (idx < dX.len) {
+    let q: u32 = idx % 9;
+    let t1: u32 = idx / 9;
+    let p: u32 = t1 % 9;
+    let t2: u32 = t1 / 9;
+    let ic: u32 = t2 % nplane;
+    let bb: u32 = t2 / nplane;
+    let pi: i32 = p as i32;
+    let qi: i32 = q as i32;
+    let g: f32 = 0.0;
+    let oc: u32 = 0;
+    while (oc < nch) {
+      let dy: i32 = 0 - 1;
+      while (dy <= 1) {
+        let dx: i32 = 0 - 1;
+        while (dx <= 1) {
+          let oy: i32 = pi - dy;                         // 出力セル = (p-dy, q-dx)
+          let ox: i32 = qi - dx;
+          if (oy >= 0 && oy < 9 && ox >= 0 && ox < 9) {
+            let dzIdx: u32 = (bb * nch + oc) * 81 + ((oy as u32) * 9 + (ox as u32));
+            let wIdx: u32 = woff + (oc * nplane + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32));
+            g = g + dz[dzIdx] * w[wIdx];
+          }
+          dx = dx + 1;
+        }
+        dy = dy + 1;
+      }
+      oc = oc + 1;
+    }
+    dX[idx] = g;
+  }
+}
+
+// dz = (a>0) ? (dxconv + dzskip) : 0。残差層の手前の活性化勾配(conv入力勾配+スキップ勾配にReLUマスク)。
+kernel addMaskReLU(dxconv: Buffer<f32>, dzskip: Buffer<f32>, a: Buffer<f32>, dzout: Buffer<f32>) {
+  let i: u32 = grid.x;
+  if (i < dzout.len) {
+    if (a[i] > 0.0) { dzout[i] = dxconv[i] + dzskip[i]; }
+    else { dzout[i] = 0.0; }
+  }
+}
+
+// conv 重み勾配(weight-stationary・atomic 不要): grid = CONVW_SZ。1 スレッド 1 重み。
+// gW[(oc*nplane+ic)*9 + (ky*3+kx)] = Σ_pos Σ_cell dconv[(pos*nch+oc)*81+cell] * inp[(pos*nplane+ic)*81 + (cell+offset)]
+kernel tConvGrad(dconv: Buffer<f32>, inp: Buffer<f32>, gW: Buffer<f32>, woff: u32, npos: u32, nplane: u32, nch: u32) {
+  let wi: u32 = grid.x;
+  if (wi < gW.len) {
+    let k: u32 = wi % 9;             // ky*3 + kx
+    let t: u32 = wi / 9;             // oc*nplane + ic
+    let ic: u32 = t % nplane;
+    let oc: u32 = t / nplane;
+    let dy: i32 = (k / 3) as i32 - 1;
+    let dx: i32 = (k % 3) as i32 - 1;
+    let g: f32 = 0.0;
+    let pos: u32 = 0;
+    while (pos < npos) {
+      let yy: i32 = 0;
+      while (yy < 9) {
+        let xx: i32 = 0;
+        while (xx < 9) {
+          let ny: i32 = yy + dy;
+          let nx: i32 = xx + dx;
+          if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+            let dval: f32 = dconv[(pos * nch + oc) * 81 + ((yy as u32) * 9 + (xx as u32))];
+            let xval: f32 = inp[(pos * nplane + ic) * 81 + ((ny as u32) * 9 + (nx as u32))];
+            g = g + dval * xval;
+          }
+          xx = xx + 1;
+        }
+        yy = yy + 1;
+      }
+      pos = pos + 1;
+    }
+    gW[woff + wi] = g;
+  }
+}
+
+// GAP 前向き(f32): pp[pos*nch+oc] = convA チャンネルの 81 平均。grid = npos*nch。
+kernel tGapFwd(convA: Buffer<f32>, pp: Buffer<f32>, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < pp.len) {
+    let s: f32 = 0.0;
+    let p: u32 = 0;
+    while (p < 81) { s = s + convA[i * 81 + p]; p = p + 1; }
+    pp[i] = s / 81.0;
+  }
+}
+
+// GAP 逆伝播(f32): dconv[idx] = (convA[idx]>0) ? dpp[pos*nch+oc]/81 : 0。grid = npos*nch*81。
+// dconv/convA(大バッファ)は GPU だけが触る -> ホストは小さい pp/dpp のみ(Metal で速い)。
+kernel tGapBwd(convA: Buffer<f32>, dpp: Buffer<f32>, dconv: Buffer<f32>, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < dconv.len) {
+    if (convA[i] > 0.0) {
+      let t: u32 = i / 81;          // pos*nch + oc
+      dconv[i] = dpp[t] / 81.0;
+    } else {
+      dconv[i] = 0.0;
+    }
+  }
+}
+
+// conv バイアス勾配(f32): gB[oc] = Σ_pos Σ_cell dconv[(pos*nch+oc)*81+cell]。grid = nch。
+kernel tConvBGrad(dconv: Buffer<f32>, gB: Buffer<f32>, boff: u32, npos: u32, nch: u32) {
+  let oc: u32 = grid.x;
+  if (oc < nch) {
+    let g: f32 = 0.0;
+    let pos: u32 = 0;
+    while (pos < npos) {
+      let c: u32 = 0;
+      while (c < 81) { g = g + dconv[(pos * nch + oc) * 81 + c]; c = c + 1; }
+      pos = pos + 1;
+    }
+    gB[boff + oc] = g;
+  }
+}
+
+// 空間ヘッド前向き(GPU): 1 局面=1 スレッド。convA(NCH*81)-> conv1x1+ReLU(flat) -> FC1+ReLU(h2)
+// -> FC2 -> value=softsign(raw)=raw/(1+|raw|)。flat/h2 は逆伝播用に保存(headForward と同一式)。
+kernel hFwd(convA: Buffer<f32>, headW: Buffer<f32>, flat: Buffer<f32>, h2: Buffer<f32>, val: Buffer<f32>, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < val.len) {
+    let HEADC: u32 = 4; let FLAT: u32 = 324; let HID: u32 = 64;   // kernel は top-level const 不可 -> 局所定義
+    let H_C1W: u32 = 0; let H_C1B: u32 = nch * HEADC; let H_F1W: u32 = H_C1B + HEADC;
+    let H_F1B: u32 = H_F1W + FLAT * HID; let H_F2W: u32 = H_F1B + HID; let H_F2B: u32 = H_F2W + HID;
+    let oc: u32 = 0;
+    while (oc < HEADC) {
+      let cell: u32 = 0;
+      while (cell < 81) {
+        let h: f32 = headW[H_C1B + oc];
+        let ic: u32 = 0;
+        while (ic < nch) { h = h + convA[(i * nch + ic) * 81 + cell] * headW[H_C1W + oc * nch + ic]; ic = ic + 1; }
+        if (h < 0.0) { h = 0.0; }
+        flat[i * FLAT + oc * 81 + cell] = h;
+        cell = cell + 1;
+      }
+      oc = oc + 1;
+    }
+    let j: u32 = 0;
+    while (j < HID) {
+      let h: f32 = headW[H_F1B + j];
+      let k: u32 = 0;
+      while (k < FLAT) { h = h + flat[i * FLAT + k] * headW[H_F1W + k * HID + j]; k = k + 1; }
+      if (h < 0.0) { h = 0.0; }
+      h2[i * HID + j] = h;
+      j = j + 1;
+    }
+    let raw: f32 = headW[H_F2B];
+    let jj: u32 = 0;
+    while (jj < HID) { raw = raw + h2[i * HID + jj] * headW[H_F2W + jj]; jj = jj + 1; }
+    let ar: f32 = raw; if (ar < 0.0) { ar = 0.0 - ar; }  // 出力活性化 softsign(host softsign() のミラー。kernel は関数呼び出し不可)
+    let v: f32 = raw / (1.0 + ar);
+    val[i] = v;
+  }
+}
+
+// 空間ヘッド前向き(GPU・推論専用): スクラッチ1本 hs に flat(先頭)と h2(165888=MBATCH*FLAT 以降)を
+// 置き、val のみ返す(逆伝播不要)。自己対局の指し手選択 nnValueChildrenGPU 用(host往復を消す)。
+kernel hFwdI(convA: Buffer<f32>, headW: Buffer<f32>, hs: Buffer<f32>, val: Buffer<f32>, nch: u32) {
+  let i: u32 = grid.x;
+  if (i < val.len) {
+    let H_C1B: u32 = nch * 4; let H_F1W: u32 = nch * 4 + 4; let H_F1B: u32 = nch * 4 + 20740;
+    let H_F2W: u32 = nch * 4 + 20804; let H_F2B: u32 = nch * 4 + 20868;
+    let H2: u32 = 165888;                                // MBATCH*FLAT(h2 領域の先頭)
+    let oc: u32 = 0;
+    while (oc < 4) {
+      let cell: u32 = 0;
+      while (cell < 81) {
+        let h: f32 = headW[H_C1B + oc];
+        let ic: u32 = 0;
+        while (ic < nch) { h = h + convA[(i * nch + ic) * 81 + cell] * headW[oc * nch + ic]; ic = ic + 1; }
+        if (h < 0.0) { h = 0.0; }
+        hs[i * 324 + oc * 81 + cell] = h;
+        cell = cell + 1;
+      }
+      oc = oc + 1;
+    }
+    let j: u32 = 0;
+    while (j < 64) {
+      let h: f32 = headW[H_F1B + j];
+      let k: u32 = 0;
+      while (k < 324) { h = h + hs[i * 324 + k] * headW[H_F1W + k * 64 + j]; k = k + 1; }
+      if (h < 0.0) { h = 0.0; }
+      hs[H2 + i * 64 + j] = h;
+      j = j + 1;
+    }
+    let raw: f32 = headW[H_F2B];
+    let jj: u32 = 0;
+    while (jj < 64) { raw = raw + hs[H2 + i * 64 + jj] * headW[H_F2W + jj]; jj = jj + 1; }
+    let ar: f32 = raw; if (ar < 0.0) { ar = 0.0 - ar; }  // 出力活性化 softsign(host softsign() のミラー。kernel は関数呼び出し不可)
+    let v: f32 = raw / (1.0 + ar);
+    val[i] = v;
+  }
+}
+
+// 空間ヘッド逆伝播 1/2(GPU): 1 局面=1 スレッド。draw=dL/draw=2(val-target)、clamp 飽和で 0。
+// FC2 を逆伝播して dpre2[HID](ReLU後)を保存。
+kernel hBwd1(headW: Buffer<f32>, h2: Buffer<f32>, val: Buffer<f32>, dataY: Buffer<f32>,
+             draw: Buffer<f32>, dpre2: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F2W: u32 = nch * 4 + 20804;                     // = nch*HEADC + HEADC + FLAT*HID + HID
+  let i: u32 = grid.x;
+  if (i < npos) {
+    let v: f32 = val[i];
+    let dr: f32 = 2.0 * (v - dataY[i]);                  // straight-through softsign: g=1(飽和でも勾配を殺さない)
+    draw[i] = dr;
+    let j: u32 = 0;
+    while (j < 64) {
+      let dp: f32 = 0.0;
+      if (h2[i * 64 + j] > 0.0) { dp = dr * headW[H_F2W + j]; }   // ReLU(FC1) マスク
+      dpre2[i * 64 + j] = dp;
+      j = j + 1;
+    }
+  }
+}
+
+// 空間ヘッド逆伝播 2/2(GPU): FC1 を逆伝播して dpre1[FLAT](conv1x1 ReLU後)を保存。
+kernel hBwd2(headW: Buffer<f32>, dpre2: Buffer<f32>, flat: Buffer<f32>, dpre1: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F1W: u32 = nch * 4 + 4;                         // = nch*HEADC + HEADC
+  let i: u32 = grid.x;
+  if (i < npos) {
+    let k: u32 = 0;
+    while (k < 324) {
+      let df: f32 = 0.0;
+      let j: u32 = 0;
+      while (j < 64) { df = df + dpre2[i * 64 + j] * headW[H_F1W + k * 64 + j]; j = j + 1; }
+      let dp: f32 = 0.0;
+      if (flat[i * 324 + k] > 0.0) { dp = df; }   // ReLU(conv1x1) マスク
+      dpre1[i * 324 + k] = dp;
+      k = k + 1;
+    }
+  }
+}
+
+// 重み勾配(weight-stationary・atomic 不要): 各スレッド 1 重み、全局面を総和。
+kernel hGF2W(draw: Buffer<f32>, h2: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F2W: u32 = nch * 4 + 20804;
+  let j: u32 = grid.x;
+  if (j < 64) {
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) { g = g + draw[i] * h2[i * 64 + j]; i = i + 1; }
+    gHead[H_F2W + j] = g;
+  }
+}
+kernel hGF2B(draw: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F2B: u32 = nch * 4 + 20868;                     // = H_F2W + HID
+  if (grid.x < 1) {
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) { g = g + draw[i]; i = i + 1; }
+    gHead[H_F2B] = g;
+  }
+}
+kernel hGF1W(dpre2: Buffer<f32>, flat: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F1W: u32 = nch * 4 + 4;
+  let idx: u32 = grid.x;
+  if (idx < 20736) {                                    // FLAT*HID = 324*64
+    let k: u32 = idx / 64;
+    let j: u32 = idx % 64;
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) { g = g + dpre2[i * 64 + j] * flat[i * 324 + k]; i = i + 1; }
+    gHead[H_F1W + idx] = g;
+  }
+}
+kernel hGF1B(dpre2: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let H_F1B: u32 = nch * 4 + 20740;                     // = H_F1W + FLAT*HID
+  let j: u32 = grid.x;
+  if (j < 64) {
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) { g = g + dpre2[i * 64 + j]; i = i + 1; }
+    gHead[H_F1B + j] = g;
+  }
+}
+kernel hGC1W(dpre1: Buffer<f32>, convA: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let idx: u32 = grid.x;
+  if (idx < nch * 4) {                                  // NCH*HEADC ; H_C1W = 0
+    let oc: u32 = idx / nch;
+    let ic: u32 = idx % nch;
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) {
+      let cell: u32 = 0;
+      while (cell < 81) { g = g + dpre1[i * 324 + oc * 81 + cell] * convA[(i * nch + ic) * 81 + cell]; cell = cell + 1; }
+      i = i + 1;
+    }
+    gHead[idx] = g;
+  }
+}
+kernel hGC1B(dpre1: Buffer<f32>, gHead: Buffer<f32>, npos: u32, nch: u32) {
+  let H_C1B: u32 = nch * 4;                             // = nch*HEADC
+  let oc: u32 = grid.x;
+  if (oc < 4) {
+    let g: f32 = 0.0;
+    let i: u32 = 0;
+    while (i < npos) {
+      let cell: u32 = 0;
+      while (cell < 81) { g = g + dpre1[i * 324 + oc * 81 + cell]; cell = cell + 1; }
+      i = i + 1;
+    }
+    gHead[H_C1B + oc] = g;
+  }
+}
+// dL/dconv(conv1x1 を入力へ逆伝播・conv の ReLU マスク済): grid = npos*CONV_SZ。H_C1W = 0。
+kernel hDconv(dpre1: Buffer<f32>, convA: Buffer<f32>, headW: Buffer<f32>, dconv: Buffer<f32>, nch: u32) {
+  let idx: u32 = grid.x;
+  if (idx < dconv.len) {
+    if (convA[idx] > 0.0) {
+      let cell: u32 = idx % 81;
+      let t: u32 = idx / 81;
+      let ic: u32 = t % nch;
+      let i: u32 = t / nch;
+      let g: f32 = 0.0;
+      let oc: u32 = 0;
+      while (oc < 4) { g = g + dpre1[i * 324 + oc * 81 + cell] * headW[oc * nch + ic]; oc = oc + 1; }
+      dconv[idx] = g;
+    } else {
+      dconv[idx] = 0.0;
+    }
+  }
+}
+
+// 固定の決定的な小さな重みを生成(xorshift64 を ~[-0.1,0.1] にマップ)。未学習。
+function nnWeights(n: u32, seed0: u64): Buffer<f32> {
+  let w: Buffer<f32> = Buffer.shared(n);
+  let s: u64 = seed0;
+  let k: u32 = 0;
+  while (k < 6) { s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17); k = k + 1; }
+  let i: u32 = 0;
+  while (i < n) {
+    s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+    let r: i32 = (s & 1023) as i32;                // 0..1023
+    w[i] = ((r - 512) as f32) * 0.0002;            // ~[-0.1, 0.1]
+    i = i + 1;
+  }
+  return w;
+}
+
+// uniform[-scale, scale] の重み(He 初期化用。scale=0 で全ゼロ=バイアス初期化)。
+function nnWeightsScaled(n: u32, seed0: u64, scale: f32): Buffer<f32> {
+  let w: Buffer<f32> = Buffer.shared(n);
+  let s: u64 = seed0;
+  let k: u32 = 0;
+  while (k < 6) { s = xorshift64(s); k = k + 1; }
+  let f: f32 = scale / 512.0;
+  let i: u32 = 0;
+  while (i < n) {
+    s = xorshift64(s);
+    w[i] = (((s & 1023) as i32) - 512) as f32 * f;
+    i = i + 1;
+  }
+  return w;
+}
+
+// conv 重み(パック)の He 初期化: conv1 を HE_CONV、conv2 を HE_CONV2 でスケール。
+function nnInitConv(seed0: u64): Buffer<f32> {
+  let w: Buffer<f32> = Buffer.shared(CONVW_SZ);
+  let s: u64 = seed0;
+  let k: u32 = 0;
+  while (k < 6) { s = xorshift64(s); k = k + 1; }
+  let f1: f32 = HE_CONV / 512.0;
+  let i: u32 = 0;
+  while (i < CONVW1_SZ) { s = xorshift64(s); w[i] = (((s & 1023) as i32) - 512) as f32 * f1; i = i + 1; }
+  let f2: f32 = HE_CONV2 / 512.0;
+  let j: u32 = 0;
+  while (j < CONVW2_SZ) { s = xorshift64(s); w[WO_CONV2 + j] = (((s & 1023) as i32) - 512) as f32 * f2; j = j + 1; }
+  return w;
+}
+
+// 空間ヘッドの He 初期化(各層を fan_in に応じてスケール、バイアスは 0)。
+function nnInitHead(seed0: u64): Buffer<f32> {
+  let w: Buffer<f32> = Buffer.shared(HEADW_SZ);
+  let s: u64 = seed0;
+  let k: u32 = 0;
+  while (k < 6) { s = xorshift64(s); k = k + 1; }
+  let i: u32 = 0;
+  while (i < NCH * HEADC) { s = xorshift64(s); w[H_C1W + i] = (((s & 1023) as i32) - 512) as f32 * (HE_C1 / 512.0); i = i + 1; }
+  let b1: u32 = 0;
+  while (b1 < HEADC) { w[H_C1B + b1] = 0.0; b1 = b1 + 1; }
+  let f1: u32 = 0;
+  while (f1 < FLAT * HID) { s = xorshift64(s); w[H_F1W + f1] = (((s & 1023) as i32) - 512) as f32 * (HE_F1 / 512.0); f1 = f1 + 1; }
+  let b2: u32 = 0;
+  while (b2 < HID) { w[H_F1B + b2] = 0.0; b2 = b2 + 1; }
+  let f2: u32 = 0;
+  while (f2 < HID) { s = xorshift64(s); w[H_F2W + f2] = (((s & 1023) as i32) - 512) as f32 * (HE_F2 / 512.0); f2 = f2 + 1; }
+  w[H_F2B] = 0.0;
+  return w;
+}
+
+// 盤面を base オフセットのプレーンへ符号化(全エンコーダの唯一の真実)。
+//   plane 0..13 : 盤上の駒種(先手 +1 / 後手 -1)
+//   plane 14..20: 持ち駒 7 種(t=1..7 -> plane 13+t)。値=(先手枚数-後手枚数)*0.2 を全マスへ。
+// 持ち駒は将棋評価の要(どこにでも打てる)。GAP は一様プレーンをそのまま価値に通す。
+// canonical 視点: 常に手番側を自分(+1)・盤の下側にして符号化する。後手番は盤を 180° 回転し
+// 駒色・持ち駒の所有者を入れ替える。これで NN は「手番側が勝勢か」を手番非依存に評価でき(先手偏重
+// が消える)、末端の符号反転が不要になる。先手番のときは従来と完全に同一の出力(回転なし)。
+function encodeBoard(inp: Buffer<f32>, base: u32, b: &Board) {
+  let i: u32 = 0;
+  while (i < PLANE_SZ) { inp[base + i] = 0.0; i = i + 1; }
+  let me: i32 = b.side;                                  // 手番側 = 自分
+  let s: i32 = 0;
+  while (s < 81) {
+    let p: i32 = b.sq[s];
+    if (p != 0) {
+      let sq: u32 = s as u32;
+      if (me == GOTE) { sq = (80 - s) as u32; }          // 後手番は 180° 回転(s -> 80-s)
+      // 自駒は面 0..13、相手駒は面 14..27(存在=1.0・色で別面)
+      let plane: u32 = (typeOf(p) - 1) as u32;
+      if (colorOf(p) != me) { plane = plane + 14; }
+      inp[base + plane * 81 + sq] = 1.0;
+    }
+    s = s + 1;
+  }
+  let t: i32 = 1;
+  while (t <= 7) {
+    let mine: i32 = b.hand[t];                           // 自分の持ち駒(先手番)
+    let opp: i32 = b.hand[8 + t];
+    if (me == GOTE) { mine = b.hand[8 + t]; opp = b.hand[t]; }   // 後手番は所有者入れ替え
+    // 自持駒は面 28..34、相手持駒は面 35..41(枚数×0.2 をブロードキャスト・別面)
+    let mvp: f32 = (mine as f32) * 0.2;
+    let ovp: f32 = (opp as f32) * 0.2;
+    let pm: u32 = (28 + t - 1) as u32;
+    let po: u32 = (35 + t - 1) as u32;
+    let c: u32 = 0;
+    while (c < 81) { inp[base + pm * 81 + c] = mvp; inp[base + po * 81 + c] = ovp; c = c + 1; }
+    t = t + 1;
+  }
+}
+
+// バッチ用の生スロット(81 盤 + 16 駒台)から Board を復元(符号化を encodeBoard に一本化するため)。
+function boardFromSlot(src: Buffer<Atomic<i32>>, base: u32): Board {
+  let b: Board = emptyBoard();
+  let s: u32 = 0;
+  while (s < 81) { b.sq[s] = src[base + s].load(Relaxed); s = s + 1; }
+  let h: u32 = 0;
+  while (h < 16) { b.hand[h] = src[base + 81 + h].load(Relaxed); h = h + 1; }
+  return b;
+}
+
+// ----------------------------------------------------------------------------
+//  スレッド数で同期するバッチ GPU 評価
+//  ・各スレッドは「スロット予約(slotCtr.fetchAdd)」で投入枠を取り、生の盤(81)+駒台(16)を
+//    共有 Buffer<Atomic<i32>> へ書く(共有メモリへの並行書き込みは Atomic 経由のみ)。
+//  ・全スレッド到達を gen バリアで待ち、最後の到達者だけが予約された count 局面を
+//    1 ディスパッチで評価して結果を outA(Atomic)へ配り、解放する(GPU 投入は常に 1 本)。
+//  ・予約は fetchAdd なので将来 1 スレッドが複数局面を投げる拡張が容易(枠を複数取り、
+//    結果も自分の枠範囲から読むだけ)。CAP がバッチ容量。
+// ----------------------------------------------------------------------------
+
+const BOARD_INTS: u32 = 97;         // 盤 81 + 駒台 16
+
+function batchWorker(slotCtr: Atomic<u32>, arrived: Atomic<u32>, gen: Atomic<u32>,
+                     boardsA: Buffer<Atomic<i32>>, outA: Buffer<Atomic<i32>>,
+                     convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>,
+                     id: u32, nb: u32, cap: u32, rounds: u32) {
+  let planesF: Buffer<f32> = Buffer.shared(cap * PLANE_SZ);   // ランチャ専用の平坦バッファ
+  let convAF: Buffer<f32> = Buffer.shared(cap * CONV_SZ);     // conv1 出力(f32)
+  let convAF2: Buffer<f32> = Buffer.shared(cap * CONV_SZ);    // conv2 出力(残差)= head 入力
+  let scr: Buffer<f32> = Buffer.shared(FLAT + HID + FLAT);    // 空間ヘッドのスクラッチ
+  let dev: Device = Device.gpu;
+  let bd: Board = initBoard();
+  let r: u32 = 0;
+  while (r < rounds) {
+    let mySlot: u32 = slotCtr.fetchAdd(1, AcqRel);           // 1 局面分の枠を予約(複数なら fetchAdd(k))
+    let base: u32 = mySlot * BOARD_INTS;
+    let sq: u32 = 0;
+    while (sq < 81) { boardsA[base + sq].store(bd.sq[sq], Relaxed); sq = sq + 1; }
+    let hh: u32 = 0;
+    while (hh < 16) { boardsA[base + 81 + hh].store(bd.hand[hh], Relaxed); hh = hh + 1; }
+
+    let a: u32 = arrived.fetchAdd(1, AcqRel) + 1;            // バリア到達(AcqRel が盤書き込みを公開)
+    if (a == nb) {                                           // 最後の到達者がバッチを評価
+      let count: u32 = slotCtr.load(Acquire);
+      let bb: u32 = 0;
+      while (bb < count) {                                   // 集約: 予約された count 局面を planesF へ符号化
+        let gb: Board = boardFromSlot(&boardsA, bb * BOARD_INTS);
+        encodeBoard(&planesF, bb * PLANE_SZ, &gb);
+        bb = bb + 1;
+      }
+      let j1: Job = dev.launch(tConvFwd, count * CONV_SZ, &planesF, &convW, 0, &convB, 0, &mut convAF, NPLANE, NCH);
+      j1.await();
+      let j2: Job = dev.launch(tConvResFwd, count * CONV_SZ, &convAF, &convW, WO_CONV2, &convB, BO_CONV2, &mut convAF2, NCH, NCH);
+      j2.await();
+      let w: u32 = 0;                                       // 空間ヘッドはホスト(production と同一)
+      while (w < count) {
+        let value: f32 = headForward(&convAF2, w * CONV_SZ, &headW, &scr);
+        outA[w].store((value * NN_SCALE) as i32, Relaxed);
+        w = w + 1;
+      }
+      slotCtr.store(0, Relaxed);
+      arrived.store(0, Relaxed);
+      gen.store(r + 1, Release);                             // 結果を公開して解放
+    } else {
+      while (gen.load(Acquire) < (r + 1)) { }                // 解放待ち(スピン)
+    }
+    r = r + 1;
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  実探索の末端で使う GPU バッチ評価(コーディネータ方式・デッドロックフリー)
+//  共有状態は 1 本の bb: Buffer<Atomic<i32>> に束ねて探索へ通す:
+//    [0]=ARRIVED [1]=READY [2]=FINISHED [3]=GEN(バッチ番号) [4]=NN_ON
+//    boards: [B_BOARDS + slot*97 ..]   out: [B_OUT + slot]   done: [B_DONE + slot]
+//  各 worker は ARRIVED で枠を取り盤を書き READY を上げて自分の done タグを待つ。
+//  唯一のコーディネータ(専用スレッド)が「アクティブ全員が READY」になったらバッチを
+//  GPU 評価して結果と done を公開→解放。離脱は FINISHED 加算で active を減らして吸収。
+// ----------------------------------------------------------------------------
+
+const BCAP: u32 = 16;               // バッチ容量(= 最大スレッド数)
+const B_ARRIVED: u32 = 0;
+const B_READY: u32 = 1;
+const B_FIN: u32 = 2;
+const B_GEN: u32 = 3;
+const B_NN: u32 = 4;                // 1=GPU評価有効 / 0=従来の物量評価のみ(単一スレッド検証用)
+const B_BOARDS: u32 = 8;            // 盤面領域の開始
+const B_OUT: u32 = 1560;            // 8 + 16*97
+const B_DONE: u32 = 1576;           // B_OUT + 16
+const BB_SZ: u32 = 1592;            // B_DONE + 16
+
+// worker 側: 末端で 1 局面を投入し、コーディネータの評価を待って手番視点の cp を返す。
+// NN 無効なら 0(従来評価のみ)。
+function leafEval(bb: Buffer<Atomic<i32>>, b: &Board): i32 {
+  if (bb[B_NN].load(Relaxed) == 0) { return 0; }
+  let myIdx: i32 = bb[B_ARRIVED].fetchAdd(1, AcqRel);     // このバッチでの枠
+  let myBatch: i32 = bb[B_GEN].load(Acquire);             // 自分のバッチ番号(READY前なので安定)
+  let base: u32 = B_BOARDS + (myIdx as u32) * BOARD_INTS;
+  let s: u32 = 0;
+  while (s < 81) { bb[base + s].store(b.sq[s], Relaxed); s = s + 1; }
+  let h: u32 = 0;
+  while (h < 16) { bb[base + 81 + h].store(b.hand[h], Relaxed); h = h + 1; }
+  bb[B_READY].fetchAdd(1, Release);                       // 盤を公開して「準備完了」
+  let want: i32 = myBatch + 1;
+  while (bb[B_DONE + (myIdx as u32)].load(Acquire) < want) { }   // 自分のバッチ完了を待つ
+  let cp: i32 = bb[B_OUT + (myIdx as u32)].load(Relaxed);
+  return cp;                                              // canonical 入力 -> NN は既に手番視点
+}
+
+// 唯一の GPU 投入者。アクティブ全員が投入し終えたバッチを 1 ディスパッチで評価する。
+function coordinator(bb: Buffer<Atomic<i32>>, convW: Buffer<f32>, convB: Buffer<f32>,
+                     headW: Buffer<f32>, nthreads: i32) {
+  let planesF: Buffer<f32> = Buffer.shared(BCAP * PLANE_SZ);
+  let convAF: Buffer<f32> = Buffer.shared(BCAP * CONV_SZ);   // conv1 出力(f32)
+  let convAF2: Buffer<f32> = Buffer.shared(BCAP * CONV_SZ);  // conv2 出力(残差)= head 入力
+  let scr: Buffer<f32> = Buffer.shared(FLAT + HID + FLAT);   // 空間ヘッドのスクラッチ(ホスト)
+  let dev: Device = Device.gpu;
+  let bnum: i32 = 0;
+  let running: bool = true;
+  while (running) {
+    let fin: i32 = bb[B_FIN].load(Acquire);
+    let active: i32 = nthreads - fin;
+    let ready: i32 = bb[B_READY].load(Acquire);
+    if (active <= 0) {
+      running = false;
+    } else if (ready >= active) {                         // アクティブ全員が準備完了 -> フラッシュ
+      let count: i32 = bb[B_ARRIVED].load(Acquire);
+      let bb2: u32 = 0;
+      while ((bb2 as i32) < count) {                      // 集約: 盤 -> プレーン符号化(canonical)
+        let gb: Board = boardFromSlot(&bb, B_BOARDS + bb2 * BOARD_INTS);
+        encodeBoard(&planesF, bb2 * PLANE_SZ, &gb);
+        bb2 = bb2 + 1;
+      }
+      let j1: Job = dev.launch(tConvFwd, (count as u32) * CONV_SZ, &planesF, &convW, 0, &convB, 0, &mut convAF, NPLANE, NCH);
+      j1.await();
+      let j2: Job = dev.launch(tConvResFwd, (count as u32) * CONV_SZ, &convAF, &convW, WO_CONV2, &convB, BO_CONV2, &mut convAF2, NCH, NCH);
+      j2.await();
+      let w: u32 = 0;                                      // 空間ヘッドはホスト(conv 出力を読む)
+      while ((w as i32) < count) {
+        let value: f32 = headForward(&convAF2, w * CONV_SZ, &headW, &scr);
+        bb[B_OUT + w].store((value * NN_SCALE) as i32, Relaxed);
+        w = w + 1;
+      }
+      bb[B_ARRIVED].store(0, Relaxed);                    // 解放前にリセット(ABA 回避)
+      bb[B_READY].store(0, Relaxed);
+      bb[B_GEN].store(bnum + 1, Release);
+      let d: u32 = 0;
+      while ((d as i32) < count) { bb[B_DONE + d].store(bnum + 1, Release); d = d + 1; }   // 各枠を解放
+      bnum = bnum + 1;
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  CNN 重みの学習(教師あり回帰・ホスト実行)
+//  ・自己生成: 初期局面からランダム合法手を 0..35 手指して多様な局面を作る。
+//  ・教師ラベル: 手書きの物量評価 eval()(先手視点 cp)を NN_SCALE で正規化した値。
+//  ・損失 MSE、手書き逆伝播(conv/GAP/dense/ReLU)+ SGD で 4 つの重み Buffer をその場更新。
+//  ・推論カーネル(nnConv/nnHead)と同じ式・同じ添字レイアウトを host で再現しているので、
+//    学習後の重みは探索の GPU 推論でそのまま効く。
+//  ・ファイル I/O が無いので重みは保存せず、起動セッション内で学習して使う(train コマンド)。
+// ----------------------------------------------------------------------------
+
+function sgn(x: f32): f32 {
+  if (x > 0.0) { return 1.0; }
+  if (x < 0.0) { return 0.0 - 1.0; }
+  return 0.0;
+}
+
+// 価値ヘッドの出力活性化 softsign(raw)=raw/(1+|raw|) ∈(-1,1)。±1 へ漸近するだけで飽和せず、
+// 評価値が段階的(clamp のように ±600 へ張り付かない)。逆伝播は straight-through(g=1)で別途扱う。
+// ※ カーネル hFwd / hFwdI は関数呼び出し不可のため同式を各々インライン展開している(本関数が正典)。
+function softsign(raw: f32): f32 {
+  let ar: f32 = raw; if (ar < 0.0) { ar = 0.0 - ar; }
+  return raw / (1.0 + ar);
+}
+
+// xorshift64 一段(学習/自己対局/対戦の決定的乱数)。種は呼び元で warmup 8 段してから使う。
+function xorshift64(s: u64): u64 {
+  s = s ^ (s << 13);
+  s = s ^ (s >> 7);
+  s = s ^ (s << 17);
+  return s;
+}
+
+// 勾配バッファの L∞ ノルム(最大絶対値, 0 除算回避)。実勾配 SGD の層ごと正規化に使う。
+function maxAbsBuf(g: Buffer<f32>, n: u32): f32 {
+  let m: f32 = 0.00000001;
+  let i: u32 = 0;
+  while (i < n) {
+    let a: f32 = g[i];
+    if (a < 0.0) { a = 0.0 - a; }
+    if (a > m) { m = a; }
+    i = i + 1;
+  }
+  return m;
+}
+
+// ===== 空間価値ヘッド(ホスト・全経路で共有 -> trainGPU と CPU 参照が bit 一致)=====
+// a = conv 出力(NCH*81・ReLU後)。conv1x1+ReLU -> flat -> FC1+ReLU -> h2 -> FC2 -> raw
+//  -> value = softsign(raw)=raw/(1+|raw|) ∈(-1,1)。scr は単一スクラッチ: [flat(FLAT) | h2(HID) | dflat(FLAT)](>=712)。
+//  既存の pp 系バッファ(GAP 廃止で空き)を流用するので受け渡しを増やさない。
+function headForward(a: Buffer<f32>, abase: u32, headW: Buffer<f32>, scr: Buffer<f32>): f32 {
+  let oc: u32 = 0;
+  while (oc < HEADC) {                                   // conv1x1 + ReLU -> scr[flat]
+    let cell: u32 = 0;
+    while (cell < 81) {
+      let h: f32 = headW[H_C1B + oc];
+      let ic: u32 = 0;
+      while (ic < NCH) { h = h + a[abase + ic * 81 + cell] * headW[H_C1W + oc * NCH + ic]; ic = ic + 1; }
+      if (h < 0.0) { h = 0.0; }
+      scr[oc * 81 + cell] = h;
+      cell = cell + 1;
+    }
+    oc = oc + 1;
+  }
+  let j: u32 = 0;
+  while (j < HID) {                                      // FC1 + ReLU -> scr[FLAT + j]
+    let h: f32 = headW[H_F1B + j];
+    let k: u32 = 0;
+    while (k < FLAT) { h = h + scr[k] * headW[H_F1W + k * HID + j]; k = k + 1; }
+    if (h < 0.0) { h = 0.0; }
+    scr[FLAT + j] = h;
+    j = j + 1;
+  }
+  let raw: f32 = headW[H_F2B];                           // FC2 -> raw
+  let jj: u32 = 0;
+  while (jj < HID) { raw = raw + scr[FLAT + jj] * headW[H_F2W + jj]; jj = jj + 1; }
+  return softsign(raw);                                  // 出力活性化(飽和せず段階的)
+}
+
+// 空間ヘッドの逆伝播: gHead に加算し、dconv[dbase..](conv 入力勾配・ReLUマスク済)を書く。
+// scr は直前の headForward の出力(flat=scr[0..], h2=scr[FLAT..])。dflat は scr[FLAT+HID..]。
+function headBackward(a: Buffer<f32>, abase: u32, headW: Buffer<f32>, target: f32,
+                      scr: Buffer<f32>, gHead: Buffer<f32>, dconv: Buffer<f32>, dbase: u32) {
+  let raw: f32 = headW[H_F2B];
+  let j0: u32 = 0;
+  while (j0 < HID) { raw = raw + scr[FLAT + j0] * headW[H_F2W + j0]; j0 = j0 + 1; }
+  let value: f32 = softsign(raw);
+  let draw: f32 = 2.0 * (value - target);                // straight-through: g=1(飽和でも勾配を殺さない)
+  gHead[H_F2B] = gHead[H_F2B] + draw;
+  let dd: u32 = FLAT + HID;                              // dflat オフセット
+  let z: u32 = 0;
+  while (z < FLAT) { scr[dd + z] = 0.0; z = z + 1; }
+  let j: u32 = 0;
+  while (j < HID) {                                      // FC2 grad + FC1 backward
+    gHead[H_F2W + j] = gHead[H_F2W + j] + draw * scr[FLAT + j];
+    let dpre2: f32 = 0.0;
+    if (scr[FLAT + j] > 0.0) { dpre2 = draw * headW[H_F2W + j]; }   // ReLU(FC1) マスク
+    gHead[H_F1B + j] = gHead[H_F1B + j] + dpre2;
+    let k: u32 = 0;
+    while (k < FLAT) {
+      gHead[H_F1W + k * HID + j] = gHead[H_F1W + k * HID + j] + dpre2 * scr[k];
+      scr[dd + k] = scr[dd + k] + dpre2 * headW[H_F1W + k * HID + j];
+      k = k + 1;
+    }
+    j = j + 1;
+  }
+  let zc: u32 = 0;
+  while (zc < CONV_SZ) { dconv[dbase + zc] = 0.0; zc = zc + 1; }
+  let oc: u32 = 0;
+  while (oc < HEADC) {                                   // conv1x1 backward -> gC1*, da(dconv)
+    let cell: u32 = 0;
+    while (cell < 81) {
+      let dpre1: f32 = 0.0;
+      if (scr[oc * 81 + cell] > 0.0) { dpre1 = scr[dd + oc * 81 + cell]; }   // ReLU(conv1x1) マスク
+      gHead[H_C1B + oc] = gHead[H_C1B + oc] + dpre1;
+      let ic: u32 = 0;
+      while (ic < NCH) {
+        gHead[H_C1W + oc * NCH + ic] = gHead[H_C1W + oc * NCH + ic] + dpre1 * a[abase + ic * 81 + cell];
+        dconv[dbase + ic * 81 + cell] = dconv[dbase + ic * 81 + cell] + dpre1 * headW[H_C1W + oc * NCH + ic];
+        ic = ic + 1;
+      }
+      cell = cell + 1;
+    }
+    oc = oc + 1;
+  }
+  let m: u32 = 0;                                        // conv の ReLU マスク(a>0 のみ通す)
+  while (m < CONV_SZ) {
+    if (a[abase + m] <= 0.0) { dconv[dbase + m] = 0.0; }
+    m = m + 1;
+  }
+}
+
+// 学習済み重みでの 1 局面の前向き(ホスト・手番視点 canonical の価値)。bench 一致テスト用。
+// a は conv 出力スクラッチ(CONV_SZ)、scr はヘッドのスクラッチ(>=FLAT+HID)。
+function nnValueBoard(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>,
+                      planes: Buffer<f32>, a: Buffer<f32>, scr: Buffer<f32>, b: &Board): f32 {
+  encodeBoard(&planes, 0, b);
+  let oc: u32 = 0;
+  while (oc < NCH) {                                     // conv3x3 + ReLU -> a[oc*81+cell]
+    let yy: i32 = 0;
+    while (yy < 9) {
+      let xx: i32 = 0;
+      while (xx < 9) {
+        let z: f32 = convB[oc];
+        let ic: u32 = 0;
+        while (ic < NPLANE) {
+          let dy: i32 = 0 - 1;
+          while (dy <= 1) {
+            let dx: i32 = 0 - 1;
+            while (dx <= 1) {
+              let ny: i32 = yy + dy;
+              let nx: i32 = xx + dx;
+              if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+                let xv: f32 = planes[ic * 81 + ((ny as u32) * 9 + (nx as u32))];
+                z = z + xv * convW[(oc * NPLANE + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+              }
+              dx = dx + 1;
+            }
+            dy = dy + 1;
+          }
+          ic = ic + 1;
+        }
+        if (z < 0.0) { z = 0.0; }
+        a[oc * 81 + ((yy as u32) * 9 + (xx as u32))] = z;
+        xx = xx + 1;
+      }
+      yy = yy + 1;
+    }
+    oc = oc + 1;
+  }
+  // conv2 3x3 (NCH->NCH) + 残差 + ReLU -> a2。(tConvResFwd と同一式)
+  let a2: Buffer<f32> = Buffer.shared(CONV_SZ);
+  let oc2: u32 = 0;
+  while (oc2 < NCH) {
+    let yy: i32 = 0;
+    while (yy < 9) {
+      let xx: i32 = 0;
+      while (xx < 9) {
+        let z: f32 = convB[BO_CONV2 + oc2];
+        let ic: u32 = 0;
+        while (ic < NCH) {
+          let dy: i32 = 0 - 1;
+          while (dy <= 1) {
+            let dx: i32 = 0 - 1;
+            while (dx <= 1) {
+              let ny: i32 = yy + dy;
+              let nx: i32 = xx + dx;
+              if (ny >= 0 && ny < 9 && nx >= 0 && nx < 9) {
+                let xv: f32 = a[ic * 81 + ((ny as u32) * 9 + (nx as u32))];
+                z = z + xv * convW[WO_CONV2 + (oc2 * NCH + ic) * 9 + (((dy + 1) as u32) * 3 + ((dx + 1) as u32))];
+              }
+              dx = dx + 1;
+            }
+            dy = dy + 1;
+          }
+          ic = ic + 1;
+        }
+        z = z + a[oc2 * 81 + ((yy as u32) * 9 + (xx as u32))];   // 残差スキップ
+        if (z < 0.0) { z = 0.0; }
+        a2[oc2 * 81 + ((yy as u32) * 9 + (xx as u32))] = z;
+        xx = xx + 1;
+      }
+      yy = yy + 1;
+    }
+    oc2 = oc2 + 1;
+  }
+  return headForward(&a2, 0, &headW, &scr);
+}
+
+// GPU バッチで k 個の子局面(Xb に encodeBoard 済み)を一括評価 -> vals[0..k](先手視点・生 FC2 値)。
+// conv/GAP を GPU で回し重みを GPU 常駐にすることで、Metal build で nnValueBoard が局面ごとに weights
+// (MTLBuffer)をホスト読みする遅さを回避する。頭部だけホストだが触るのは小さい pp(k*NCH)のみ。
+// 値は nnValueBoard と同一の式(fast-math 再結合ぶんだけ微差)で、指し手選択(argmax)には影響しない。
+function nnValueChildrenGPU(convW: Buffer<f32>, convB: Buffer<f32>, headW: Buffer<f32>,
+                            Xb: Buffer<f32>, convA: Buffer<f32>, pp: Buffer<f32>,
+                            vals: Buffer<f32>, k: u32) {
+  let dev: Device = Device.gpu;
+  let convA2: Buffer<f32> = Buffer.shared(k * CONV_SZ);   // conv2 出力(残差)= head 入力
+  // conv はセル単位(k*NCH*81 スレッド)で広く並列化したほうが速い。融合(pos*ch 単位)は並列度が
+  // 81 分の 1 になり、ディスパッチ 1 本ぶんの節約より計算遅延の増加が勝って遅くなる(実測 15.0 vs 12.9s)。
+  let jf: Job = dev.launch(tConvFwd, k * CONV_SZ, &Xb, &convW, 0, &convB, 0, &mut convA, NPLANE, NCH);
+  jf.await();
+  let jr: Job = dev.launch(tConvResFwd, k * CONV_SZ, &convA, &convW, WO_CONV2, &convB, BO_CONV2, &mut convA2, NCH, NCH);
+  jr.await();
+  // 空間ヘッドも GPU(hFwdI)。pp は flat+h2 のスクラッチ(MBATCH*(FLAT+HID))。host往復ゼロ。
+  let jh: Job = dev.launch(hFwdI, k, &convA2, &headW, &mut pp, &mut vals, NCH);
+  jh.await();
+}
+
+// 全合法子局面を Xb に集めて GPU で一括評価する共通ルーチン(自己対局/対戦/TD で共有)。
+// vals[0..cnt]=各子の先手視点値, mvb[0..cnt]=指し手。cnt(<=MBATCH)を返す。合法手 > MBATCH は稀。
+function evalChildren(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                     Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                     bd: &mut Board, mv: &Vec<i32>): u32 {
+  let n: u32 = mv.len;
+  let cnt: u32 = 0;
+  let k: u32 = 0;
+  while (k < n && cnt < MBATCH) {
+    let m: i32 = mv[k] & 65535;
+    if (bd.legalMove(m)) {
+      let cap: i32 = bd.doMove(m);
+      encodeBoard(&Xb, cnt * PLANE_SZ, bd);
+      bd.undoMove(m, cap);
+      mvb[cnt] = m;
+      cnt = cnt + 1;
+    }
+    k = k + 1;
+  }
+  if (cnt > 0) { nnValueChildrenGPU(&w, &b, &h, &Xb, &cA, &ppB, &vals, cnt); }
+  return cnt;
+}
+
+// CNN 価値で手番側の最善手を返す。canonical/negamax: 子は相手番の局面で vals[c] は相手視点なので、
+// 自分の最善 = 相手視点の値が最小の手(argmin)。合法手なし= -1(詰み)。
+function cnnGreedyMove(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                      Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                      bd: &mut Board, mv: &Vec<i32>): i32 {
+  let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
+  let bestScore: f32 = 1000000000.0;
+  let bestMv: i32 = 0 - 1;
+  let c: u32 = 0;
+  while (c < cnt) {
+    if (vals[c] < bestScore) { bestScore = vals[c]; bestMv = mvb[c]; }   // argmin(相手視点最小)
+    c = c + 1;
+  }
+  return bestMv;
+}
+
+// TD ターゲット(先手視点): 終局は ±1(手番側の詰み)、非終局は γ·(先手番なら子の max / 後手番なら
+// min)を [-1,1] にクランプ。tdTrain がブートストラップ目標を作るのに使う。
+// canonical/negamax: 子は相手番の局面なので vals[c] は相手視点。自分の手番視点の値 = -vals[c]。
+// 自分は最大化 -> max(-vals) = -min(vals)。終局(自分詰み)= -1。
+function tdTargetValue(w: Buffer<f32>, b: Buffer<f32>, h: Buffer<f32>,
+                       Xb: Buffer<f32>, cA: Buffer<f32>, ppB: Buffer<f32>, vals: Buffer<f32>, mvb: Buffer<i32>,
+                       bd: &mut Board, mv: &Vec<i32>, gamma: f32): f32 {
+  let cnt: u32 = evalChildren(&w, &b, &h, &Xb, &cA, &ppB, &vals, &mvb, bd, mv);
+  if (cnt == 0) { return 0.0 - 1.0; }                   // 手番側が詰み = 自分の負け
+  let best: f32 = vals[0];                              // 子の最小(相手視点で最小 = 自分に最良)
+  let c: u32 = 1;
+  while (c < cnt) { if (vals[c] < best) { best = vals[c]; } c = c + 1; }
+  let tgt: f32 = 0.0 - gamma * best;                    // negamax: 自分視点へ反転
+  if (tgt > 1.0) { tgt = 1.0; }
+  if (tgt < (0.0 - 1.0)) { tgt = 0.0 - 1.0; }
+  return tgt;
+}
+

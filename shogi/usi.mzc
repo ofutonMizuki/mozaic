@@ -1,0 +1,177 @@
+// ============================================================================
+//  USI プロトコル・パーサ  — shogi.mzc から分割 (mozaic 将棋エンジン)
+// ============================================================================
+
+// ============================================================================
+//  USI プロトコル
+//  対応コマンド: usi / isready / usinewgame / setoption name Threads value N /
+//                position (startpos|sfen) [moves..] /
+//                go [depth N | movetime MS | btime/wtime/byoyomi/binc/winc | infinite] /
+//                quit、加えて独自の bench・d(盤表示)・train(物量回帰で初期化)・
+//                selfplay(自己対局の勝敗から価値を強化学習)。
+//  探索は Lazy SMP(共有 TT のロックレス並列探索)+ 反復深化 + 時間制御。
+//  末端評価は GPU CNN の値のみ(コーディネータが全スレッドのリーフをバッチ評価)。
+//  学習は train(教師=物量評価)で初期化 → selfplay(教師=自己対局の最終結果)で強化。
+//  go では Threads 本のワーカーが共有 TT を読み書きしながら並列に読み、時間が来れば
+//  clock で全スレッドを打ち切る。指し手は USI 表記(7g7f / 7g7f+ / P*5e)で入出力する。
+// ============================================================================
+
+function copyStr(s: &str): str {                            // str をコピー(Vec 要素を所有値として取り出す)
+  let out: str = String.new();
+  let i: u32 = 0;
+  while (i < s.len) { out.push(s[i]); i = i + 1; }
+  return out;
+}
+
+function split(s: &str): Vec<str> {                         // 空白区切りでトークン化
+  let out: Vec<str> = Vec.new();
+  let i: u32 = 0;
+  let n: u32 = s.len;
+  while (i < n) {
+    while (i < n && s[i] == ' ') { i = i + 1; }
+    if (i < n) {
+      let tok: str = String.new();
+      while (i < n && s[i] != ' ') { tok.push(s[i]); i = i + 1; }
+      out.push(tok);
+    }
+  }
+  return out;
+}
+
+function letterToType(c: char): i32 {                       // 駒文字 -> 駒種 (P L N S B R G K)
+  if (c == 'P') { return PAWN; }
+  if (c == 'L') { return LANCE; }
+  if (c == 'N') { return KNIGHT; }
+  if (c == 'S') { return SILVER; }
+  if (c == 'B') { return BISHOP; }
+  if (c == 'R') { return ROOK; }
+  if (c == 'G') { return GOLD; }
+  if (c == 'K') { return KING; }
+  return 0;
+}
+
+function toUpper(c: char): char {
+  if (c >= 'a' && c <= 'z') { return ((c as u32) - 32) as char; }
+  return c;
+}
+
+function usiSquare(fc: char, rc: char): i32 {              // "5e" 等 -> 内部マス
+  let usiFile: i32 = ((fc as u32) - ('0' as u32)) as i32;  // 1..9
+  let f: i32 = 9 - usiFile;                                 // 内部 file 0..8
+  let r: i32 = ((rc as u32) - ('a' as u32)) as i32;        // 0..8
+  return r * 9 + f;
+}
+
+function parseUsiMove(s: &str): i32 {                       // USI 指し手 -> 16bit パック
+  if (s[1] == '*') {                                        // 打ち: P*5e
+    let t: i32 = letterToType(s[0]);
+    let to: i32 = usiSquare(s[2], s[3]);
+    return to | ((80 + t) << 7);
+  }
+  let from: i32 = usiSquare(s[0], s[1]);
+  let to: i32 = usiSquare(s[2], s[3]);
+  let promo: i32 = 0;
+  if (s.len >= 5 && s[4] == '+') { promo = 1; }
+  return to | (from << 7) | (promo << 14);
+}
+
+function parseIntStr(s: &str): i32 {
+  let v: i32 = 0;
+  let i: u32 = 0;
+  while (i < s.len) {
+    let c: char = s[i];
+    if (c >= '0' && c <= '9') { v = v * 10 + (((c as u32) - ('0' as u32)) as i32); }
+    i = i + 1;
+  }
+  return v;
+}
+
+// 符号付き整数(重みの固定小数 ×1e6)をパース。
+function parseSignedInt(s: &str): i32 {
+  let neg: bool = false;
+  let i: u32 = 0;
+  if (s.len > 0 && s[0] == '-') { neg = true; i = 1; }
+  let v: i32 = 0;
+  while (i < s.len) {
+    let c: char = s[i];
+    if (c >= '0' && c <= '9') { v = v * 10 + (((c as u32) - ('0' as u32)) as i32); }
+    i = i + 1;
+  }
+  if (neg) { return 0 - v; }
+  return v;
+}
+
+// SFEN(toks[start]=盤面, +1=手番, +2=持ち駒, +3=手数)から局面を構築。
+function parseSfen(toks: &Vec<str>, start: u32): Board {
+  let b: Board = emptyBoard();
+  let board: str = copyStr(&toks[start]);
+  let r: i32 = 0;
+  let f: i32 = 0;
+  let i: u32 = 0;
+  let n: u32 = board.len;
+  let promo: bool = false;
+  while (i < n) {
+    let c: char = board[i];
+    if (c == '/') { r = r + 1; f = 0; }
+    else if (c >= '1' && c <= '9') { f = f + (((c as u32) - ('0' as u32)) as i32); }
+    else if (c == '+') { promo = true; }
+    else {
+      let col: i32 = GOTE;
+      if (c >= 'A' && c <= 'Z') { col = SENTE; }
+      let t: i32 = letterToType(toUpper(c));
+      if (promo) { t = t + 8; }
+      b.sq[r * 9 + f] = pieceCode(col, t);
+      f = f + 1;
+      promo = false;
+    }
+    i = i + 1;
+  }
+  let side: str = copyStr(&toks[start + 1]);
+  if (side == "w") { b.side = GOTE; } else { b.side = SENTE; }
+  let hand: str = copyStr(&toks[start + 2]);
+  if (!(hand == "-")) {
+    let cnt: i32 = 0;
+    let hi: u32 = 0;
+    let hn: u32 = hand.len;
+    while (hi < hn) {
+      let hc: char = hand[hi];
+      if (hc >= '0' && hc <= '9') { cnt = cnt * 10 + (((hc as u32) - ('0' as u32)) as i32); }
+      else {
+        let col: i32 = GOTE;
+        if (hc >= 'A' && hc <= 'Z') { col = SENTE; }
+        let t: i32 = letterToType(toUpper(hc));
+        let add: i32 = cnt;
+        if (add == 0) { add = 1; }
+        b.hand[col * 8 + t] = b.hand[col * 8 + t] + add;
+        cnt = 0;
+      }
+      hi = hi + 1;
+    }
+  }
+  return b;
+}
+
+function parsePosition(toks: &Vec<str>): Board {
+  let b: Board = initBoard();
+  let movesIdx: u32 = 2;
+  if (toks.len >= 2 && toks[1] == "sfen") {
+    b = parseSfen(toks, 2);
+    movesIdx = 6;
+  }
+  if (toks.len > movesIdx && toks[movesIdx] == "moves") {
+    let k: u32 = movesIdx + 1;
+    while (k < toks.len) {
+      b.doMove(parseUsiMove(&toks[k]));
+      k = k + 1;
+    }
+  }
+  return b;
+}
+
+function scoreStr(score: i32): str {                        // USI score: cp か mate
+  if (score > MATE - 1000) { return `mate ${MATE - score}`; }
+  if (score < (0 - MATE) + 1000) { return `mate -${score + MATE}`; }
+  return `cp ${score}`;
+}
+
+
